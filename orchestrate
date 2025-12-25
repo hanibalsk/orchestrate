@@ -226,6 +226,18 @@ case "$cmd" in
         subcmd="${1:-status}"
         shift 2>/dev/null || true
         case "$subcmd" in
+            set|watch)
+                [[ $# -lt 1 ]] && { echo "Usage: $0 pr set <pr_number>"; exit 1; }
+                pr_num="$1"
+                # Verify PR exists
+                if ! gh pr view "$pr_num" &>/dev/null; then
+                    echo "PR #$pr_num not found"
+                    exit 1
+                fi
+                echo "$pr_num" > "$CURRENT_PR_FILE"
+                echo "Set current PR to #$pr_num"
+                gh pr view "$pr_num" --json title,state,url -q '"Title: " + .title + "\nState: " + .state + "\nURL: " + .url'
+                ;;
             create)
                 pr_create "$@"
                 ;;
@@ -238,8 +250,12 @@ case "$cmd" in
             next)
                 pr_create
                 ;;
+            clear)
+                rm -f "$CURRENT_PR_FILE"
+                echo "Cleared current PR"
+                ;;
             *)
-                echo "PR commands: create, queue, status, next"
+                echo "PR commands: set, create, queue, status, next, clear"
                 ;;
         esac
         ;;
@@ -429,10 +445,12 @@ Only ONE PR open at a time. Finished work queues for next PR.
 Usage: $0 <command> [args]
 
 PR Queue Commands:
+  pr set <number>         Set existing PR as current (to watch)
   pr queue                Show queued finished work
   pr status               Check current PR, process queue if closed
   pr create [wt_name]     Create PR from worktree or queue
   pr next                 Create PR from next in queue
+  pr clear                Clear current PR tracking
   done <wt_name> [title]  Mark worktree done, queue for PR
 
 Worktree Commands:
@@ -458,10 +476,11 @@ Workflow:
   6. (when PR merged, next queued work creates PR)
 
 Examples:
+  $0 pr set 60                        # Set existing PR #60 as current
+  $0 shepherd 60                      # Watch and fix PR #60
   $0 develop "Add auth" auth-feature
   $0 done auth-feature "User authentication"
   $0 pr queue
-  $0 shepherd 123
 EOF
         ;;
 
