@@ -348,15 +348,38 @@ Follow TDD. When done, tell user to run: orchestrate done $wt_name" --dangerousl
         pr_num="$1"
         wt_name="pr-$pr_num"
 
-        wt_path=$(worktree_create "$wt_name")
+        # Get PR branch name
+        pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName')
+
+        # Fetch the branch
+        git fetch origin "$pr_branch" 2>/dev/null || true
+
+        # Create worktree from PR branch
+        wt_path="$WORKTREE_DIR/$wt_name"
+        mkdir -p "$WORKTREE_DIR"
+
+        # Prune stale worktrees first
+        git worktree prune 2>/dev/null || true
+
+        if [[ ! -d "$wt_path" ]]; then
+            git worktree add "$wt_path" "origin/$pr_branch" 2>/dev/null || \
+                git worktree add -f "$wt_path" "origin/$pr_branch" 2>/dev/null || \
+                git worktree add "$wt_path" "$pr_branch" 2>/dev/null || {
+                    echo "Failed to create worktree for PR #$pr_num"
+                    exit 1
+                }
+        fi
+
         echo "Working in: $wt_path"
         cd "$wt_path"
 
-        gh pr checkout "$pr_num" 2>/dev/null || true
+        # Set as current PR
+        echo "$pr_num" > "$CURRENT_PR_FILE"
 
         claude -p "Use the Task tool with subagent_type=\"pr-shepherd\" to watch PR #$pr_num and auto-fix any CI failures or review comments.
 
 Working directory: $wt_path
+PR branch: $pr_branch
 
 When PR is merged or closed, run: orchestrate pr next" --dangerously-skip-permissions
         ;;
