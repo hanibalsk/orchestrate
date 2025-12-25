@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+#
+# orchestrate - Simple multi-agent orchestrator using Claude Code SDK
+#
+# Supports git worktrees for isolated parallel development.
+# Only ONE PR open at a time - queue system for finished work.
+#
+# Usage:
+#   ./orchestrate develop <task>          - Develop in worktree
+#   ./orchestrate pr create               - Create PR from finished work
+#   ./orchestrate pr queue                - Show queued finished work
+#   ./orchestrate pr status               - Check current PR status
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKTREE_DIR="${WORKTREE_DIR:-$SCRIPT_DIR/.worktrees}"
+STATE_DIR="${STATE_DIR:-$SCRIPT_DIR/.orchestrate}"
+QUEUE_FILE="$STATE_DIR/pr-queue"
+CURRENT_PR_FILE="$STATE_DIR/current-pr"
+
+# Check Claude CLI
+command -v claude &>/dev/null || {
+    echo "Error: Claude CLI not found"
+    echo "Install: https://docs.anthropic.com/en/docs/claude-code"
+    exit 1
+}
+
+mkdir -p "$STATE_DIR"
+
+# ==================== PR Queue Functions ====================
+
+# Check if there's an open PR
+pr_is_open() {
+    [[ -f "$CURRENT_PR_FILE" ]] || return 1
+    local pr_num=$(cat "$CURRENT_PR_FILE")
+    local state=$(gh pr view "$pr_num" --json state -q '.state' 2>/dev/null || echo "UNKNOWN")
+    [[ "$state" == "OPEN" ]]
+}
+
+# Get current open PR number
+pr_current() {
+    [[ -f "$CURRENT_PR_FILE" ]] && cat "$CURRENT_PR_FILE"
+}
+
+# Add worktree to PR queue (finished work waiting for PR)
+queue_add() {
+    local wt_name="$1"
+    local title="${2:-$wt_name}"
+    echo "$wt_name|$title|$(date +%s)" >> "$QUEUE_FILE"
+    echo "Queued: $wt_name"
+}
+
+# Show PR queue
+queue_list() {
+    echo "=== PR Queue ==="
+    if [[ -f "$QUEUE_FILE" ]] && [[ -s "$QUEUE_FILE" ]]; then
+        local i=1
+        while IFS='|' read -r name title ts; do
+            echo "  $i. $name - $title"
+            ((i++))
+        done < "$QUEUE_FILE"
+    else
+        echo "  (empty)"
+    fi
+    echo ""
+    echo "=== Current PR ==="
+    if pr_is_open; then
+        local pr_num=$(pr_current)
+        echo "  PR #$pr_num (OPEN)"
+        gh pr view "$pr_num" --json title,url -q '"  " + .title + "\n  " + .url' 2>/dev/null || true
+    else
+        echo "  (none)"
+    fi
+}
+
+# Get next from queue
+queue_next() {
+    [[ -f "$QUEUE_FILE" ]] && [[ -s "$QUEUE_FILE" ]] || return 1
+    head -1 "$QUEUE_FILE" | cut -d'|' -f1
+}
+
+# Remove first from queue
+queue_pop() {
+    [[ -f "$QUEUE_FILE" ]] || return 0
+    tail -n +2 "$QUEUE_FILE" > "$QUEUE_FILE.tmp"
+    mv "$QUEUE_FILE.tmp" "$QUEUE_FILE"
+}
+
+# Create PR from worktree (only if no open PR)
+pr_create() {
+    local wt_name="${1:-}"
+
+    # Check if PR is already open
+    if pr_is_open; then
+        local pr_num=$(pr_current)
+        echo "PR #$pr_num is still open. Wait for it to close."
+        echo "Use: orchestrate pr status"
+        return 1
+    fi
+
+    # Get from queue if not specified
+    if [[ -z "$wt_name" ]]; then
+        wt_name=$(queue_next) || {
+            echo "No work in queue. Use: orchestrate pr queue"
+            return 1
+        }
+    fi
+
+    local wt_path="$WORKTREE_DIR/$wt_name"
+    [[ -d "$wt_path" ]] || { echo "Worktree not found: $wt_name"; return 1; }
+
+    echo "Creating PR from: $wt_name"
+    cd "$wt_path"
+
+    # Push branch
+    local branch=$(git rev-parse --abbrev-ref HEAD)
+    git push -u origin "$branch" 2>/dev/null || git push origin "$branch"
+
+    # Create PR
+    local pr_url=$(gh pr create --fill 2>/dev/null || gh pr create --title "$wt_name" --body "From worktree: $wt_name")
+    local pr_num=$(echo "$pr_url" | grep -oE '[0-9]+$')
+
+    # Save current PR
+    echo "$pr_num" > "$CURRENT_PR_FILE"
+
+    # Remove from queue
+    queue_pop
+
+    echo "Created PR #$pr_num: $pr_url"
+    echo ""
+    echo "Shepherd will watch: orchestrate shepherd $pr_num"
+}
+
+# Check PR status and process queue if closed
+pr_check() {
+    if ! pr_is_open; then
+        # Clear current PR
+        rm -f "$CURRENT_PR_FILE"
+
+        # Check if queue has items
+        if queue_next &>/dev/null; then
+            echo "Previous PR closed. Creating next from queue..."
+            pr_create
+        else
+            echo "No open PR. Queue is empty."
+        fi
+    else
+        local pr_num=$(pr_current)
+        echo "PR #$pr_num is open"
+        gh pr view "$pr_num" --json state,statusCheckRollup,reviews \
+            -q '"State: " + .state + "\nChecks: " + (.statusCheckRollup | map(.conclusion) | join(", "))' 2>/dev/null || true
+    fi
+}
+
+# Mark worktree as done and queue for PR
+mark_done() {
+    local wt_name="$1"
+    local title="${2:-$wt_name}"
+
+    local wt_path="$WORKTREE_DIR/$wt_name"
+    [[ -d "$wt_path" ]] || { echo "Worktree not found: $wt_name"; return 1; }
+
+    # Ensure all changes committed
+    cd "$wt_path"
+    if [[ -n $(git status --porcelain) ]]; then
+        echo "Uncommitted changes in $wt_name. Commit first."
+        return 1
+    fi
+
+    # Add to queue
+    queue_add "$wt_name" "$title"
+
+    # Try to create PR if none open
+    if ! pr_is_open; then
+        echo "No open PR. Creating now..."
+        pr_create "$wt_name"
+    else
+        echo "PR queue position: $(wc -l < "$QUEUE_FILE" | tr -d ' ')"
+    fi
+}
+
+# ==================== Worktree Functions ====================
+
+worktree_create() {
+    local name="$1"
+    local base="${2:-main}"
+    local branch="worktree/$name"
+    local path="$WORKTREE_DIR/$name"
+
+    mkdir -p "$WORKTREE_DIR"
+
+    git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null || \
+        git branch "$branch" "$base"
+
+    git worktree add "$path" "$branch" 2>/dev/null || {
+        echo "Worktree exists: $path" >&2
+    }
+
+    echo "$path"
+}
+
+worktree_remove() {
+    local name="$1"
+    local path="$WORKTREE_DIR/$name"
+
+    git worktree remove "$path" --force 2>/dev/null || true
+    git branch -D "worktree/$name" 2>/dev/null || true
+    echo "Removed: $name"
+}
+
+worktree_list() {
+    echo "Worktrees:"
+    git worktree list
+}
+
+# ==================== Main Commands ====================
+
+cmd="${1:-interactive}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    # ==================== PR Commands ====================
+    pr)
+        subcmd="${1:-status}"
+        shift 2>/dev/null || true
+        case "$subcmd" in
+            create)
+                pr_create "$@"
+                ;;
+            queue|list)
+                queue_list
+                ;;
+            status|check)
+                pr_check
+                ;;
+            next)
+                pr_create
+                ;;
+            *)
+                echo "PR commands: create, queue, status, next"
+                ;;
+        esac
+        ;;
+
+    done|finish)
+        [[ $# -lt 1 ]] && { echo "Usage: $0 done <worktree_name> [title]"; exit 1; }
+        mark_done "$@"
+        ;;
+
+    # ==================== Worktree Commands ====================
+    worktree|wt)
+        subcmd="${1:-list}"
+        shift 2>/dev/null || true
+        case "$subcmd" in
+            create|new)
+                [[ $# -lt 1 ]] && { echo "Usage: $0 wt create <name> [base]"; exit 1; }
+                worktree_create "$@"
+                ;;
+            remove|rm)
+                [[ $# -lt 1 ]] && { echo "Usage: $0 wt remove <name>"; exit 1; }
+                worktree_remove "$1"
+                ;;
+            list|ls)
+                worktree_list
+                ;;
+            *)
+                echo "Worktree commands: create, remove, list"
+                ;;
+        esac
+        ;;
+
+    # ==================== BMAD Commands ====================
+    bmad)
+        epic="${1:-}"
+        wt_name="${2:-bmad-$(date +%s)}"
+
+        wt_path=$(worktree_create "$wt_name")
+        echo "Working in: $wt_path"
+        cd "$wt_path"
+
+        if [[ -n "$epic" ]]; then
+            claude -p "Use the Task tool with subagent_type=\"bmad-orchestrator\" to run BMAD workflow for epic: $epic
+
+Working directory: $wt_path
+
+Follow BMAD method:
+1. Find the epic in docs/bmad/epics/
+2. Break into stories
+3. Implement each story with TDD
+4. Review code
+5. When done, tell user to run: orchestrate done $wt_name" --dangerously-skip-permissions
+        else
+            claude -p "Use the Task tool with subagent_type=\"bmad-orchestrator\" to:
+1. List available epics in docs/bmad/epics/
+2. Show their status
+3. Ask which epic to work on
+
+Working directory: $wt_path" --dangerously-skip-permissions
+        fi
+        ;;
+
+    bmad-plan|plan)
+        [[ $# -lt 1 ]] && { echo "Usage: $0 plan <feature>"; exit 1; }
+        claude -p "Use the Task tool with subagent_type=\"bmad-planner\" to create a BMAD epic and stories for: $*
+
+Create in docs/bmad/:
+- Epic file with overview
+- Story files with acceptance criteria" --dangerously-skip-permissions
+        ;;
+
+    bmad-story|story)
+        [[ $# -lt 1 ]] && { echo "Usage: $0 story <story_id> [wt_name]"; exit 1; }
+        story_id="$1"
+        wt_name="${2:-story-$story_id}"
+
+        wt_path=$(worktree_create "$wt_name")
+        echo "Working in: $wt_path"
+        cd "$wt_path"
+
+        claude -p "Use the Task tool with subagent_type=\"story-developer\" to implement BMAD story: $story_id
+
+Working directory: $wt_path
+
+Follow TDD. When done, tell user to run: orchestrate done $wt_name" --dangerously-skip-permissions
+        ;;
+
+    # ==================== Core Commands ====================
+    shepherd|sh)
+        [[ $# -lt 1 ]] && { echo "Usage: $0 shepherd <pr_number>"; exit 1; }
+        pr_num="$1"
+        wt_name="pr-$pr_num"
+
+        wt_path=$(worktree_create "$wt_name")
+        echo "Working in: $wt_path"
+        cd "$wt_path"
+
+        gh pr checkout "$pr_num" 2>/dev/null || true
+
+        claude -p "Use the Task tool with subagent_type=\"pr-shepherd\" to watch PR #$pr_num and auto-fix any CI failures or review comments.
+
+Working directory: $wt_path
+
+When PR is merged or closed, run: orchestrate pr next" --dangerously-skip-permissions
+        ;;
+
+    develop|dev)
+        [[ $# -lt 1 ]] && { echo "Usage: $0 dev <task> [wt_name]"; exit 1; }
+        task="$1"
+        wt_name="${2:-dev-$(date +%s)}"
+
+        wt_path=$(worktree_create "$wt_name")
+        echo "Working in: $wt_path"
+        cd "$wt_path"
+
+        claude -p "Use the Task tool with subagent_type=\"story-developer\" to implement: $task
+
+Working directory: $wt_path
+
+When done, tell user to run: orchestrate done $wt_name" --dangerously-skip-permissions
+        ;;
+
+    review|rev)
+        [[ $# -lt 1 ]] && { echo "Usage: $0 review <target>"; exit 1; }
+        claude -p "Use the Task tool with subagent_type=\"code-reviewer\" to review: $*" --dangerously-skip-permissions
+        ;;
+
+    parallel|par)
+        [[ $# -lt 2 ]] && { echo "Usage: $0 parallel <task1> <task2> ..."; exit 1; }
+        prompt="Spawn these agents IN PARALLEL using multiple Task tool calls in ONE message:"
+        i=1
+        for task in "$@"; do
+            wt_path=$(worktree_create "parallel-$i-$(date +%s)")
+            prompt+=$'\n'"- Use Task with subagent_type=\"explorer\" in $wt_path to: $task"
+            ((i++))
+        done
+        claude -p "$prompt" --dangerously-skip-permissions
+        ;;
+
+    spawn)
+        [[ $# -lt 2 ]] && { echo "Usage: $0 spawn <agent> <task> [wt_name]"; exit 1; }
+        agent="$1"; shift
+        task="$1"; shift
+        wt_name="${1:-$agent-$(date +%s)}"
+
+        wt_path=$(worktree_create "$wt_name")
+        echo "Working in: $wt_path"
+        cd "$wt_path"
+
+        claude -p "Use the Task tool with subagent_type=\"$agent\" to: $task
+
+Working directory: $wt_path" --dangerously-skip-permissions
+        ;;
+
+    # ==================== Interactive ====================
+    interactive|int|"")
+        cat <<'EOF'
+Multi-Agent Orchestrator
+
+PR Queue (one PR at a time):
+  pr queue      Show queue of finished work
+  pr status     Check current PR
+  pr create     Create PR from queue
+  done <wt>     Mark worktree done, queue for PR
+
+Worktree Commands:
+  wt create     Create worktree
+  wt list       List worktrees
+  wt remove     Remove worktree
+
+Development:
+  develop       Implement in worktree
+  bmad          BMAD workflow
+  story         Implement story
+  shepherd      Watch PR
+  parallel      Run parallel agents
+
+EOF
+        claude --dangerously-skip-permissions
+        ;;
+
+    help|--help|-h)
+        cat <<EOF
+Multi-Agent Orchestrator with PR Queue
+
+Only ONE PR open at a time. Finished work queues for next PR.
+
+Usage: $0 <command> [args]
+
+PR Queue Commands:
+  pr queue                Show queued finished work
+  pr status               Check current PR, process queue if closed
+  pr create [wt_name]     Create PR from worktree or queue
+  pr next                 Create PR from next in queue
+  done <wt_name> [title]  Mark worktree done, queue for PR
+
+Worktree Commands:
+  wt create <name>        Create isolated worktree
+  wt remove <name>        Remove worktree
+  wt list                 List all worktrees
+
+Development Commands:
+  develop <task> [wt]     Implement in worktree
+  bmad [epic] [wt]        BMAD workflow in worktree
+  story <id> [wt]         Implement story in worktree
+  shepherd <pr>           Watch PR, auto-fix
+  review <target>         Code review
+  parallel <t1> <t2>      Parallel worktrees
+  spawn <agent> <task>    Spawn any agent
+
+Workflow:
+  1. orchestrate develop "Add feature" my-feature
+  2. (agent works, commits)
+  3. orchestrate done my-feature "Add new feature"
+  4. (PR created if none open, else queued)
+  5. orchestrate shepherd <pr_number>
+  6. (when PR merged, next queued work creates PR)
+
+Examples:
+  $0 develop "Add auth" auth-feature
+  $0 done auth-feature "User authentication"
+  $0 pr queue
+  $0 shepherd 123
+EOF
+        ;;
+
+    *)
+        echo "Unknown: $cmd. Use '$0 help'"
+        exit 1
+        ;;
+esac

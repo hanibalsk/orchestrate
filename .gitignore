@@ -1,0 +1,12 @@
+# Worktrees
+.worktrees/
+
+# State
+.orchestrate/
+
+# OS files
+.DS_Store
+
+# Editor files
+*.swp
+*~
