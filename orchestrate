@@ -515,15 +515,20 @@ Working directory: $wt_path" --dangerously-skip-permissions
                         }
                     } }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "?")
 
-                # Check shepherd status
+                # Check shepherd status and merge state
                 local lock_file="$STATE_DIR/shepherd-$pr_num.lock"
                 local status_icon status_text
+                local mergeable=$(gh pr view "$pr_num" --json mergeable -q '.mergeable' 2>/dev/null)
+
                 if [[ -f "$lock_file" ]] && kill -0 "$(cat "$lock_file" 2>/dev/null)" 2>/dev/null; then
                     status_icon="🔄"
                     status_text="Shepherd running"
+                elif [[ "$mergeable" == "CONFLICTING" ]]; then
+                    status_icon="⚠️"
+                    status_text="Conflicts"
                 elif [[ "$unresolved" == "0" ]]; then
                     status_icon="✅"
-                    status_text="Healthy"
+                    status_text="Ready to merge"
                 else
                     status_icon="⏳"
                     status_text="Pending"
@@ -637,8 +642,56 @@ Working directory: $wt_path" --dangerously-skip-permissions
                         shepherd_bg_pid=$!
                         echo "$shepherd_bg_pid" > "$SHEPHERD_LOCK"
                         ((active_count++)) || true
+                    else
+                        # PR is healthy - check if ready for auto-merge
+                        if [[ "${AUTO_MERGE:-true}" == "true" ]]; then
+                            # Check all CI checks passed
+                            all_checks_passed=$(gh pr view "$pr_num" --json statusCheckRollup \
+                                -q '[.statusCheckRollup[]? | .conclusion] | all(. == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED")' 2>/dev/null)
+
+                            if [[ "$all_checks_passed" == "true" ]]; then
+                                # Approve and merge
+                                gh pr review "$pr_num" --approve -b "Auto-approved by orchestrator" 2>/dev/null || true
+
+                                # Try to merge
+                                if gh pr merge "$pr_num" --squash --auto 2>/dev/null; then
+                                    echo "✅ PR #$pr_num auto-merged!"
+                                elif gh pr merge "$pr_num" --squash 2>/dev/null; then
+                                    echo "✅ PR #$pr_num merged!"
+                                fi
+                            fi
+                        fi
                     fi
                 done
+
+                # After merging, check for merge conflicts in remaining PRs and fix them
+                if [[ "${AUTO_MERGE:-true}" == "true" ]]; then
+                    for pr_num in $open_prs; do
+                        # Check if PR has merge conflicts
+                        mergeable=$(gh pr view "$pr_num" --json mergeable -q '.mergeable' 2>/dev/null)
+                        if [[ "$mergeable" == "CONFLICTING" ]]; then
+                            pr_branch=$(gh pr view "$pr_num" --json headRefName -q '.headRefName' 2>/dev/null)
+                            wt_path="$WORKTREE_DIR/pr-$pr_num"
+
+                            if [[ -d "$wt_path" ]]; then
+                                (
+                                    cd "$wt_path"
+                                    git fetch origin main 2>/dev/null
+
+                                    # Try automatic merge with strategies
+                                    if git merge origin/main -X theirs --no-edit 2>/dev/null; then
+                                        git push 2>/dev/null && echo "🔀 PR #$pr_num: Merge conflicts resolved (theirs strategy)"
+                                    elif git merge --abort 2>/dev/null; then
+                                        # Try ours strategy
+                                        if git merge origin/main -X ours --no-edit 2>/dev/null; then
+                                            git push 2>/dev/null && echo "🔀 PR #$pr_num: Merge conflicts resolved (ours strategy)"
+                                        fi
+                                    fi
+                                ) 2>/dev/null || true
+                            fi
+                        fi
+                    done
+                fi
             fi
 
             # Check for pending epics/stories (only if no PRs need work)
@@ -716,12 +769,17 @@ When done, run: orchestrate done $wt_name" --dangerously-skip-permissions &
                 } }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "?")
 
             lock_file="$STATE_DIR/shepherd-$pr_num.lock"
+            mergeable=$(gh pr view "$pr_num" --json mergeable -q '.mergeable' 2>/dev/null)
+
             if [[ -f "$lock_file" ]] && kill -0 "$(cat "$lock_file" 2>/dev/null)" 2>/dev/null; then
                 status_icon="🔄"
                 status_text="Shepherd running"
+            elif [[ "$mergeable" == "CONFLICTING" ]]; then
+                status_icon="⚠️"
+                status_text="Conflicts"
             elif [[ "$unresolved" == "0" ]]; then
                 status_icon="✅"
-                status_text="Healthy"
+                status_text="Ready to merge"
             else
                 status_icon="⏳"
                 status_text="Pending"
