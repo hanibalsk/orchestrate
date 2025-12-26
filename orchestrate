@@ -376,12 +376,56 @@ Follow TDD. When done, tell user to run: orchestrate done $wt_name" --dangerousl
         # Set as current PR
         echo "$pr_num" > "$CURRENT_PR_FILE"
 
-        claude -p "Use the Task tool with subagent_type=\"pr-shepherd\" to watch PR #$pr_num and auto-fix any CI failures or review comments.
+        # Log file for output
+        LOG_FILE="$STATE_DIR/shepherd-$pr_num.log"
+        echo "=== Shepherd started: $(date) ===" >> "$LOG_FILE"
+        echo "Agent output: $LOG_FILE"
+
+        # Get repo info for GraphQL queries
+        repo_info=$(gh repo view --json owner,name -q '.owner.login + "/" + .name')
+        repo_owner=$(echo "$repo_info" | cut -d'/' -f1)
+        repo_name=$(echo "$repo_info" | cut -d'/' -f2)
+
+        # Run claude
+        claude -p "You are a PR shepherd. Fix ALL issues on PR #$pr_num NOW.
 
 Working directory: $wt_path
 PR branch: $pr_branch
+Repository: $repo_owner/$repo_name
 
-When PR is merged or closed, run: orchestrate pr next" --dangerously-skip-permissions
+## STEP 1 - GET UNRESOLVED REVIEW THREADS:
+
+gh api graphql -f query='query { repository(owner: \"$repo_owner\", name: \"$repo_name\") { pullRequest(number: $pr_num) { reviewThreads(first: 100) { nodes { id isResolved path line comments(first: 1) { nodes { body author { login } } } } } } } }' --jq '.data.repository.pullRequest.reviewThreads.nodes | map(select(.isResolved == false))'
+
+## STEP 2 - FOR EACH UNRESOLVED THREAD:
+
+1. Read the comment body to understand what change is requested
+2. Make the code fix if needed
+3. Reply to the comment explaining your fix:
+   gh pr comment $pr_num --body 'Fixed: explanation here'
+4. RESOLVE THE THREAD (CRITICAL - this is required to merge):
+   gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"THE_THREAD_ID\"}) { thread { isResolved } } }'
+
+The thread ID looks like: PRRT_kwDONOK... - get it from the query in Step 1.
+
+## STEP 3 - CHECK AND FIX CI:
+
+gh pr checks $pr_num
+If any fail, check logs and fix: gh run view RUN_ID --log-failed
+
+## STEP 4 - COMMIT AND PUSH:
+
+git add -A && git commit -m 'fix: address review feedback' && git push
+
+## REQUIREMENTS:
+- RESOLVE ALL threads (not just reply)
+- All CI checks must pass
+- Actually FIX code, don't just report
+
+After each thread resolution, verify it worked:
+gh api graphql -f query='query { repository(owner: \"$repo_owner\", name: \"$repo_name\") { pullRequest(number: $pr_num) { reviewThreads(first: 100) { nodes { isResolved } } } } }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length'
+
+Keep going until that returns 0." --dangerously-skip-permissions 2>&1 | tee -a "$LOG_FILE"
         ;;
 
     develop|dev)
@@ -432,6 +476,216 @@ When done, tell user to run: orchestrate done $wt_name" --dangerously-skip-permi
 Working directory: $wt_path" --dangerously-skip-permissions
         ;;
 
+    # ==================== Automated Loop ====================
+    loop)
+        LOOP_INTERVAL="${LOOP_INTERVAL:-30}"
+        MAX_CONCURRENT_SHEPHERDS="${MAX_CONCURRENT_SHEPHERDS:-3}"
+        WORK_LOCK="$STATE_DIR/work.lock"
+
+        # Cleanup locks on exit
+        trap 'rm -f "$STATE_DIR"/shepherd-*.lock "$WORK_LOCK" 2>/dev/null' EXIT
+
+        # ASCII UI display function
+        display_status() {
+            local repo_owner="$1"
+            local repo_name="$2"
+
+            clear
+            echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+            echo "║                        🤖 ORCHESTRATE - Multi-Agent Loop                     ║"
+            echo "║                              $repo_owner/$repo_name"
+            printf "║%78s║\n" ""
+            echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+            echo "║  ⏰ $(date '+%Y-%m-%d %H:%M:%S')                    Interval: ${LOOP_INTERVAL}s  Max Agents: $MAX_CONCURRENT_SHEPHERDS  ║"
+            echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+            echo "║                              📋 PULL REQUESTS                                ║"
+            echo "╠════════╦═══════════════════════════════════╦════════════╦════════════════════╣"
+            echo "║   PR   ║             Title                 ║  Threads   ║      Status        ║"
+            echo "╠════════╬═══════════════════════════════════╬════════════╬════════════════════╣"
+
+            for pr_num in $open_prs; do
+                # Get PR title
+                pr_title=$(gh pr view "$pr_num" --json title -q '.title' 2>/dev/null | cut -c1-33)
+
+                # Get unresolved count
+                unresolved=$(gh api graphql -f query='
+                    query { repository(owner: "'"$repo_owner"'", name: "'"$repo_name"'") {
+                        pullRequest(number: '"$pr_num"') {
+                            reviewThreads(first: 100) { nodes { isResolved } }
+                        }
+                    } }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "?")
+
+                # Check shepherd status
+                local lock_file="$STATE_DIR/shepherd-$pr_num.lock"
+                local status_icon status_text
+                if [[ -f "$lock_file" ]] && kill -0 "$(cat "$lock_file" 2>/dev/null)" 2>/dev/null; then
+                    status_icon="🔄"
+                    status_text="Shepherd running"
+                elif [[ "$unresolved" == "0" ]]; then
+                    status_icon="✅"
+                    status_text="Healthy"
+                else
+                    status_icon="⏳"
+                    status_text="Pending"
+                fi
+
+                printf "║  #%-4s ║ %-33s ║     %-6s ║ %s %-14s ║\n" \
+                    "$pr_num" "$pr_title" "$unresolved" "$status_icon" "$status_text"
+            done
+
+            echo "╠════════╩═══════════════════════════════════════════════════════════════════════╣"
+            echo "║                              🤖 ACTIVE AGENTS                                  ║"
+            echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+
+            local agent_count=0
+            shopt -s nullglob 2>/dev/null || true
+            for lock_file in "$STATE_DIR"/shepherd-*.lock; do
+                [[ -f "$lock_file" ]] || continue
+                local pid=$(cat "$lock_file" 2>/dev/null)
+                if kill -0 "$pid" 2>/dev/null; then
+                    local pr_num=$(basename "$lock_file" .lock | sed 's/shepherd-//')
+                    local runtime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || echo "??:??")
+                    printf "║  🐑 Shepherd #%-4s │ PID: %-8s │ Runtime: %-10s │ Working...       ║\n" \
+                        "$pr_num" "$pid" "$runtime"
+                    ((agent_count++)) || true
+                fi
+            done
+            shopt -u nullglob 2>/dev/null || true
+
+            if [[ $agent_count -eq 0 ]]; then
+                echo "║                          No active agents                                     ║"
+            fi
+
+            echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+
+            # Check for work agent
+            if [[ -f "$WORK_LOCK" ]] && kill -0 "$(cat "$WORK_LOCK" 2>/dev/null)" 2>/dev/null; then
+                local work_pid=$(cat "$WORK_LOCK")
+                local work_runtime=$(ps -o etime= -p "$work_pid" 2>/dev/null | tr -d ' ' || echo "??:??")
+                printf "║  🏗️  Epic Worker   │ PID: %-8s │ Runtime: %-10s │ Implementing...  ║\n" \
+                    "$work_pid" "$work_runtime"
+            fi
+
+            echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "Press Ctrl+C to stop"
+        }
+
+        while true; do
+
+            # Get repo info for GraphQL queries
+            repo_info=$(gh repo view --json owner,name -q '.owner.login + " " + .name' 2>/dev/null)
+            repo_owner=$(echo "$repo_info" | cut -d' ' -f1)
+            repo_name=$(echo "$repo_info" | cut -d' ' -f2)
+
+            # Get all open PRs
+            open_prs=$(gh pr list --state open --json number -q '.[].number' 2>/dev/null || echo "")
+
+            # Display ASCII UI
+            display_status "$repo_owner" "$repo_name"
+
+            if [[ -n "$open_prs" ]]; then
+                # Count active shepherds
+                active_count=0
+                shopt -s nullglob 2>/dev/null || true
+                for lock_file in "$STATE_DIR"/shepherd-*.lock; do
+                    [[ -f "$lock_file" ]] || continue
+                    if kill -0 "$(cat "$lock_file" 2>/dev/null)" 2>/dev/null; then
+                        ((active_count++)) || true
+                    else
+                        rm -f "$lock_file" 2>/dev/null || true
+                    fi
+                done
+                shopt -u nullglob 2>/dev/null || true
+
+                for pr_num in $open_prs; do
+                    SHEPHERD_LOCK="$STATE_DIR/shepherd-$pr_num.lock"
+
+                    # Check if shepherd already running for this PR
+                    if [[ -f "$SHEPHERD_LOCK" ]]; then
+                        shepherd_pid=$(cat "$SHEPHERD_LOCK")
+                        if kill -0 "$shepherd_pid" 2>/dev/null; then
+                            continue
+                        else
+                            rm -f "$SHEPHERD_LOCK"
+                        fi
+                    fi
+
+                    # Check if we're at max capacity
+                    [[ $active_count -ge $MAX_CONCURRENT_SHEPHERDS ]] && continue
+
+                    # Check PR state including unresolved comments
+                    pr_state=$(gh pr view "$pr_num" --json state,statusCheckRollup,reviews \
+                        -q '{state: .state, checks: [.statusCheckRollup[]? | .conclusion], reviews: [.reviews[]? | .state]}' 2>/dev/null)
+
+                    checks_failed=$(echo "$pr_state" | grep -q '"FAILURE"\|"ERROR"\|null' && echo "yes" || echo "no")
+                    has_changes_requested=$(echo "$pr_state" | grep -q '"CHANGES_REQUESTED"' && echo "yes" || echo "no")
+
+                    # Check for unresolved review threads using GraphQL
+                    unresolved_count=$(gh api graphql -f query='
+                        query { repository(owner: "'"$repo_owner"'", name: "'"$repo_name"'") {
+                            pullRequest(number: '"$pr_num"') {
+                                reviewThreads(first: 100) {
+                                    nodes { isResolved }
+                                }
+                            }
+                        } }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "0")
+                    has_unresolved=$([[ "$unresolved_count" -gt 0 ]] && echo "yes" || echo "no")
+
+                    if [[ "$checks_failed" == "yes" ]] || [[ "$has_changes_requested" == "yes" ]] || [[ "$has_unresolved" == "yes" ]]; then
+                        "$0" shepherd "$pr_num" </dev/null >/dev/null 2>&1 &
+                        shepherd_bg_pid=$!
+                        echo "$shepherd_bg_pid" > "$SHEPHERD_LOCK"
+                        ((active_count++)) || true
+                    fi
+                done
+            fi
+
+            # Check for pending epics/stories (only if no PRs need work)
+            if ! pr_is_open; then
+                if [[ -f "$WORK_LOCK" ]]; then
+                    work_pid=$(cat "$WORK_LOCK")
+                    if ! kill -0 "$work_pid" 2>/dev/null; then
+                        rm -f "$WORK_LOCK"
+                    fi
+                else
+                    # Find epics with uncompleted stories
+                    # Check both docs/bmad/epics/ and _bmad-output/epics-*.md
+                    pending_epic=""
+                    shopt -s nullglob
+                    for epic_file in docs/bmad/epics/*.md _bmad-output/epics-*.md; do
+                        [[ -f "$epic_file" ]] || continue
+                        # Check if epic has unchecked items
+                        if grep -q '\- \[ \]' "$epic_file" 2>/dev/null; then
+                            pending_epic="$epic_file"
+                            break
+                        fi
+                    done
+                    shopt -u nullglob
+
+                    if [[ -n "$pending_epic" ]]; then
+                        echo "[EPICS] Found pending epic: $pending_epic"
+                        epic_name=$(basename "$pending_epic" .md)
+                        wt_name="bmad-$(date +%s)"
+
+                        wt_path=$(worktree_create "$wt_name")
+                        cd "$wt_path"
+                        claude -p "Use the Task tool with subagent_type=\"bmad-orchestrator\" to work on epic: $pending_epic
+
+Working directory: $wt_path
+
+When done, run: orchestrate done $wt_name" --dangerously-skip-permissions &
+                        work_bg_pid=$!
+                        echo "$work_bg_pid" > "$WORK_LOCK"
+                        cd "$SCRIPT_DIR"
+                    fi
+                fi
+            fi
+
+            sleep "$LOOP_INTERVAL"
+        done
+        ;;
+
     # ==================== Interactive ====================
     interactive|int|"")
         cat <<'EOF'
@@ -467,6 +721,13 @@ Only ONE PR open at a time. Finished work queues for next PR.
 
 Usage: $0 <command> [args]
 
+Automated Loop:
+  loop                    Run fully automated loop (Ctrl+C to stop)
+                          - Watches/fixes open PRs
+                          - Fixes build/test errors
+                          - Implements pending epics
+                          Set LOOP_INTERVAL=N for custom interval (default: 30s)
+
 PR Queue Commands:
   pr set <number>         Set existing PR as current (to watch)
   pr queue                Show queued finished work
@@ -498,7 +759,14 @@ Workflow:
   5. orchestrate shepherd <pr_number>
   6. (when PR merged, next queued work creates PR)
 
+Automated Loop Workflow:
+  1. orchestrate loop     # Start automated loop
+  2. (loop checks PRs, fixes issues, implements epics)
+  3. Ctrl+C to stop
+
 Examples:
+  $0 loop                             # Start automated orchestration
+  LOOP_INTERVAL=60 $0 loop            # Check every 60 seconds
   $0 pr set 60                        # Set existing PR #60 as current
   $0 shepherd 60                      # Watch and fix PR #60
   $0 develop "Add auth" auth-feature
