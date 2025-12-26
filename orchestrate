@@ -686,6 +686,91 @@ When done, run: orchestrate done $wt_name" --dangerously-skip-permissions &
         done
         ;;
 
+    # Status display (one-shot, for viewing from another terminal)
+    status|st)
+        repo_info=$(gh repo view --json owner,name -q '.owner.login + " " + .name' 2>/dev/null)
+        repo_owner=$(echo "$repo_info" | cut -d' ' -f1)
+        repo_name=$(echo "$repo_info" | cut -d' ' -f2)
+        open_prs=$(gh pr list --state open --json number -q '.[].number' 2>/dev/null || echo "")
+
+        clear
+        echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+        echo "║                        🤖 ORCHESTRATE - Status                               ║"
+        echo "║                              $repo_owner/$repo_name"
+        printf "║%78s║\n" ""
+        echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+        echo "║  ⏰ $(date '+%Y-%m-%d %H:%M:%S')                                                      ║"
+        echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+        echo "║                              📋 PULL REQUESTS                                ║"
+        echo "╠════════╦═══════════════════════════════════╦════════════╦════════════════════╣"
+        echo "║   PR   ║             Title                 ║  Threads   ║      Status        ║"
+        echo "╠════════╬═══════════════════════════════════╬════════════╬════════════════════╣"
+
+        for pr_num in $open_prs; do
+            pr_title=$(gh pr view "$pr_num" --json title -q '.title' 2>/dev/null | cut -c1-33)
+            unresolved=$(gh api graphql -f query='
+                query { repository(owner: "'"$repo_owner"'", name: "'"$repo_name"'") {
+                    pullRequest(number: '"$pr_num"') {
+                        reviewThreads(first: 100) { nodes { isResolved } }
+                    }
+                } }' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "?")
+
+            lock_file="$STATE_DIR/shepherd-$pr_num.lock"
+            if [[ -f "$lock_file" ]] && kill -0 "$(cat "$lock_file" 2>/dev/null)" 2>/dev/null; then
+                status_icon="🔄"
+                status_text="Shepherd running"
+            elif [[ "$unresolved" == "0" ]]; then
+                status_icon="✅"
+                status_text="Healthy"
+            else
+                status_icon="⏳"
+                status_text="Pending"
+            fi
+
+            printf "║  #%-4s ║ %-33s ║     %-6s ║ %s %-14s ║\n" \
+                "$pr_num" "$pr_title" "$unresolved" "$status_icon" "$status_text"
+        done
+
+        if [[ -z "$open_prs" ]]; then
+            echo "║                          No open PRs                                         ║"
+        fi
+
+        echo "╠════════╩═══════════════════════════════════════════════════════════════════════╣"
+        echo "║                              🤖 ACTIVE AGENTS                                  ║"
+        echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+
+        agent_count=0
+        shopt -s nullglob 2>/dev/null || true
+        for lock_file in "$STATE_DIR"/shepherd-*.lock; do
+            [[ -f "$lock_file" ]] || continue
+            pid=$(cat "$lock_file" 2>/dev/null)
+            if kill -0 "$pid" 2>/dev/null; then
+                pr_num=$(basename "$lock_file" .lock | sed 's/shepherd-//')
+                runtime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || echo "??:??")
+                printf "║  🐑 Shepherd #%-4s │ PID: %-8s │ Runtime: %-10s │ Working...       ║\n" \
+                    "$pr_num" "$pid" "$runtime"
+                ((agent_count++)) || true
+            fi
+        done
+        shopt -u nullglob 2>/dev/null || true
+
+        if [[ $agent_count -eq 0 ]]; then
+            echo "║                          No active agents                                     ║"
+        fi
+
+        echo "╠══════════════════════════════════════════════════════════════════════════════╣"
+
+        # Check for work agent
+        if [[ -f "$STATE_DIR/work.lock" ]] && kill -0 "$(cat "$STATE_DIR/work.lock" 2>/dev/null)" 2>/dev/null; then
+            work_pid=$(cat "$STATE_DIR/work.lock")
+            work_runtime=$(ps -o etime= -p "$work_pid" 2>/dev/null | tr -d ' ' || echo "??:??")
+            printf "║  🏗️  Epic Worker   │ PID: %-8s │ Runtime: %-10s │ Implementing...  ║\n" \
+                "$work_pid" "$work_runtime"
+        fi
+
+        echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+        ;;
+
     # ==================== Interactive ====================
     interactive|int|"")
         cat <<'EOF'
