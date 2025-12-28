@@ -8,6 +8,28 @@ members = [
     "crates/orchestrate-cli",
 ]
 
+# Integration tests package
+[package]
+name = "orchestrate-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration_tests.rs"
+
+[dev-dependencies]
+orchestrate-core.workspace = true
+orchestrate-web.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.4", features = ["util"] }
+axum.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+http-body-util = "0.1"
+futures = "0.3"
+
 [workspace.package]
 version = "0.1.1"
 edition = "2021"

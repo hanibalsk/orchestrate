@@ -17,7 +17,7 @@ pub mod worktree;
 pub mod pr;
 pub mod epic;
 
-pub use agent::{Agent, AgentState, AgentType};
+pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::Database;
 pub use error::{Error, Result};
 pub use message::{Message, MessageRole};
