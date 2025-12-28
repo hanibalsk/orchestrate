@@ -6,7 +6,7 @@ use orchestrate_core::{
 };
 use std::path::Path;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::client::{ClaudeClient, ContentBlock, CreateMessageRequest, MessageContent};
 use crate::tools::ToolExecutor;
@@ -19,6 +19,10 @@ pub struct LoopConfig {
     pub enable_instructions: bool,
     /// Enable learning from agent runs
     pub enable_learning: bool,
+    /// Max consecutive turns without progress before considering stuck
+    pub max_idle_turns: u32,
+    /// Max consecutive errors before aborting
+    pub max_consecutive_errors: u32,
 }
 
 impl Default for LoopConfig {
@@ -28,6 +32,8 @@ impl Default for LoopConfig {
             model: "claude-sonnet-4-20250514".to_string(),
             enable_instructions: true,
             enable_learning: true,
+            max_idle_turns: 5,
+            max_consecutive_errors: 3,
         }
     }
 }
@@ -118,14 +124,75 @@ impl AgentLoop {
 
         let mut turn = 0;
         let mut was_blocked = false;
+        let mut idle_turns = 0;  // Turns without tool calls or status signal
+        let mut consecutive_errors = 0;  // Consecutive API or tool errors
+        let mut last_tool_error: Option<String> = None;  // Track repeated errors
+
+        info!(
+            "[AGENT {}] Starting loop | Type: {:?} | Max turns: {} | Task: {}",
+            agent.id, agent.agent_type, self.config.max_turns,
+            agent.task.chars().take(100).collect::<String>()
+        );
 
         loop {
             turn += 1;
-            debug!("Agent {} turn {}/{}", agent.id, turn, self.config.max_turns);
+            let turn_start = Instant::now();
 
+            info!(
+                "[AGENT {}] Turn {}/{} | Idle: {}/{} | Errors: {}/{} | Messages: {}",
+                agent.id, turn, self.config.max_turns,
+                idle_turns, self.config.max_idle_turns,
+                consecutive_errors, self.config.max_consecutive_errors,
+                messages.len()
+            );
+
+            // Check max turns
             if turn > self.config.max_turns {
-                warn!("Agent {} reached max turns", agent.id);
-                agent.fail("Max turns reached")?;
+                error!(
+                    "[AGENT {}] STUCK: Reached max turns ({}) without completion",
+                    agent.id, self.config.max_turns
+                );
+                error!(
+                    "[AGENT {}] Last message: {}",
+                    agent.id,
+                    messages.last().map(|m| m.content.chars().take(200).collect::<String>()).unwrap_or_default()
+                );
+                agent.fail("Max turns reached - agent may be stuck in a loop")?;
+                break;
+            }
+
+            // Check idle turns (no progress)
+            if idle_turns >= self.config.max_idle_turns {
+                error!(
+                    "[AGENT {}] STUCK: {} consecutive turns without progress (no tools, no status signal)",
+                    agent.id, idle_turns
+                );
+                error!(
+                    "[AGENT {}] Last response: {}",
+                    agent.id,
+                    messages.last().map(|m| m.content.chars().take(500).collect::<String>()).unwrap_or_default()
+                );
+                agent.fail(&format!(
+                    "Agent stuck: {} turns without progress. Last response had no tool calls or status signals.",
+                    idle_turns
+                ))?;
+                break;
+            }
+
+            // Check consecutive errors
+            if consecutive_errors >= self.config.max_consecutive_errors {
+                error!(
+                    "[AGENT {}] STUCK: {} consecutive errors",
+                    agent.id, consecutive_errors
+                );
+                if let Some(ref err) = last_tool_error {
+                    error!("[AGENT {}] Last error: {}", agent.id, err);
+                }
+                agent.fail(&format!(
+                    "Agent stuck: {} consecutive errors. Last error: {}",
+                    consecutive_errors,
+                    last_tool_error.as_deref().unwrap_or("unknown")
+                ))?;
                 break;
             }
 
@@ -142,8 +209,22 @@ impl AgentLoop {
                 tools: Some(self.tool_executor.get_tool_definitions(&agent.agent_type)),
             };
 
-            // Call Claude API
-            let response = self.client.create_message(request).await?;
+            // Call Claude API with error handling
+            let response = match self.client.create_message(request).await {
+                Ok(resp) => {
+                    consecutive_errors = 0;  // Reset on success
+                    resp
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    last_tool_error = Some(format!("API error: {}", e));
+                    error!(
+                        "[AGENT {}] API error (attempt {}/{}): {}",
+                        agent.id, consecutive_errors, self.config.max_consecutive_errors, e
+                    );
+                    continue;  // Retry
+                }
+            };
 
             // Extract text and tool calls
             let mut text_content = String::new();
@@ -164,6 +245,11 @@ impl AgentLoop {
                 }
             }
 
+            debug!(
+                "[AGENT {}] Response: {} chars, {} tool calls, stop_reason: {:?}",
+                agent.id, text_content.len(), tool_calls.len(), response.stop_reason
+            );
+
             // Store assistant message
             let assistant_msg = Message::assistant(agent.id, &text_content)
                 .with_tool_calls(tool_calls.clone())
@@ -173,38 +259,83 @@ impl AgentLoop {
 
             // Check for blocked status
             if self.is_blocked_signal(&text_content) {
-                warn!("Agent {} is blocked", agent.id);
+                warn!("[AGENT {}] Agent signaled BLOCKED", agent.id);
                 was_blocked = true;
                 let reason = self.extract_blocked_reason(&text_content);
+                warn!("[AGENT {}] Block reason: {}", agent.id, reason);
                 agent.fail(&format!("Agent blocked: {}", reason))?;
                 break;
             }
 
             // Check for completion
             if response.stop_reason.as_deref() == Some("end_turn") && tool_calls.is_empty() {
-                // Check if agent signaled completion
                 if self.is_completion_signal(&text_content) {
-                    info!("Agent {} completed", agent.id);
+                    info!("[AGENT {}] Completed successfully!", agent.id);
                     agent.transition_to(AgentState::Completed)?;
                     break;
+                } else {
+                    // No tool calls and no status signal - this is an idle turn
+                    idle_turns += 1;
+                    warn!(
+                        "[AGENT {}] Idle turn {}/{}: No tool calls, no status signal",
+                        agent.id, idle_turns, self.config.max_idle_turns
+                    );
+                    warn!(
+                        "[AGENT {}] Response preview: {}...",
+                        agent.id,
+                        text_content.chars().take(200).collect::<String>()
+                    );
+                    // Continue to next turn - maybe agent will self-correct
+                    continue;
                 }
             }
 
             // Execute tool calls if any
             if !tool_calls.is_empty() {
+                idle_turns = 0;  // Reset idle counter - we're making progress
                 let mut results = Vec::new();
+                let mut had_error = false;
 
                 for tool_call in &tool_calls {
+                    debug!(
+                        "[AGENT {}] Executing tool: {} with input: {}",
+                        agent.id, tool_call.name,
+                        serde_json::to_string(&tool_call.input).unwrap_or_default().chars().take(200).collect::<String>()
+                    );
+
                     let result = self
                         .tool_executor
                         .execute(&tool_call.name, &tool_call.input, agent)
                         .await;
 
+                    let is_error = result.starts_with("Error:");
+                    if is_error {
+                        had_error = true;
+                        last_tool_error = Some(result.clone());
+                        warn!(
+                            "[AGENT {}] Tool '{}' error: {}",
+                            agent.id, tool_call.name,
+                            result.chars().take(200).collect::<String>()
+                        );
+                    } else {
+                        debug!(
+                            "[AGENT {}] Tool '{}' success: {} chars",
+                            agent.id, tool_call.name, result.len()
+                        );
+                    }
+
                     results.push(orchestrate_core::message::ToolResult {
                         tool_call_id: tool_call.id.clone(),
                         content: result.clone(),
-                        is_error: result.starts_with("Error:"),
+                        is_error,
                     });
+                }
+
+                // Track consecutive errors
+                if had_error {
+                    consecutive_errors += 1;
+                } else {
+                    consecutive_errors = 0;
                 }
 
                 // Store tool results
@@ -215,11 +346,23 @@ impl AgentLoop {
 
             // Check if waiting for external
             if self.needs_external_wait(&text_content) {
-                info!("Agent {} waiting for external event", agent.id);
+                info!("[AGENT {}] Waiting for external event", agent.id);
                 agent.transition_to(AgentState::WaitingForExternal)?;
                 break;
             }
+
+            let turn_elapsed = turn_start.elapsed();
+            debug!(
+                "[AGENT {}] Turn {} completed in {:?}",
+                agent.id, turn, turn_elapsed
+            );
         }
+
+        let total_elapsed = start_time.elapsed();
+        info!(
+            "[AGENT {}] Loop finished | State: {:?} | Turns: {} | Time: {:?}",
+            agent.id, agent.state, turn, total_elapsed
+        );
 
         // Record instruction outcomes and apply learning
         let success = agent.state == AgentState::Completed;
