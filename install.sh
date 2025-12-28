@@ -257,17 +257,38 @@ install() {
 
 install_local() {
     local target="${1:-.}"
+    local install_dir="$target/.orchestrate"
 
-    log_info "Installing to local project: $target"
+    log_info "Installing to local project: $install_dir"
 
-    # Create directories
-    mkdir -p "$target/.claude/agents"
-    mkdir -p "$target/scripts"
+    # Create .orchestrate directory structure
+    mkdir -p "$install_dir/agents"
+    mkdir -p "$install_dir/scripts"
 
-    # Install only bin, script, and agent types
-    parse_manifest "bin,script,agent" | while read -r type path mode; do
+    # Install files to .orchestrate directory
+    parse_manifest "bin,script,agent,config" | while read -r type path mode; do
         local src="$SCRIPT_DIR/$path"
-        local dst="$target/$path"
+        local dst
+
+        # Map paths to .orchestrate structure
+        case "$type" in
+            bin)
+                dst="$install_dir/$(basename "$path")"
+                ;;
+            script)
+                dst="$install_dir/scripts/$(basename "$path")"
+                ;;
+            agent)
+                # .claude/agents/foo.md -> .orchestrate/agents/foo.md
+                dst="$install_dir/agents/$(basename "$path")"
+                ;;
+            config)
+                dst="$install_dir/$(basename "$path")"
+                ;;
+            *)
+                dst="$install_dir/$path"
+                ;;
+        esac
 
         if [[ ! -e "$src" ]]; then
             log_debug "Skipping (not found): $path"
@@ -278,10 +299,24 @@ install_local() {
         cp "$src" "$dst"
         chmod "$mode" "$dst"
 
-        log_info "Installed: $path"
+        log_info "Installed: $dst"
     done
 
+    # Copy manifest
+    cp "$MANIFEST_FILE" "$install_dir/MANIFEST"
+
+    # Create wrapper script in project root
+    cat > "$target/orchestrate" <<'WRAPPER'
+#!/usr/bin/env bash
+# Orchestrate wrapper - delegates to .orchestrate/orchestrate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/.orchestrate/orchestrate" "$@"
+WRAPPER
+    chmod 755 "$target/orchestrate"
+
     log_info "Local installation complete!"
+    echo ""
+    echo "Files installed to: $install_dir"
     echo ""
     echo "Usage:"
     echo "  cd $target"
