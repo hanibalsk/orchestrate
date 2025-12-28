@@ -3,9 +3,12 @@
 //! This crate provides the web interface:
 //! - REST API
 //! - WebSocket for real-time updates
+//! - HTML UI for agent management
 //! - Chat interface
 
 pub mod api;
+pub mod ui;
 pub mod websocket;
 
 pub use api::create_router;
+pub use ui::create_ui_router;

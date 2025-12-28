@@ -30,8 +30,12 @@ toml = "0.8"
 # HTTP/WebSocket
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 reqwest = { version = "0.11", features = ["json"] }
+
+# Templates
+askama = "0.12"
+askama_axum = "0.4"
 
 # CLI
 clap = { version = "4.4", features = ["derive", "env"] }

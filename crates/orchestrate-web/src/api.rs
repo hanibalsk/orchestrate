@@ -125,16 +125,16 @@ async fn auth_middleware(
     }
 }
 
-/// Create the API router
-pub fn create_router(state: Arc<AppState>) -> Router {
+/// Create the API router (API endpoints only)
+pub fn create_api_router(state: Arc<AppState>) -> Router {
     // Routes that require authentication
     let protected_routes = Router::new()
         .route("/api/agents", get(list_agents).post(create_agent))
-        .route("/api/agents/:id", get(get_agent))
-        .route("/api/agents/:id/pause", post(pause_agent))
-        .route("/api/agents/:id/resume", post(resume_agent))
-        .route("/api/agents/:id/terminate", post(terminate_agent))
-        .route("/api/agents/:id/messages", get(get_messages))
+        .route("/api/agents/{id}", get(get_agent))
+        .route("/api/agents/{id}/pause", post(pause_agent))
+        .route("/api/agents/{id}/resume", post(resume_agent))
+        .route("/api/agents/{id}/terminate", post(terminate_agent))
+        .route("/api/agents/{id}/messages", get(get_messages))
         .route("/api/status", get(system_status))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
@@ -146,6 +146,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(protected_routes)
         .merge(public_routes)
         .with_state(state)
+}
+
+/// Create the full router with both API and UI routes
+pub fn create_router(state: Arc<AppState>) -> Router {
+    let api_router = create_api_router(state.clone());
+    let ui_router = crate::ui::create_ui_router().with_state(state);
+
+    Router::new()
+        .merge(api_router)
+        .merge(ui_router)
 }
 
 // ==================== Handlers ====================
