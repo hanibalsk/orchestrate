@@ -332,6 +332,8 @@ impl Agent {
 mod tests {
     use super::*;
 
+    // ==================== AgentState Tests ====================
+
     #[test]
     fn test_state_transitions() {
         assert!(AgentState::Created.can_transition_to(AgentState::Initializing));
@@ -341,9 +343,216 @@ mod tests {
     }
 
     #[test]
+    fn test_state_transitions_from_created() {
+        let created = AgentState::Created;
+        assert!(created.can_transition_to(AgentState::Initializing));
+        assert!(created.can_transition_to(AgentState::Terminated));
+        assert!(!created.can_transition_to(AgentState::Running));
+        assert!(!created.can_transition_to(AgentState::Completed));
+        assert!(!created.can_transition_to(AgentState::Paused));
+    }
+
+    #[test]
+    fn test_state_transitions_from_running() {
+        let running = AgentState::Running;
+        assert!(running.can_transition_to(AgentState::WaitingForInput));
+        assert!(running.can_transition_to(AgentState::WaitingForExternal));
+        assert!(running.can_transition_to(AgentState::Paused));
+        assert!(running.can_transition_to(AgentState::Completed));
+        assert!(running.can_transition_to(AgentState::Failed));
+        assert!(running.can_transition_to(AgentState::Terminated));
+        assert!(!running.can_transition_to(AgentState::Created));
+        assert!(!running.can_transition_to(AgentState::Initializing));
+    }
+
+    #[test]
+    fn test_state_transitions_from_paused() {
+        let paused = AgentState::Paused;
+        assert!(paused.can_transition_to(AgentState::Running));
+        assert!(paused.can_transition_to(AgentState::Terminated));
+        assert!(!paused.can_transition_to(AgentState::Completed));
+        assert!(!paused.can_transition_to(AgentState::Created));
+    }
+
+    #[test]
+    fn test_terminal_states() {
+        assert!(AgentState::Completed.is_terminal());
+        assert!(AgentState::Failed.is_terminal());
+        assert!(AgentState::Terminated.is_terminal());
+        assert!(!AgentState::Created.is_terminal());
+        assert!(!AgentState::Running.is_terminal());
+        assert!(!AgentState::Paused.is_terminal());
+    }
+
+    #[test]
+    fn test_accepts_input() {
+        assert!(AgentState::Running.accepts_input());
+        assert!(AgentState::WaitingForInput.accepts_input());
+        assert!(!AgentState::Created.accepts_input());
+        assert!(!AgentState::Paused.accepts_input());
+        assert!(!AgentState::Completed.accepts_input());
+    }
+
+    #[test]
+    fn test_state_as_str() {
+        assert_eq!(AgentState::Created.as_str(), "created");
+        assert_eq!(AgentState::Running.as_str(), "running");
+        assert_eq!(AgentState::WaitingForInput.as_str(), "waiting_for_input");
+        assert_eq!(AgentState::Completed.as_str(), "completed");
+    }
+
+    #[test]
+    fn test_state_from_str() {
+        assert_eq!(AgentState::from_str("created").unwrap(), AgentState::Created);
+        assert_eq!(AgentState::from_str("running").unwrap(), AgentState::Running);
+        assert_eq!(AgentState::from_str("waiting_for_input").unwrap(), AgentState::WaitingForInput);
+        assert!(AgentState::from_str("invalid").is_err());
+    }
+
+    // ==================== AgentType Tests ====================
+
+    #[test]
+    fn test_agent_type_as_str() {
+        assert_eq!(AgentType::StoryDeveloper.as_str(), "story_developer");
+        assert_eq!(AgentType::CodeReviewer.as_str(), "code_reviewer");
+        assert_eq!(AgentType::PrShepherd.as_str(), "pr_shepherd");
+    }
+
+    #[test]
+    fn test_agent_type_from_str() {
+        assert_eq!(AgentType::from_str("story_developer").unwrap(), AgentType::StoryDeveloper);
+        assert_eq!(AgentType::from_str("code_reviewer").unwrap(), AgentType::CodeReviewer);
+        assert!(AgentType::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_agent_type_default_model() {
+        assert_eq!(AgentType::Explorer.default_model(), "claude-3-haiku-20240307");
+        assert_eq!(AgentType::StoryDeveloper.default_model(), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_agent_type_allowed_tools() {
+        let explorer_tools = AgentType::Explorer.allowed_tools();
+        assert!(explorer_tools.contains(&"Read"));
+        assert!(explorer_tools.contains(&"Glob"));
+        assert!(!explorer_tools.contains(&"Write"));
+
+        let developer_tools = AgentType::StoryDeveloper.allowed_tools();
+        assert!(developer_tools.contains(&"Write"));
+        assert!(developer_tools.contains(&"Edit"));
+        assert!(developer_tools.contains(&"Task"));
+    }
+
+    #[test]
+    fn test_agent_type_max_turns() {
+        assert_eq!(AgentType::Explorer.default_max_turns(), 20);
+        assert_eq!(AgentType::CodeReviewer.default_max_turns(), 30);
+        assert_eq!(AgentType::StoryDeveloper.default_max_turns(), 80);
+    }
+
+    // ==================== Agent Tests ====================
+
+    #[test]
     fn test_agent_creation() {
         let agent = Agent::new(AgentType::StoryDeveloper, "Implement auth feature");
         assert_eq!(agent.state, AgentState::Created);
         assert_eq!(agent.task, "Implement auth feature");
+        assert_eq!(agent.agent_type, AgentType::StoryDeveloper);
+        assert!(agent.error_message.is_none());
+        assert!(agent.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_agent_with_context() {
+        let context = AgentContext {
+            epic_id: Some("epic-1".to_string()),
+            story_id: Some("story-1".to_string()),
+            pr_number: Some(42),
+            branch_name: Some("feature/auth".to_string()),
+            working_directory: Some("/tmp/work".to_string()),
+            custom: serde_json::json!({"key": "value"}),
+        };
+
+        let agent = Agent::new(AgentType::StoryDeveloper, "Test task").with_context(context);
+        assert_eq!(agent.context.epic_id, Some("epic-1".to_string()));
+        assert_eq!(agent.context.pr_number, Some(42));
+    }
+
+    #[test]
+    fn test_agent_with_parent() {
+        let parent_id = Uuid::new_v4();
+        let agent = Agent::new(AgentType::Explorer, "Sub task").with_parent(parent_id);
+        assert_eq!(agent.parent_agent_id, Some(parent_id));
+    }
+
+    #[test]
+    fn test_agent_with_worktree() {
+        let agent = Agent::new(AgentType::StoryDeveloper, "Task")
+            .with_worktree("worktree-123");
+        assert_eq!(agent.worktree_id, Some("worktree-123".to_string()));
+    }
+
+    #[test]
+    fn test_agent_transition_success() {
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Task");
+        assert!(agent.transition_to(AgentState::Initializing).is_ok());
+        assert_eq!(agent.state, AgentState::Initializing);
+
+        assert!(agent.transition_to(AgentState::Running).is_ok());
+        assert_eq!(agent.state, AgentState::Running);
+
+        assert!(agent.transition_to(AgentState::Completed).is_ok());
+        assert_eq!(agent.state, AgentState::Completed);
+        assert!(agent.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_agent_transition_failure() {
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Task");
+        // Cannot go directly from Created to Running
+        assert!(agent.transition_to(AgentState::Running).is_err());
+        assert_eq!(agent.state, AgentState::Created);
+    }
+
+    #[test]
+    fn test_agent_fail() {
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Task");
+        agent.transition_to(AgentState::Initializing).unwrap();
+        agent.transition_to(AgentState::Running).unwrap();
+
+        assert!(agent.fail("Something went wrong").is_ok());
+        assert_eq!(agent.state, AgentState::Failed);
+        assert_eq!(agent.error_message, Some("Something went wrong".to_string()));
+        assert!(agent.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_agent_terminate_from_any_state() {
+        // Test that any state can transition to Terminated
+        let states = [
+            AgentState::Created,
+            AgentState::Initializing,
+            AgentState::Running,
+            AgentState::WaitingForInput,
+            AgentState::WaitingForExternal,
+            AgentState::Paused,
+        ];
+
+        for state in states {
+            assert!(state.can_transition_to(AgentState::Terminated),
+                "Should be able to terminate from {:?}", state);
+        }
+    }
+
+    #[test]
+    fn test_agent_updated_at_changes() {
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Task");
+        let initial_updated_at = agent.updated_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        agent.transition_to(AgentState::Initializing).unwrap();
+        assert!(agent.updated_at > initial_updated_at);
     }
 }

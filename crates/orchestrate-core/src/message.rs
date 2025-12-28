@@ -164,3 +164,191 @@ impl Message {
         self.input_tokens + self.output_tokens
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== MessageRole Tests ====================
+
+    #[test]
+    fn test_message_role_as_str() {
+        assert_eq!(MessageRole::User.as_str(), "user");
+        assert_eq!(MessageRole::Assistant.as_str(), "assistant");
+        assert_eq!(MessageRole::System.as_str(), "system");
+        assert_eq!(MessageRole::Tool.as_str(), "tool");
+    }
+
+    #[test]
+    fn test_message_role_from_str() {
+        assert_eq!(MessageRole::from_str("user").unwrap(), MessageRole::User);
+        assert_eq!(MessageRole::from_str("assistant").unwrap(), MessageRole::Assistant);
+        assert_eq!(MessageRole::from_str("system").unwrap(), MessageRole::System);
+        assert_eq!(MessageRole::from_str("tool").unwrap(), MessageRole::Tool);
+        assert!(MessageRole::from_str("invalid").is_err());
+    }
+
+    // ==================== Message Tests ====================
+
+    #[test]
+    fn test_user_message() {
+        let agent_id = Uuid::new_v4();
+        let msg = Message::user(agent_id, "Hello, world!");
+
+        assert_eq!(msg.agent_id, agent_id);
+        assert_eq!(msg.role, MessageRole::User);
+        assert_eq!(msg.content, "Hello, world!");
+        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_results.is_none());
+        assert_eq!(msg.input_tokens, 0);
+        assert_eq!(msg.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_assistant_message() {
+        let agent_id = Uuid::new_v4();
+        let msg = Message::assistant(agent_id, "I can help with that.");
+
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.content, "I can help with that.");
+    }
+
+    #[test]
+    fn test_system_message() {
+        let agent_id = Uuid::new_v4();
+        let msg = Message::system(agent_id, "You are a helpful assistant.");
+
+        assert_eq!(msg.role, MessageRole::System);
+        assert_eq!(msg.content, "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_tool_result_message() {
+        let agent_id = Uuid::new_v4();
+        let results = vec![
+            ToolResult {
+                tool_call_id: "call_123".to_string(),
+                content: "File content here".to_string(),
+                is_error: false,
+            },
+            ToolResult {
+                tool_call_id: "call_456".to_string(),
+                content: "Error: file not found".to_string(),
+                is_error: true,
+            },
+        ];
+
+        let msg = Message::tool_result(agent_id, results);
+
+        assert_eq!(msg.role, MessageRole::Tool);
+        assert!(msg.content.is_empty());
+        assert!(msg.tool_results.is_some());
+        let tool_results = msg.tool_results.unwrap();
+        assert_eq!(tool_results.len(), 2);
+        assert!(!tool_results[0].is_error);
+        assert!(tool_results[1].is_error);
+    }
+
+    #[test]
+    fn test_message_with_tool_calls() {
+        let agent_id = Uuid::new_v4();
+        let tool_calls = vec![
+            ToolCall {
+                id: "call_123".to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({"file_path": "/tmp/test.txt"}),
+            },
+        ];
+
+        let msg = Message::assistant(agent_id, "Let me read that file.")
+            .with_tool_calls(tool_calls);
+
+        assert!(msg.tool_calls.is_some());
+        let calls = msg.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+    }
+
+    #[test]
+    fn test_message_with_tokens() {
+        let agent_id = Uuid::new_v4();
+        let msg = Message::assistant(agent_id, "Response")
+            .with_tokens(100, 50);
+
+        assert_eq!(msg.input_tokens, 100);
+        assert_eq!(msg.output_tokens, 50);
+        assert_eq!(msg.total_tokens(), 150);
+    }
+
+    #[test]
+    fn test_total_tokens() {
+        let agent_id = Uuid::new_v4();
+        let mut msg = Message::user(agent_id, "Test");
+        msg.input_tokens = 25;
+        msg.output_tokens = 75;
+
+        assert_eq!(msg.total_tokens(), 100);
+    }
+
+    // ==================== ToolCall Tests ====================
+
+    #[test]
+    fn test_tool_call_serialization() {
+        let tool_call = ToolCall {
+            id: "call_abc".to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({
+                "command": "ls -la",
+                "timeout": 5000
+            }),
+        };
+
+        let json = serde_json::to_string(&tool_call).unwrap();
+        let parsed: ToolCall = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.id, "call_abc");
+        assert_eq!(parsed.name, "Bash");
+        assert_eq!(parsed.input["command"], "ls -la");
+    }
+
+    // ==================== ToolResult Tests ====================
+
+    #[test]
+    fn test_tool_result_success() {
+        let result = ToolResult {
+            tool_call_id: "call_123".to_string(),
+            content: "Operation completed successfully".to_string(),
+            is_error: false,
+        };
+
+        assert!(!result.is_error);
+        assert_eq!(result.tool_call_id, "call_123");
+    }
+
+    #[test]
+    fn test_tool_result_error() {
+        let result = ToolResult {
+            tool_call_id: "call_456".to_string(),
+            content: "Permission denied".to_string(),
+            is_error: true,
+        };
+
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn test_tool_result_serialization() {
+        let result = ToolResult {
+            tool_call_id: "call_789".to_string(),
+            content: "Result content".to_string(),
+            is_error: false,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: ToolResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.tool_call_id, result.tool_call_id);
+        assert_eq!(parsed.content, result.content);
+        assert_eq!(parsed.is_error, result.is_error);
+    }
+}
