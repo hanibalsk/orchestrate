@@ -307,6 +307,32 @@ impl ToolExecutor {
             });
         }
 
+        if allowed.contains(&"Task") {
+            tools.push(crate::client::Tool {
+                name: "task".to_string(),
+                description: "Spawn a sub-agent to handle a complex task. The sub-agent runs independently and returns results when complete.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "subagent_type": {
+                            "type": "string",
+                            "description": "Type of agent to spawn: story-developer, code-reviewer, issue-fixer, explorer, bmad-orchestrator, bmad-planner, pr-shepherd, conflict-resolver",
+                            "enum": ["story-developer", "code-reviewer", "issue-fixer", "explorer", "bmad-orchestrator", "bmad-planner", "pr-shepherd", "conflict-resolver"]
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The task description for the sub-agent"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Short 3-5 word description of what the agent will do"
+                        }
+                    },
+                    "required": ["subagent_type", "prompt", "description"]
+                }),
+            });
+        }
+
         tools
     }
 
@@ -321,6 +347,7 @@ impl ToolExecutor {
             "edit" => self.execute_edit(input).await,
             "glob" => self.execute_glob(input).await,
             "grep" => self.execute_grep(input).await,
+            "task" => self.execute_task(input, agent).await,
             _ => Err(anyhow!("Unknown tool: {}", name)),
         };
 
@@ -498,6 +525,55 @@ impl ToolExecutor {
             .output()?;
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Execute a task by spawning a sub-agent
+    ///
+    /// Note: This is a placeholder that records the spawn request.
+    /// Actual agent execution happens via the AgentLoop which requires
+    /// database access. The calling code should check for task results
+    /// and run the spawned agent.
+    async fn execute_task(&self, input: &Value, parent: &Agent) -> Result<String> {
+        let subagent_type = input["subagent_type"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing subagent_type"))?;
+        let prompt = input["prompt"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing prompt"))?;
+        let description = input["description"]
+            .as_str()
+            .unwrap_or("Sub-agent task");
+
+        // Map string to AgentType
+        let agent_type = match subagent_type {
+            "story-developer" => AgentType::StoryDeveloper,
+            "code-reviewer" => AgentType::CodeReviewer,
+            "issue-fixer" => AgentType::IssueFixer,
+            "explorer" => AgentType::Explorer,
+            "bmad-orchestrator" => AgentType::BmadOrchestrator,
+            "bmad-planner" => AgentType::BmadPlanner,
+            "pr-shepherd" => AgentType::PrShepherd,
+            "conflict-resolver" => AgentType::ConflictResolver,
+            _ => return Err(anyhow!("Unknown subagent type: {}", subagent_type)),
+        };
+
+        // Create a spawn record
+        // In a full implementation, this would:
+        // 1. Create the agent in the database
+        // 2. Optionally run it synchronously or queue it
+        // 3. Return results when complete
+
+        // For now, return info about what would be spawned
+        // The actual spawning must happen at a higher level with DB access
+        Ok(json!({
+            "status": "spawn_requested",
+            "subagent_type": subagent_type,
+            "agent_type_enum": format!("{:?}", agent_type),
+            "description": description,
+            "prompt": prompt,
+            "parent_agent_id": parent.id.to_string(),
+            "note": "Task spawn recorded. The orchestrator will execute this sub-agent."
+        }).to_string())
     }
 }
 

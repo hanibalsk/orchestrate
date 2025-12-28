@@ -2,8 +2,9 @@
 
 use anyhow::Result;
 use orchestrate_core::{
-    Agent, AgentState, CustomInstruction, Database, LearningEngine, Message,
+    Agent, AgentState, AgentType, CustomInstruction, Database, LearningEngine, Message,
 };
+use std::path::Path;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -299,8 +300,30 @@ impl AgentLoop {
     }
 
     fn get_system_prompt(&self, agent: &Agent) -> String {
-        format!(
-            r#"You are an autonomous agent working on the following task:
+        // Try to load agent prompt from .claude/agents/ file
+        let agent_prompt = self.load_agent_prompt(&agent.agent_type);
+
+        if let Some(custom_prompt) = agent_prompt {
+            format!(
+                r#"{}
+
+## Current Task
+
+{}
+
+## Status Signals
+
+When you complete your task, respond with "STATUS: COMPLETE" in your message.
+If you need to wait for an external event (like PR review or CI), respond with "STATUS: WAITING".
+If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <reason>".
+"#,
+                custom_prompt,
+                agent.task
+            )
+        } else {
+            // Fallback to default prompt
+            format!(
+                r#"You are an autonomous agent working on the following task:
 
 {}
 
@@ -312,10 +335,67 @@ When you complete your task, respond with "STATUS: COMPLETE" in your message.
 If you need to wait for an external event (like PR review or CI), respond with "STATUS: WAITING".
 If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <reason>".
 "#,
-            agent.task,
-            agent.agent_type,
-            agent.agent_type.allowed_tools()
-        )
+                agent.task,
+                agent.agent_type,
+                agent.agent_type.allowed_tools()
+            )
+        }
+    }
+
+    /// Load agent prompt from .claude/agents/<type>.md file
+    fn load_agent_prompt(&self, agent_type: &AgentType) -> Option<String> {
+        let filename = match agent_type {
+            AgentType::StoryDeveloper => "story-developer.md",
+            AgentType::CodeReviewer => "code-reviewer.md",
+            AgentType::IssueFixer => "issue-fixer.md",
+            AgentType::Explorer => "explorer.md",
+            AgentType::BmadOrchestrator => "bmad-orchestrator.md",
+            AgentType::BmadPlanner => "bmad-planner.md",
+            AgentType::PrShepherd => "pr-shepherd.md",
+            AgentType::PrController => "pr-controller.md",
+            AgentType::ConflictResolver => "conflict-resolver.md",
+            AgentType::BackgroundController => "background-controller.md",
+            AgentType::Scheduler => "scheduler.md",
+        };
+
+        // Look for agent file in common locations
+        let paths = [
+            Path::new(".claude/agents").join(filename),
+            Path::new(".").join(".claude/agents").join(filename),
+        ];
+
+        for path in &paths {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    // Parse frontmatter and extract content after ---
+                    let prompt = self.extract_prompt_content(&content);
+                    if !prompt.is_empty() {
+                        debug!("Loaded agent prompt from {:?}", path);
+                        return Some(prompt);
+                    }
+                }
+            }
+        }
+
+        debug!("No custom prompt found for agent type {:?}", agent_type);
+        None
+    }
+
+    /// Extract prompt content from markdown file with frontmatter
+    fn extract_prompt_content(&self, content: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Check for frontmatter
+        if lines.first() == Some(&"---") {
+            // Find closing ---
+            if let Some(end_pos) = lines.iter().skip(1).position(|&l| l == "---") {
+                // Return content after frontmatter
+                return lines[end_pos + 2..].join("\n").trim().to_string();
+            }
+        }
+
+        // No frontmatter, return full content
+        content.trim().to_string()
     }
 
     fn get_system_prompt_with_instructions(

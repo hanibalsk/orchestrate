@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_core::{
     Agent, AgentType, CustomInstruction, Database,
-    LearningEngine, PatternStatus,
+    LearningEngine, PatternStatus, ShellState, QueueEntry,
 };
 use std::path::PathBuf;
 use tracing::Level;
@@ -453,15 +453,48 @@ async fn main() -> Result<()> {
                 // TODO: Implement merge
             }
             PrAction::Queue => {
-                let prs = db.get_pending_prs().await?;
-                println!("PR Queue ({} items):", prs.len());
-                for (i, pr) in prs.iter().enumerate() {
-                    println!(
-                        "  {}. {} ({:?})",
-                        i + 1,
-                        pr.branch_name,
-                        pr.status
-                    );
+                // Read from shell state file for compatibility
+                let shell_state = ShellState::new(".");
+                let queue = shell_state.queue_list().unwrap_or_default();
+                let current_pr = shell_state.current_pr().unwrap_or(None);
+
+                println!("=== PR Queue ({} items) ===", queue.len());
+                if queue.is_empty() {
+                    println!("  (empty)");
+                } else {
+                    for (i, entry) in queue.iter().enumerate() {
+                        println!("  {}. {} - {}", i + 1, entry.worktree, entry.title);
+                    }
+                }
+                println!();
+                println!("=== Current PR ===");
+                if let Some(pr_num) = current_pr {
+                    println!("  PR #{} (checking status...)", pr_num);
+                    // Try to get more info from gh
+                    if let Ok(output) = std::process::Command::new("gh")
+                        .args(["pr", "view", &pr_num.to_string(), "--json", "title,state,url"])
+                        .output()
+                    {
+                        if output.status.success() {
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                                println!("  Title: {}", json["title"].as_str().unwrap_or("-"));
+                                println!("  State: {}", json["state"].as_str().unwrap_or("-"));
+                                println!("  URL: {}", json["url"].as_str().unwrap_or("-"));
+                            }
+                        }
+                    }
+                } else {
+                    println!("  (none)");
+                }
+
+                // Also show database PRs for reference
+                let db_prs = db.get_pending_prs().await?;
+                if !db_prs.is_empty() {
+                    println!();
+                    println!("=== Database PRs ===");
+                    for pr in db_prs {
+                        println!("  - {} ({:?})", pr.branch_name, pr.status);
+                    }
                 }
             }
         },
@@ -530,19 +563,47 @@ async fn main() -> Result<()> {
                 .filter(|a| a.state == orchestrate_core::AgentState::Paused)
                 .count();
 
+            // Get shell state
+            let shell_state = ShellState::new(".");
+            let queue = shell_state.queue_list().unwrap_or_default();
+            let current_pr = shell_state.current_pr().unwrap_or(None);
+            let shepherd_locks = shell_state.shepherd_locks().unwrap_or_default();
+            let active_shepherds: Vec<_> = shepherd_locks.iter().filter(|l| l.is_active).collect();
+
             if json {
                 println!(
-                    r#"{{"total_agents":{},"running":{},"paused":{}}}"#,
+                    r#"{{"total_agents":{},"running":{},"paused":{},"queue_size":{},"current_pr":{},"active_shepherds":{}}}"#,
                     agents.len(),
                     running,
-                    paused
+                    paused,
+                    queue.len(),
+                    current_pr.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string()),
+                    active_shepherds.len()
                 );
             } else {
-                println!("System Status");
-                println!("=============");
-                println!("Total agents: {}", agents.len());
-                println!("Running: {}", running);
-                println!("Paused: {}", paused);
+                println!("╔══════════════════════════════════════════════════╗");
+                println!("║              ORCHESTRATE STATUS                  ║");
+                println!("╠══════════════════════════════════════════════════╣");
+                println!("║ Database Agents                                  ║");
+                println!("║   Total: {:3}  Running: {:3}  Paused: {:3}         ║", agents.len(), running, paused);
+                println!("╠══════════════════════════════════════════════════╣");
+                println!("║ PR Queue                                         ║");
+                println!("║   Queued: {:3}                                    ║", queue.len());
+                if let Some(pr_num) = current_pr {
+                    println!("║   Current PR: #{}                                ║", pr_num);
+                } else {
+                    println!("║   Current PR: (none)                             ║");
+                }
+                println!("╠══════════════════════════════════════════════════╣");
+                println!("║ Active Shepherds                                 ║");
+                if active_shepherds.is_empty() {
+                    println!("║   (none)                                         ║");
+                } else {
+                    for lock in &active_shepherds {
+                        println!("║   PR #{} (PID: {})                            ║", lock.pr_number, lock.pid);
+                    }
+                }
+                println!("╚══════════════════════════════════════════════════╝");
             }
         }
 

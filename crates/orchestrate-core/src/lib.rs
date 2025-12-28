@@ -15,6 +15,7 @@ pub mod learning;
 pub mod message;
 pub mod network;
 pub mod session;
+pub mod shell_state;
 pub mod worktree;
 pub mod pr;
 pub mod epic;
@@ -46,3 +47,6 @@ pub use network::{
     StepOutput, StepOutputType, ValidationError, ValidationResult,
     MAX_STEP_OUTPUT_DATA_SIZE,
 };
+
+// Re-export shell state types
+pub use shell_state::{ShellState, QueueEntry, ShepherdLock};
