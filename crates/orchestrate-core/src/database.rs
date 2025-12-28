@@ -373,6 +373,7 @@ impl Database {
     // ==================== Step Output Operations ====================
 
     /// Insert a step output
+    #[tracing::instrument(skip(self, output), level = "debug", fields(agent_id = %output.agent_id, skill = %output.skill_name))]
     pub async fn insert_step_output(&self, output: &StepOutput) -> Result<i64> {
         let result = sqlx::query(
             r#"
@@ -394,6 +395,7 @@ impl Database {
     }
 
     /// Get step outputs for an agent
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn get_step_outputs(&self, agent_id: AgentId) -> Result<Vec<StepOutput>> {
         let rows = sqlx::query_as::<_, StepOutputRow>(
             "SELECT * FROM step_outputs WHERE agent_id = ? ORDER BY created_at DESC",
@@ -406,6 +408,7 @@ impl Database {
     }
 
     /// Get unconsumed step outputs from specific agents (dependencies)
+    #[tracing::instrument(skip(self), level = "debug", fields(count = dependency_agent_ids.len()))]
     pub async fn get_dependency_outputs(&self, dependency_agent_ids: &[AgentId]) -> Result<Vec<StepOutput>> {
         if dependency_agent_ids.is_empty() {
             return Ok(vec![]);
@@ -438,6 +441,7 @@ impl Database {
     }
 
     /// Get the latest step output from an agent
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn get_latest_step_output(&self, agent_id: AgentId) -> Result<Option<StepOutput>> {
         let row = sqlx::query_as::<_, StepOutputRow>(
             "SELECT * FROM step_outputs WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -450,6 +454,7 @@ impl Database {
     }
 
     /// Get step outputs by skill name
+    #[tracing::instrument(skip(self), level = "debug")]
     pub async fn get_step_outputs_by_skill(&self, agent_id: AgentId, skill_name: &str) -> Result<Vec<StepOutput>> {
         let rows = sqlx::query_as::<_, StepOutputRow>(
             "SELECT * FROM step_outputs WHERE agent_id = ? AND skill_name = ? ORDER BY created_at DESC",
@@ -464,6 +469,7 @@ impl Database {
 
     /// Mark step outputs as consumed by an agent
     /// Returns the number of outputs that were actually consumed (not already consumed)
+    #[tracing::instrument(skip(self), level = "debug", fields(count = output_ids.len()))]
     pub async fn mark_outputs_consumed(&self, output_ids: &[i64], consumed_by: AgentId) -> Result<u64> {
         if output_ids.is_empty() {
             return Ok(0);

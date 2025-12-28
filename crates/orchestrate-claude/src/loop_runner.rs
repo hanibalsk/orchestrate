@@ -42,6 +42,7 @@ impl AgentLoop {
     }
 
     /// Run the agent loop
+    #[tracing::instrument(skip(self, agent), fields(agent_id = %agent.id, agent_type = ?agent.agent_type))]
     pub async fn run(&self, agent: &mut Agent) -> Result<()> {
         info!("Starting agent loop for agent {}", agent.id);
 

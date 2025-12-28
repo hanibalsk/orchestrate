@@ -4,7 +4,39 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_core::{Agent, AgentType, Database};
 use std::path::PathBuf;
+use tracing::Level;
 use tracing_subscriber::EnvFilter;
+
+/// Initialize logging with the specified verbosity level
+fn init_logging(verbose: u8, quiet: bool, json: bool) -> Result<()> {
+    let level = if quiet {
+        Level::ERROR
+    } else {
+        match verbose {
+            0 => Level::WARN,
+            1 => Level::INFO,
+            2 => Level::DEBUG,
+            _ => Level::TRACE,
+        }
+    };
+
+    let filter = EnvFilter::from_default_env()
+        .add_directive(format!("orchestrate={}", level).parse()?);
+
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(verbose >= 2)      // Show module path at debug+
+        .with_file(verbose >= 3)        // Show file:line at trace
+        .with_line_number(verbose >= 3);
+
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
+
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(name = "orchestrate")]
@@ -17,6 +49,18 @@ struct Cli {
     /// Database path
     #[arg(long, env = "ORCHESTRATE_DB_PATH", default_value = "~/.orchestrate/orchestrate.db")]
     db_path: String,
+
+    /// Increase verbosity (-v: info, -vv: debug, -vvv: trace)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Quiet mode (suppress non-error output)
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
+    /// Output logs as JSON (for machine parsing)
+    #[arg(long, global = true)]
+    log_json: bool,
 }
 
 #[derive(Subcommand)]
@@ -55,6 +99,11 @@ enum Commands {
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// Debug utilities
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
     },
 }
 
@@ -157,14 +206,28 @@ enum BmadAction {
     Reset,
 }
 
+#[derive(Subcommand)]
+enum DebugAction {
+    /// Show database info and statistics
+    Db,
+    /// Test database connection
+    Ping,
+    /// Show current configuration
+    Config,
+    /// Dump internal state
+    Dump {
+        /// What to dump: agents, prs, epics, all
+        #[arg(default_value = "all")]
+        target: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("orchestrate=info".parse()?))
-        .init();
-
     let cli = Cli::parse();
+
+    // Initialize logging with CLI options
+    init_logging(cli.verbose, cli.quiet, cli.log_json)?;
 
     // Expand home directory
     let db_path = shellexpand::tilde(&cli.db_path).to_string();
@@ -379,6 +442,74 @@ async fn main() -> Result<()> {
                 println!("Paused: {}", paused);
             }
         }
+
+        Commands::Debug { action } => match action {
+            DebugAction::Db => {
+                println!("Database Info");
+                println!("=============");
+                println!("Path: {}", db_path.display());
+                let agents = db.list_agents().await?;
+                let prs = db.get_pending_prs().await?;
+                let epics = db.get_pending_epics().await?;
+                println!("Agents: {}", agents.len());
+                println!("Pending PRs: {}", prs.len());
+                println!("Pending Epics: {}", epics.len());
+            }
+            DebugAction::Ping => {
+                let start = std::time::Instant::now();
+                let _ = db.list_agents().await?;
+                let elapsed = start.elapsed();
+                println!("Database ping: {:?}", elapsed);
+                println!("Connection: OK");
+            }
+            DebugAction::Config => {
+                println!("Configuration");
+                println!("=============");
+                println!("Database path: {}", db_path.display());
+                println!("Verbosity: {}", cli.verbose);
+                println!("Quiet mode: {}", cli.quiet);
+                println!("JSON logging: {}", cli.log_json);
+                println!("RUST_LOG: {}", std::env::var("RUST_LOG").unwrap_or_else(|_| "(not set)".to_string()));
+            }
+            DebugAction::Dump { target } => {
+                match target.as_str() {
+                    "agents" | "all" => {
+                        let agents = db.list_agents().await?;
+                        println!("=== Agents ({}) ===", agents.len());
+                        for agent in &agents {
+                            println!("{:#?}", agent);
+                        }
+                        if target == "agents" { return Ok(()); }
+                    }
+                    _ => {}
+                }
+                match target.as_str() {
+                    "prs" | "all" => {
+                        let prs = db.get_pending_prs().await?;
+                        println!("=== PRs ({}) ===", prs.len());
+                        for pr in &prs {
+                            println!("{:#?}", pr);
+                        }
+                        if target == "prs" { return Ok(()); }
+                    }
+                    _ => {}
+                }
+                match target.as_str() {
+                    "epics" | "all" => {
+                        let epics = db.get_pending_epics().await?;
+                        println!("=== Epics ({}) ===", epics.len());
+                        for epic in &epics {
+                            println!("{:#?}", epic);
+                        }
+                        if target == "epics" { return Ok(()); }
+                    }
+                    _ => {}
+                }
+                if !["agents", "prs", "epics", "all"].contains(&target.as_str()) {
+                    anyhow::bail!("Unknown dump target: {}. Use: agents, prs, epics, all", target);
+                }
+            }
+        },
     }
 
     Ok(())
