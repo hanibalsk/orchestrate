@@ -1000,3 +1000,186 @@ mod instructions {
         assert!(inst.is_none());
     }
 }
+
+// ==================== Token Tracking Tests ====================
+
+mod token_tracking {
+    use super::*;
+    use orchestrate_core::Session;
+
+    #[tokio::test]
+    async fn test_record_session_tokens() {
+        let db = setup_db().await;
+
+        // Create agent and session
+        let agent = Agent::new(AgentType::StoryDeveloper, "Test token tracking");
+        db.insert_agent(&agent).await.unwrap();
+
+        let session = Session::new(agent.id);
+        db.create_session(&session).await.unwrap();
+
+        // Record token usage for multiple turns
+        db.record_session_tokens(
+            &session.id,
+            agent.id,
+            1,      // turn
+            1000,   // input_tokens
+            500,    // output_tokens
+            800,    // cache_read_tokens
+            200,    // cache_write_tokens
+            5000,   // context_window_used
+            10,     // messages_included
+            2,      // messages_summarized
+        ).await.unwrap();
+
+        db.record_session_tokens(
+            &session.id,
+            agent.id,
+            2,
+            1200,
+            600,
+            1000,
+            100,
+            6000,
+            12,
+            3,
+        ).await.unwrap();
+
+        // Get session stats
+        let stats = db.get_session_token_stats(&session.id).await.unwrap();
+
+        assert_eq!(stats.turn_count, 2);
+        assert_eq!(stats.total_input_tokens, 2200);
+        assert_eq!(stats.total_output_tokens, 1100);
+        assert_eq!(stats.total_cache_read_tokens, 1800);
+        assert_eq!(stats.total_cache_write_tokens, 300);
+        assert_eq!(stats.total_messages_summarized, 5);
+
+        // Cache hit rate should be (1800 / 2200) * 100 = 81.8%
+        assert!(stats.cache_hit_rate > 80.0 && stats.cache_hit_rate < 83.0);
+    }
+
+    #[tokio::test]
+    async fn test_get_agent_token_stats() {
+        let db = setup_db().await;
+
+        // Create agent
+        let agent = Agent::new(AgentType::Explorer, "Test agent tokens");
+        db.insert_agent(&agent).await.unwrap();
+
+        // Create session and record tokens
+        let session = Session::new(agent.id);
+        db.create_session(&session).await.unwrap();
+
+        db.record_session_tokens(
+            &session.id,
+            agent.id,
+            1,
+            2000,
+            1000,
+            1500,
+            500,
+            10000,
+            20,
+            5,
+        ).await.unwrap();
+
+        // Get stats by agent ID
+        let stats = db.get_agent_token_stats(agent.id).await.unwrap();
+
+        assert_eq!(stats.turn_count, 1);
+        assert_eq!(stats.total_input_tokens, 2000);
+        assert_eq!(stats.total_output_tokens, 1000);
+        assert_eq!(stats.total_cache_read_tokens, 1500);
+    }
+
+    #[tokio::test]
+    async fn test_daily_token_usage_aggregation() {
+        let db = setup_db().await;
+
+        // Record usage for different models
+        db.update_daily_token_usage(
+            "claude-sonnet-4-20250514",
+            5000,
+            2000,
+            3000,
+            1000,
+        ).await.unwrap();
+
+        db.update_daily_token_usage(
+            "claude-sonnet-4-20250514",
+            3000,
+            1500,
+            2000,
+            500,
+        ).await.unwrap();
+
+        db.update_daily_token_usage(
+            "claude-haiku-3-20240307",
+            1000,
+            500,
+            800,
+            200,
+        ).await.unwrap();
+
+        // Get daily usage
+        let usage = db.get_daily_token_usage(1).await.unwrap();
+
+        // Should have 2 entries (one per model for today)
+        assert_eq!(usage.len(), 2);
+
+        // Find sonnet entry
+        let sonnet = usage.iter()
+            .find(|u| u.model.contains("sonnet"))
+            .unwrap();
+
+        assert_eq!(sonnet.total_input_tokens, 8000);
+        assert_eq!(sonnet.total_output_tokens, 3500);
+        assert_eq!(sonnet.total_cache_read_tokens, 5000);
+        assert_eq!(sonnet.total_cache_write_tokens, 1500);
+        assert_eq!(sonnet.request_count, 2);
+
+        // Cost should be calculated (Sonnet: $3/$15 per 1M)
+        assert!(sonnet.estimated_cost_usd.is_some());
+        let cost = sonnet.estimated_cost_usd.unwrap();
+        assert!(cost > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_empty_token_stats() {
+        let db = setup_db().await;
+
+        // Agent with no token data
+        let agent = Agent::new(AgentType::CodeReviewer, "No tokens");
+        db.insert_agent(&agent).await.unwrap();
+
+        // Get stats should return zeros
+        let stats = db.get_agent_token_stats(agent.id).await.unwrap();
+
+        assert_eq!(stats.turn_count, 0);
+        assert_eq!(stats.total_input_tokens, 0);
+        assert_eq!(stats.total_output_tokens, 0);
+        assert_eq!(stats.cache_hit_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_instruction_token_tracking() {
+        let db = setup_db().await;
+
+        // Create instruction
+        let instruction = orchestrate_core::CustomInstruction::global("token-test", "Test instruction for token tracking");
+        let id = db.insert_instruction(&instruction).await.unwrap();
+
+        // Record token usage - this should not fail
+        db.update_instruction_tokens(id, 5000, 2000, 3000, 1000).await.unwrap();
+        db.update_instruction_tokens(id, 3000, 1500, 2000, 500).await.unwrap();
+
+        // Verify instruction still exists and can be retrieved
+        let inst = db.get_instruction(id).await.unwrap();
+        assert!(inst.is_some());
+
+        // Verify effectiveness record exists
+        let eff = db.get_instruction_effectiveness(id).await.unwrap();
+        assert!(eff.is_some());
+    }
+}

@@ -1313,11 +1313,11 @@ impl Database {
         session_id: &str,
         agent_id: Uuid,
         turn_number: i32,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-        cache_write_tokens: i32,
-        context_window_used: i32,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        context_window_used: i64,
         messages_included: i32,
         messages_summarized: i32,
     ) -> Result<()> {
@@ -1348,64 +1348,94 @@ impl Database {
     }
 
     /// Update daily token usage aggregation
+    /// Uses INSERT ... ON CONFLICT to avoid race conditions
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn update_daily_token_usage(
         &self,
         model: &str,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-        cache_write_tokens: i32,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
     ) -> Result<()> {
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Try to update existing row first
-        let result = sqlx::query(
+        // Calculate estimated cost based on model pricing (USD per 1M tokens)
+        let estimated_cost = Self::calculate_token_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        );
+
+        // Use upsert to avoid race conditions
+        sqlx::query(
             r#"
-            UPDATE daily_token_usage SET
-                total_input_tokens = total_input_tokens + ?,
-                total_output_tokens = total_output_tokens + ?,
-                total_cache_read_tokens = total_cache_read_tokens + ?,
-                total_cache_write_tokens = total_cache_write_tokens + ?,
+            INSERT INTO daily_token_usage (
+                date, model,
+                total_input_tokens, total_output_tokens,
+                total_cache_read_tokens, total_cache_write_tokens,
+                request_count, agent_count, estimated_cost_usd,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+            ON CONFLICT(date, model) DO UPDATE SET
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+                total_cache_write_tokens = total_cache_write_tokens + excluded.total_cache_write_tokens,
                 request_count = request_count + 1,
-                updated_at = ?
-            WHERE date = ? AND model = ?
+                estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + excluded.estimated_cost_usd,
+                updated_at = excluded.updated_at
             "#,
         )
+        .bind(&date)
+        .bind(model)
         .bind(input_tokens)
         .bind(output_tokens)
         .bind(cache_read_tokens)
         .bind(cache_write_tokens)
+        .bind(estimated_cost)
         .bind(&now)
-        .bind(&date)
-        .bind(model)
+        .bind(&now)
         .execute(&self.pool)
         .await?;
 
-        // If no row was updated, insert a new one
-        if result.rows_affected() == 0 {
-            sqlx::query(
-                r#"
-                INSERT INTO daily_token_usage (
-                    date, model,
-                    total_input_tokens, total_output_tokens,
-                    total_cache_read_tokens, total_cache_write_tokens,
-                    request_count, agent_count
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, 1)
-                "#,
-            )
-            .bind(&date)
-            .bind(model)
-            .bind(input_tokens)
-            .bind(output_tokens)
-            .bind(cache_read_tokens)
-            .bind(cache_write_tokens)
-            .execute(&self.pool)
-            .await?;
-        }
-
         Ok(())
+    }
+
+    /// Calculate token cost in USD based on model pricing
+    /// Prices as of Dec 2024 (per 1M tokens)
+    fn calculate_token_cost(
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) -> f64 {
+        // Pricing per 1M tokens (USD)
+        let (input_price, output_price, cache_read_price, cache_write_price) = if model.contains("opus") {
+            // Claude Opus 4
+            (15.0, 75.0, 1.5, 18.75)  // cache read 90% off, cache write 25% premium
+        } else if model.contains("haiku") {
+            // Claude Haiku 3
+            (0.25, 1.25, 0.025, 0.3125)
+        } else {
+            // Claude Sonnet 4 (default)
+            (3.0, 15.0, 0.3, 3.75)
+        };
+
+        // Calculate regular input tokens (excluding cached)
+        let regular_input = input_tokens - cache_read_tokens - cache_write_tokens;
+
+        // Cost calculation
+        let input_cost = (regular_input as f64 / 1_000_000.0) * input_price;
+        let output_cost = (output_tokens as f64 / 1_000_000.0) * output_price;
+        let cache_read_cost = (cache_read_tokens as f64 / 1_000_000.0) * cache_read_price;
+        let cache_write_cost = (cache_write_tokens as f64 / 1_000_000.0) * cache_write_price;
+
+        input_cost + output_cost + cache_read_cost + cache_write_cost
     }
 
     /// Update instruction effectiveness with token data
@@ -1413,11 +1443,13 @@ impl Database {
     pub async fn update_instruction_tokens(
         &self,
         instruction_id: i64,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-        cache_write_tokens: i32,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
     ) -> Result<()> {
+        // First update the totals, then calculate avg in a separate step
+        // This ensures correct avg_tokens_per_run calculation
         sqlx::query(
             r#"
             UPDATE instruction_effectiveness SET
@@ -1425,9 +1457,10 @@ impl Database {
                 total_output_tokens = COALESCE(total_output_tokens, 0) + ?,
                 total_cache_read_tokens = COALESCE(total_cache_read_tokens, 0) + ?,
                 total_cache_write_tokens = COALESCE(total_cache_write_tokens, 0) + ?,
-                avg_tokens_per_run = (
-                    COALESCE(total_input_tokens, 0) + ? + COALESCE(total_output_tokens, 0) + ?
-                ) / CAST(COALESCE(usage_count, 1) AS REAL),
+                avg_tokens_per_run = CAST(
+                    (COALESCE(total_input_tokens, 0) + ? + COALESCE(total_output_tokens, 0) + ?)
+                    AS REAL
+                ) / CAST(MAX(COALESCE(usage_count, 1), 1) AS REAL),
                 updated_at = ?
             WHERE instruction_id = ?
             "#,
@@ -1457,8 +1490,8 @@ impl Database {
                 COALESCE(SUM(output_tokens), 0) as total_output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens,
                 COALESCE(SUM(cache_write_tokens), 0) as total_cache_write_tokens,
-                COALESCE(AVG(context_window_used), 0) as avg_context_used,
-                COALESCE(AVG(messages_included), 0) as avg_messages_included,
+                CAST(COALESCE(AVG(context_window_used), 0) AS REAL) as avg_context_used,
+                CAST(COALESCE(AVG(messages_included), 0) AS REAL) as avg_messages_included,
                 COALESCE(SUM(messages_summarized), 0) as total_messages_summarized
             FROM session_token_stats
             WHERE session_id = ?
@@ -1486,6 +1519,31 @@ impl Database {
         .await?;
 
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Get token stats for a specific agent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_agent_token_stats(&self, agent_id: Uuid) -> Result<TokenStats> {
+        let row = sqlx::query_as::<_, TokenStatsRow>(
+            r#"
+            SELECT
+                COUNT(*) as turn_count,
+                COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens,
+                COALESCE(SUM(cache_write_tokens), 0) as total_cache_write_tokens,
+                CAST(COALESCE(AVG(context_window_used), 0) AS REAL) as avg_context_used,
+                CAST(COALESCE(AVG(messages_included), 0) AS REAL) as avg_messages_included,
+                COALESCE(SUM(messages_summarized), 0) as total_messages_summarized
+            FROM session_token_stats
+            WHERE agent_id = ?
+            "#,
+        )
+        .bind(agent_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.into())
     }
 }
 

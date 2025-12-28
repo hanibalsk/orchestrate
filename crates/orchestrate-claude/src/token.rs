@@ -396,51 +396,6 @@ impl CachedPrompt {
     }
 }
 
-/// Prompt cache manager
-#[derive(Debug, Clone)]
-pub struct PromptCache {
-    /// Cached system prompts by hash
-    cached_hashes: Vec<u64>,
-    /// Maximum number of cached prompts to track
-    max_cached: usize,
-}
-
-impl Default for PromptCache {
-    fn default() -> Self {
-        Self::new(10)
-    }
-}
-
-impl PromptCache {
-    /// Create a new prompt cache
-    pub fn new(max_cached: usize) -> Self {
-        Self {
-            cached_hashes: Vec::new(),
-            max_cached,
-        }
-    }
-
-    /// Check if a prompt is cached
-    pub fn is_cached(&self, prompt: &CachedPrompt) -> bool {
-        self.cached_hashes.contains(&prompt.content_hash)
-    }
-
-    /// Mark a prompt as cached (called after API confirms caching)
-    pub fn mark_cached(&mut self, prompt: &CachedPrompt) {
-        if !self.cached_hashes.contains(&prompt.content_hash) {
-            // Remove oldest if at capacity
-            if self.cached_hashes.len() >= self.max_cached {
-                self.cached_hashes.remove(0);
-            }
-            self.cached_hashes.push(prompt.content_hash);
-        }
-    }
-
-    /// Clear the cache
-    pub fn clear(&mut self) {
-        self.cached_hashes.clear();
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -532,24 +487,6 @@ mod tests {
         assert!(prompt.tokens > 0);
         assert!(prompt.content_hash > 0);
         assert_eq!(prompt.cache_status, CacheStatus::Cacheable);
-    }
-
-    #[test]
-    fn test_prompt_cache() {
-        let mut cache = PromptCache::new(3);
-
-        let prompt1 = CachedPrompt::new("Prompt one".to_string());
-        let prompt2 = CachedPrompt::new("Prompt two".to_string());
-
-        assert!(!cache.is_cached(&prompt1));
-
-        cache.mark_cached(&prompt1);
-        assert!(cache.is_cached(&prompt1));
-        assert!(!cache.is_cached(&prompt2));
-
-        cache.mark_cached(&prompt2);
-        assert!(cache.is_cached(&prompt1));
-        assert!(cache.is_cached(&prompt2));
     }
 
     #[test]

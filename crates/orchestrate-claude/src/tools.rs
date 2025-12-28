@@ -203,6 +203,7 @@ impl ToolExecutor {
                     },
                     "required": ["command"]
                 }),
+                cache_control: None,
             });
         }
 
@@ -220,6 +221,7 @@ impl ToolExecutor {
                     },
                     "required": ["path"]
                 }),
+                cache_control: None,
             });
         }
 
@@ -241,6 +243,7 @@ impl ToolExecutor {
                     },
                     "required": ["path", "content"]
                 }),
+                cache_control: None,
             });
         }
 
@@ -266,6 +269,7 @@ impl ToolExecutor {
                     },
                     "required": ["path", "old_text", "new_text"]
                 }),
+                cache_control: None,
             });
         }
 
@@ -283,6 +287,7 @@ impl ToolExecutor {
                     },
                     "required": ["pattern"]
                 }),
+                cache_control: None,
             });
         }
 
@@ -304,6 +309,7 @@ impl ToolExecutor {
                     },
                     "required": ["pattern"]
                 }),
+                cache_control: None,
             });
         }
 
@@ -330,6 +336,7 @@ impl ToolExecutor {
                     },
                     "required": ["subagent_type", "prompt", "description"]
                 }),
+                cache_control: None,
             });
         }
 

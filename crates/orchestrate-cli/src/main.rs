@@ -123,6 +123,11 @@ enum Commands {
         #[command(subcommand)]
         action: HistoryAction,
     },
+    /// Token usage and cost tracking
+    Tokens {
+        #[command(subcommand)]
+        action: TokensAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -379,6 +384,41 @@ enum HistoryAction {
         /// Number of recent agents to analyze
         #[arg(short, long, default_value = "10")]
         limit: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokensAction {
+    /// Show daily token usage and costs
+    Daily {
+        /// Number of days to show (default: 7)
+        #[arg(short, long, default_value = "7")]
+        days: i32,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show token stats for a specific agent
+    Agent {
+        /// Agent ID
+        agent_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show token stats for a session
+    Session {
+        /// Session ID
+        session_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show overall token usage summary
+    Summary {
+        /// Number of days to analyze
+        #[arg(short, long, default_value = "30")]
+        days: i32,
     },
 }
 
@@ -1163,6 +1203,157 @@ async fn main() -> Result<()> {
                 println!("╚══════════════════════════════════════════════════════════════════════════════╝");
             }
         },
+
+        Commands::Tokens { action } => match action {
+            TokensAction::Daily { days, json } => {
+                let usage = db.get_daily_token_usage(days).await?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&usage)?);
+                    return Ok(());
+                }
+
+                if usage.is_empty() {
+                    println!("No token usage data found for the last {} days", days);
+                    return Ok(());
+                }
+
+                println!("Daily Token Usage (Last {} Days)", days);
+                println!("{}", "=".repeat(110));
+                println!("{:<12} {:<25} {:>12} {:>12} {:>12} {:>10} {:>12}",
+                    "DATE", "MODEL", "INPUT", "OUTPUT", "CACHE_READ", "REQUESTS", "EST. COST");
+                println!("{}", "-".repeat(110));
+
+                let mut total_cost = 0.0;
+                for day in &usage {
+                    let cost_str = day.estimated_cost_usd
+                        .map(|c| format!("${:.4}", c))
+                        .unwrap_or_else(|| "-".to_string());
+                    if let Some(c) = day.estimated_cost_usd {
+                        total_cost += c;
+                    }
+
+                    println!("{:<12} {:<25} {:>12} {:>12} {:>12} {:>10} {:>12}",
+                        day.date,
+                        &day.model[..day.model.len().min(25)],
+                        format_tokens(day.total_input_tokens),
+                        format_tokens(day.total_output_tokens),
+                        format_tokens(day.total_cache_read_tokens),
+                        day.request_count,
+                        cost_str
+                    );
+                }
+
+                println!("{}", "-".repeat(110));
+                println!("{:>97} ${:.4}", "TOTAL:", total_cost);
+            }
+            TokensAction::Agent { agent_id, json } => {
+                let uuid = uuid::Uuid::parse_str(&agent_id)?;
+                let stats = db.get_agent_token_stats(uuid).await?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                    return Ok(());
+                }
+
+                // Get agent info
+                if let Some(agent) = db.get_agent(uuid).await? {
+                    println!("Token Statistics for Agent {}", agent_id);
+                    println!("{}", "=".repeat(50));
+                    println!("Type: {:?}", agent.agent_type);
+                    println!("State: {:?}", agent.state);
+                    println!("Task: {}", if agent.task.len() > 60 {
+                        format!("{}...", &agent.task[..57])
+                    } else {
+                        agent.task.clone()
+                    });
+                    println!();
+                }
+
+                println!("Token Usage");
+                println!("{}", "-".repeat(50));
+                println!("Turns:                  {:>12}", stats.turn_count);
+                println!("Input tokens:           {:>12}", format_tokens(stats.total_input_tokens));
+                println!("Output tokens:          {:>12}", format_tokens(stats.total_output_tokens));
+                println!("Total tokens:           {:>12}", format_tokens(stats.total_input_tokens + stats.total_output_tokens));
+                println!();
+                println!("Cache Performance");
+                println!("{}", "-".repeat(50));
+                println!("Cache reads:            {:>12}", format_tokens(stats.total_cache_read_tokens));
+                println!("Cache writes:           {:>12}", format_tokens(stats.total_cache_write_tokens));
+                println!("Cache hit rate:         {:>11.1}%", stats.cache_hit_rate);
+                println!();
+                println!("Context Usage");
+                println!("{}", "-".repeat(50));
+                println!("Avg context used:       {:>12.0}", stats.avg_context_used);
+                println!("Avg messages included:  {:>12.1}", stats.avg_messages_included);
+                println!("Messages summarized:    {:>12}", stats.total_messages_summarized);
+            }
+            TokensAction::Session { session_id, json } => {
+                let stats = db.get_session_token_stats(&session_id).await?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                    return Ok(());
+                }
+
+                println!("Token Statistics for Session {}", session_id);
+                println!("{}", "=".repeat(50));
+                println!("Turns:                  {:>12}", stats.turn_count);
+                println!("Input tokens:           {:>12}", format_tokens(stats.total_input_tokens));
+                println!("Output tokens:          {:>12}", format_tokens(stats.total_output_tokens));
+                println!("Total tokens:           {:>12}", format_tokens(stats.total_input_tokens + stats.total_output_tokens));
+                println!();
+                println!("Cache Performance");
+                println!("{}", "-".repeat(50));
+                println!("Cache reads:            {:>12}", format_tokens(stats.total_cache_read_tokens));
+                println!("Cache writes:           {:>12}", format_tokens(stats.total_cache_write_tokens));
+                println!("Cache hit rate:         {:>11.1}%", stats.cache_hit_rate);
+            }
+            TokensAction::Summary { days } => {
+                let usage = db.get_daily_token_usage(days).await?;
+
+                if usage.is_empty() {
+                    println!("No token usage data found for the last {} days", days);
+                    return Ok(());
+                }
+
+                let total_input: i64 = usage.iter().map(|d| d.total_input_tokens).sum();
+                let total_output: i64 = usage.iter().map(|d| d.total_output_tokens).sum();
+                let total_cache_read: i64 = usage.iter().map(|d| d.total_cache_read_tokens).sum();
+                let total_cache_write: i64 = usage.iter().map(|d| d.total_cache_write_tokens).sum();
+                let total_requests: i64 = usage.iter().map(|d| d.request_count).sum();
+                let total_cost: f64 = usage.iter().filter_map(|d| d.estimated_cost_usd).sum();
+
+                let cache_hit_rate = if total_input > 0 {
+                    (total_cache_read as f64 / total_input as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                println!("╔══════════════════════════════════════════════════════════════╗");
+                println!("║               TOKEN USAGE SUMMARY ({} Days)                ║", days);
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║  Total Tokens                                                ║");
+                println!("║    Input:            {:>20}                    ║", format_tokens(total_input));
+                println!("║    Output:           {:>20}                    ║", format_tokens(total_output));
+                println!("║    Combined:         {:>20}                    ║", format_tokens(total_input + total_output));
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║  Cache Performance                                           ║");
+                println!("║    Cache reads:      {:>20}                    ║", format_tokens(total_cache_read));
+                println!("║    Cache writes:     {:>20}                    ║", format_tokens(total_cache_write));
+                println!("║    Hit rate:         {:>19.1}%                    ║", cache_hit_rate);
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║  Activity                                                    ║");
+                println!("║    Total requests:   {:>20}                    ║", total_requests);
+                println!("║    Days with usage:  {:>20}                    ║", usage.len());
+                println!("╠══════════════════════════════════════════════════════════════╣");
+                println!("║  Estimated Cost                                              ║");
+                println!("║    Total:            {:>19}                     ║", format!("${:.4}", total_cost));
+                println!("║    Avg per day:      {:>19}                     ║", format!("${:.4}", total_cost / usage.len() as f64));
+                println!("╚══════════════════════════════════════════════════════════════╝");
+            }
+        },
     }
 
     Ok(())
@@ -1212,5 +1403,16 @@ fn parse_agent_state(s: &str) -> Result<orchestrate_core::AgentState> {
         "failed" => Ok(AgentState::Failed),
         "terminated" => Ok(AgentState::Terminated),
         _ => anyhow::bail!("Unknown agent state: {}. Valid: created, initializing, running, paused, completed, failed, terminated", s),
+    }
+}
+
+/// Format token count with K/M suffix for readability
+fn format_tokens(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.2}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }

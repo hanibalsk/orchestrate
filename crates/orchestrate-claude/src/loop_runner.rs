@@ -15,7 +15,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::client::{ClaudeClient, ContentBlock, CreateMessageRequest, MessageContent};
-use crate::token::{ContextManager, TokenConfig, TokenEstimator};
+use crate::token::{ContextManager, TokenEstimator};
 use crate::tools::ToolExecutor;
 
 /// Configuration for the agent loop
@@ -148,10 +148,10 @@ impl AgentLoop {
         let mut idle_turns = 0;  // Turns without tool calls or status signal
         let mut consecutive_errors = 0;  // Consecutive API or tool errors
         let mut last_tool_error: Option<String> = None;  // Track repeated errors
-        let mut total_input_tokens = 0i32;
-        let mut total_output_tokens = 0i32;
-        let mut total_cache_read_tokens = 0i32;
-        let mut total_cache_write_tokens = 0i32;
+        let mut total_input_tokens = 0i64;
+        let mut total_output_tokens = 0i64;
+        let mut total_cache_read_tokens = 0i64;
+        let mut total_cache_write_tokens = 0i64;
 
         // Create or get session for this agent
         let session_id = if self.config.enable_sessions {
@@ -306,11 +306,11 @@ impl AgentLoop {
                 }
             };
 
-            // Track token usage
-            total_input_tokens += response.usage.input_tokens;
-            total_output_tokens += response.usage.output_tokens;
-            total_cache_read_tokens += response.usage.cache_read_input_tokens;
-            total_cache_write_tokens += response.usage.cache_creation_input_tokens;
+            // Track token usage (convert i32 from API to i64 for database)
+            total_input_tokens += response.usage.input_tokens as i64;
+            total_output_tokens += response.usage.output_tokens as i64;
+            total_cache_read_tokens += response.usage.cache_read_input_tokens as i64;
+            total_cache_write_tokens += response.usage.cache_creation_input_tokens as i64;
 
             // Log cache efficiency
             if response.usage.cache_read_input_tokens > 0 || response.usage.cache_creation_input_tokens > 0 {
@@ -335,11 +335,11 @@ impl AgentLoop {
                     sid,
                     agent.id,
                     turn as i32,
-                    response.usage.input_tokens,
-                    response.usage.output_tokens,
-                    response.usage.cache_read_input_tokens,
-                    response.usage.cache_creation_input_tokens,
-                    estimated_context as i32,
+                    response.usage.input_tokens as i64,
+                    response.usage.output_tokens as i64,
+                    response.usage.cache_read_input_tokens as i64,
+                    response.usage.cache_creation_input_tokens as i64,
+                    estimated_context as i64,
                     msgs_included,
                     msgs_summarized,
                 ).await {
@@ -350,10 +350,10 @@ impl AgentLoop {
             // Update daily token usage
             if let Err(e) = self.db.update_daily_token_usage(
                 &self.config.model,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                response.usage.cache_read_input_tokens,
-                response.usage.cache_creation_input_tokens,
+                response.usage.input_tokens as i64,
+                response.usage.output_tokens as i64,
+                response.usage.cache_read_input_tokens as i64,
+                response.usage.cache_creation_input_tokens as i64,
             ).await {
                 warn!("Failed to update daily token usage: {}", e);
             }
