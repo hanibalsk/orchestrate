@@ -10,3 +10,19 @@
 # Editor files
 *.swp
 *~
+.secrets
+
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Database
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
