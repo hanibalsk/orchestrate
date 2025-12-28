@@ -229,6 +229,20 @@ impl Database {
         rows.into_iter().map(|r| r.try_into()).collect()
     }
 
+    // ==================== Worktree Operations ====================
+
+    /// Get worktree path by ID
+    pub async fn get_worktree_path(&self, worktree_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT path FROM worktrees WHERE id = ?",
+        )
+        .bind(worktree_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     // ==================== Message Operations ====================
 
     /// Insert a message

@@ -1695,11 +1695,37 @@ async fn run_agent_with_cli(
         .arg("--model").arg(&model)
         .arg("--dangerously-skip-permissions");  // For autonomous operation
 
+    // Set working directory to worktree path if available
+    let working_dir: Option<String> = if let Some(ref worktree_id) = agent.worktree_id {
+        match db.get_worktree_path(worktree_id).await {
+            Ok(Some(path)) => {
+                cmd.current_dir(&path);
+                info!("[AGENT {}] Using worktree: {}", agent.id, path);
+                Some(path)
+            }
+            Ok(None) => {
+                warn!("[AGENT {}] Worktree {} not found", agent.id, worktree_id);
+                None
+            }
+            Err(e) => {
+                warn!("[AGENT {}] Failed to get worktree path: {}", agent.id, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    info!("[AGENT {}] Running via CLI with model {}", agent.id, model);
+    info!(
+        "[AGENT {}] Running via CLI with model {}{}",
+        agent.id,
+        model,
+        working_dir.as_ref().map(|p| format!(" in {}", p)).unwrap_or_default()
+    );
 
     let mut child = cmd.spawn()?;
 
