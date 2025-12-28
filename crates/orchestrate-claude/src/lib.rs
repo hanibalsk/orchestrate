@@ -13,6 +13,6 @@ pub mod loop_runner;
 pub mod token;
 pub mod tools;
 
-pub use client::ClaudeClient;
+pub use client::{ClaudeClient, ClaudeCliClient};
 pub use loop_runner::AgentLoop;
 pub use token::{ContextManager, TokenConfig, TokenEstimator};

@@ -285,3 +285,201 @@ impl Usage {
         (self.cache_read_input_tokens as f64 / self.input_tokens as f64) * 100.0
     }
 }
+
+// ==================== Claude CLI Client ====================
+
+/// Claude CLI client - uses the `claude` command line tool
+/// This leverages OAuth authentication from Claude Code
+#[derive(Clone)]
+pub struct ClaudeCliClient {
+    model: String,
+    /// Working directory for the CLI
+    working_dir: Option<std::path::PathBuf>,
+}
+
+impl ClaudeCliClient {
+    /// Create a new CLI client with default model
+    pub fn new() -> Self {
+        Self {
+            model: "sonnet".to_string(),
+            working_dir: None,
+        }
+    }
+
+    /// Create a CLI client with specific model
+    pub fn with_model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            working_dir: None,
+        }
+    }
+
+    /// Set working directory
+    pub fn with_working_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
+    /// Create a new message using claude CLI
+    pub async fn create_message(&self, request: CreateMessageRequest) -> Result<MessageResponse> {
+        use tokio::process::Command;
+
+        // Build the prompt from messages
+        let prompt = self.build_prompt(&request)?;
+
+        // Build command
+        let mut cmd = Command::new("claude");
+        cmd.arg("-p")
+            .arg("--output-format").arg("json")
+            .arg("--model").arg(&self.model);
+
+        // Add system prompt if present
+        if let Some(ref system) = request.system {
+            if let Some(s) = system.as_str() {
+                cmd.arg("--system-prompt").arg(s);
+            }
+        }
+
+        // Add tools if present
+        if let Some(ref tools) = request.tools {
+            let tool_names: Vec<&str> = tools.iter()
+                .map(|t| t.name.as_str())
+                .collect();
+            if !tool_names.is_empty() {
+                // Map our tool names to Claude CLI tool names
+                let cli_tools = self.map_tools_to_cli(&tool_names);
+                if !cli_tools.is_empty() {
+                    cmd.arg("--tools").arg(cli_tools.join(","));
+                }
+            }
+        }
+
+        // Set working directory
+        if let Some(ref dir) = self.working_dir {
+            cmd.current_dir(dir);
+        }
+
+        // Pass prompt via stdin
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+
+        // Write prompt to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(prompt.as_bytes()).await?;
+        }
+
+        let output = child.wait_with_output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Claude CLI failed: {}", stderr);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        self.parse_cli_response(&stdout)
+    }
+
+    /// Build prompt string from request messages
+    fn build_prompt(&self, request: &CreateMessageRequest) -> Result<String> {
+        let mut prompt = String::new();
+
+        for msg in &request.messages {
+            let role = &msg.role;
+            let content = match &msg.content {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(arr) => {
+                    // Handle array of content blocks
+                    let mut text = String::new();
+                    for block in arr {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            text.push_str(t);
+                            text.push('\n');
+                        }
+                    }
+                    text
+                }
+                _ => serde_json::to_string(&msg.content)?,
+            };
+
+            if role == "user" {
+                prompt.push_str(&content);
+                prompt.push('\n');
+            }
+            // Assistant messages are context, handled differently
+        }
+
+        Ok(prompt)
+    }
+
+    /// Map our tool names to Claude CLI tool names
+    fn map_tools_to_cli(&self, tools: &[&str]) -> Vec<String> {
+        tools.iter().filter_map(|t| {
+            match *t {
+                "bash" => Some("Bash".to_string()),
+                "read" => Some("Read".to_string()),
+                "write" => Some("Write".to_string()),
+                "edit" => Some("Edit".to_string()),
+                "glob" => Some("Glob".to_string()),
+                "grep" => Some("Grep".to_string()),
+                "task" => Some("Task".to_string()),
+                _ => None,
+            }
+        }).collect()
+    }
+
+    /// Parse CLI JSON response into MessageResponse
+    fn parse_cli_response(&self, stdout: &str) -> Result<MessageResponse> {
+        #[derive(Deserialize)]
+        struct CliResponse {
+            #[serde(rename = "type")]
+            response_type: String,
+            result: Option<String>,
+            is_error: bool,
+            usage: Option<CliUsage>,
+            #[serde(default)]
+            session_id: String,
+        }
+
+        #[derive(Deserialize)]
+        struct CliUsage {
+            input_tokens: i32,
+            output_tokens: i32,
+            #[serde(default)]
+            cache_read_input_tokens: i32,
+            #[serde(default)]
+            cache_creation_input_tokens: i32,
+        }
+
+        let cli_resp: CliResponse = serde_json::from_str(stdout)?;
+
+        if cli_resp.is_error {
+            anyhow::bail!("Claude CLI error: {:?}", cli_resp.result);
+        }
+
+        let content = cli_resp.result.unwrap_or_default();
+        let usage = cli_resp.usage.map(|u| Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+        }).unwrap_or_default();
+
+        Ok(MessageResponse {
+            id: cli_resp.session_id,
+            model: self.model.clone(),
+            stop_reason: Some("end_turn".to_string()),
+            content: vec![ContentBlock::Text { text: content }],
+            usage,
+        })
+    }
+}
+
+impl Default for ClaudeCliClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}

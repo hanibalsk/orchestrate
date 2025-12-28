@@ -6,7 +6,7 @@ use orchestrate_core::{
     Agent, AgentState, AgentType, CustomInstruction, Database,
     LearningEngine, PatternStatus, ShellState,
 };
-use orchestrate_claude::{AgentLoop, ClaudeClient};
+use orchestrate_claude::{AgentLoop, ClaudeClient, ClaudeCliClient};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,8 +148,11 @@ enum DaemonAction {
         #[arg(short = 'i', long, default_value = "5")]
         poll_interval: u64,
         /// Claude model to use
-        #[arg(short, long, default_value = "claude-sonnet-4-20250514")]
+        #[arg(short, long, default_value = "sonnet")]
         model: String,
+        /// Use claude CLI instead of direct API (uses OAuth auth)
+        #[arg(long)]
+        use_cli: bool,
     },
     /// Stop the daemon
     Stop,
@@ -456,8 +459,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Daemon { action } => match action {
-            DaemonAction::Start { port, max_concurrent, poll_interval, model } => {
-                run_daemon(db, port, max_concurrent, poll_interval, model).await?;
+            DaemonAction::Start { port, max_concurrent, poll_interval, model, use_cli } => {
+                run_daemon(db, port, max_concurrent, poll_interval, model, use_cli).await?;
             }
             DaemonAction::Stop => {
                 println!("Stopping daemon...");
@@ -1431,6 +1434,13 @@ fn format_tokens(tokens: i64) -> String {
     }
 }
 
+/// Client type for daemon
+#[derive(Clone)]
+enum DaemonClient {
+    Api(ClaudeClient),
+    Cli(ClaudeCliClient),
+}
+
 /// Run the daemon to execute agents
 async fn run_daemon(
     db: Database,
@@ -1438,15 +1448,35 @@ async fn run_daemon(
     max_concurrent: usize,
     poll_interval: u64,
     model: String,
+    use_cli: bool,
 ) -> Result<()> {
-    // Get API key from environment
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| std::env::var("CLAUDE_API_KEY"))
-        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY or CLAUDE_API_KEY environment variable not set"))?;
+    // Create client based on mode
+    let client = if use_cli {
+        // Check if claude CLI is available
+        let output = std::process::Command::new("claude")
+            .arg("--version")
+            .output();
+
+        if output.is_err() || !output.unwrap().status.success() {
+            anyhow::bail!("claude CLI not found. Install Claude Code or use API mode.");
+        }
+
+        DaemonClient::Cli(ClaudeCliClient::with_model(&model))
+    } else {
+        // Get API key from environment
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("CLAUDE_API_KEY"))
+            .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY or CLAUDE_API_KEY not set. Use --use-cli for OAuth."))?;
+
+        DaemonClient::Api(ClaudeClient::new(api_key))
+    };
+
+    let mode_str = if use_cli { "CLI (OAuth)" } else { "API" };
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                    ORCHESTRATE DAEMON                        ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Mode:            {:<42} ║", mode_str);
     println!("║  Model:           {:<42} ║", &model[..model.len().min(42)]);
     println!("║  Max concurrent:  {:<42} ║", max_concurrent);
     println!("║  Poll interval:   {:<42} ║", format!("{}s", poll_interval));
@@ -1469,9 +1499,6 @@ async fn run_daemon(
         info!("Shutdown signal received");
         shutdown_clone.store(true, Ordering::SeqCst);
     });
-
-    // Create Claude client
-    let client = ClaudeClient::new(api_key);
 
     // Create semaphore for concurrency control
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
@@ -1578,8 +1605,26 @@ async fn run_daemon(
 /// Run a single agent to completion
 async fn run_single_agent(
     db: Database,
-    client: ClaudeClient,
+    client: DaemonClient,
     mut agent: Agent,
+    model: String,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    match client {
+        DaemonClient::Api(api_client) => {
+            run_agent_with_api(db, api_client, &mut agent, model, shutdown).await
+        }
+        DaemonClient::Cli(cli_client) => {
+            run_agent_with_cli(db, cli_client, &mut agent, model, shutdown).await
+        }
+    }
+}
+
+/// Run agent using direct API
+async fn run_agent_with_api(
+    db: Database,
+    client: ClaudeClient,
+    agent: &mut Agent,
     model: String,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -1600,7 +1645,7 @@ async fn run_single_agent(
 
     // Run with periodic shutdown check
     let result = tokio::select! {
-        result = agent_loop.run(&mut agent) => result,
+        result = agent_loop.run(agent) => result,
         _ = async {
             while !shutdown.load(Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1608,13 +1653,122 @@ async fn run_single_agent(
         } => {
             // Shutdown requested, mark agent as paused
             agent.transition_to(AgentState::Paused).ok();
-            db.update_agent(&agent).await.ok();
+            db.update_agent(agent).await.ok();
             return Ok(());
         }
     };
 
     // Update final state
-    db.update_agent(&agent).await?;
+    db.update_agent(agent).await?;
 
+    result
+}
+
+/// Run agent using claude CLI (OAuth auth)
+async fn run_agent_with_cli(
+    db: Database,
+    _cli_client: ClaudeCliClient,
+    agent: &mut Agent,
+    model: String,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    use tokio::process::Command;
+    use orchestrate_core::Message;
+
+    // Transition through proper state machine: Created -> Initializing -> Running
+    agent.transition_to(AgentState::Initializing)?;
+    db.update_agent(agent).await?;
+
+    agent.transition_to(AgentState::Running)?;
+    db.update_agent(agent).await?;
+
+    // Build the prompt
+    let prompt = format!(
+        "You are an autonomous agent. Complete this task:\n\n{}\n\nUse the available tools to complete the task. When done, output STATUS: DONE.",
+        agent.task
+    );
+
+    // Build command
+    let mut cmd = Command::new("claude");
+    cmd.arg("-p")
+        .arg("--output-format").arg("json")
+        .arg("--model").arg(&model)
+        .arg("--dangerously-skip-permissions");  // For autonomous operation
+
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    info!("[AGENT {}] Running via CLI with model {}", agent.id, model);
+
+    let mut child = cmd.spawn()?;
+
+    // Write prompt
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(prompt.as_bytes()).await?;
+        drop(stdin);  // Close stdin
+    }
+
+    // Wait for completion with shutdown check
+    let output = tokio::select! {
+        output = child.wait_with_output() => output,
+        _ = async {
+            while !shutdown.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        } => {
+            // Shutdown - we can't kill since wait_with_output consumed child
+            agent.transition_to(AgentState::Paused)?;
+            db.update_agent(agent).await.ok();
+            return Ok(());
+        }
+    };
+
+    let result = match output {
+        Ok(out) => {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+
+                // Parse response to get result
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                    let result_text = json.get("result")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Task completed");
+
+                    // Store final message
+                    let msg = Message::assistant(agent.id, result_text);
+                    db.insert_message(&msg).await.ok();
+
+                    // Update token usage if available
+                    if let Some(usage) = json.get("usage") {
+                        let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                        db.update_daily_token_usage(&model, input, output_tokens, cache_read, cache_write).await.ok();
+                    }
+
+                    agent.transition_to(AgentState::Completed)?;
+                } else {
+                    agent.transition_to(AgentState::Completed)?;
+                }
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                agent.error_message = Some(stderr.to_string());
+                agent.transition_to(AgentState::Failed)?;
+                anyhow::bail!("CLI failed: {}", stderr)
+            }
+        }
+        Err(e) => {
+            agent.error_message = Some(e.to_string());
+            agent.transition_to(AgentState::Failed)?;
+            Err(e.into())
+        }
+    };
+
+    db.update_agent(agent).await?;
     result
 }
