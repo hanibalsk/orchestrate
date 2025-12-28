@@ -259,6 +259,8 @@ install_local() {
     local target="${1:-.}"
     local install_dir="$target/.orchestrate"
     local claude_dir="$target/.claude"
+    local backup_zip="$install_dir/backup-$(date +%Y%m%d_%H%M%S).zip"
+    local files_to_backup=()
 
     log_info "Installing to local project: $target"
 
@@ -266,6 +268,60 @@ install_local() {
     mkdir -p "$install_dir/scripts"
     mkdir -p "$claude_dir/agents"
     mkdir -p "$claude_dir/skills"
+
+    # First pass: collect files that will be overwritten
+    parse_manifest "bin,script,agent,skill,config" | while read -r type path mode; do
+        local dst
+
+        case "$type" in
+            bin)
+                dst="$install_dir/$(basename "$path")"
+                ;;
+            script)
+                dst="$install_dir/scripts/$(basename "$path")"
+                ;;
+            agent)
+                dst="$claude_dir/agents/$(basename "$path")"
+                ;;
+            skill)
+                dst="$claude_dir/skills/$(basename "$path")"
+                ;;
+            config)
+                dst="$install_dir/$(basename "$path")"
+                ;;
+            *)
+                dst="$install_dir/$path"
+                ;;
+        esac
+
+        if [[ -e "$dst" ]]; then
+            echo "$dst"
+        fi
+    done > /tmp/orchestrate_backup_list.txt
+
+    # Check wrapper script too
+    if [[ -e "$target/orchestrate" ]]; then
+        echo "$target/orchestrate" >> /tmp/orchestrate_backup_list.txt
+    fi
+
+    # Create backup zip if there are files to backup
+    if [[ -s /tmp/orchestrate_backup_list.txt ]]; then
+        log_info "Backing up existing files to: $backup_zip"
+
+        # Create zip from the list
+        (cd "$target" && cat /tmp/orchestrate_backup_list.txt | while read -r file; do
+            # Convert absolute path to relative
+            rel_path="${file#$target/}"
+            if [[ -e "$file" ]]; then
+                echo "$rel_path"
+            fi
+        done | xargs zip -q "$backup_zip" 2>/dev/null) || true
+
+        if [[ -f "$backup_zip" ]]; then
+            log_info "Backup created: $backup_zip"
+        fi
+    fi
+    rm -f /tmp/orchestrate_backup_list.txt
 
     # Install files
     parse_manifest "bin,script,agent,skill,config" | while read -r type path mode; do
