@@ -19,7 +19,7 @@ use uuid::Uuid;
 const MAX_TASK_LENGTH: usize = 10_000;
 
 /// API error response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
     pub code: String,
@@ -128,13 +128,14 @@ async fn auth_middleware(
 /// Create the API router (API endpoints only)
 pub fn create_api_router(state: Arc<AppState>) -> Router {
     // Routes that require authentication
+    // Note: axum 0.7 uses :param syntax, axum 0.8+ uses {param}
     let protected_routes = Router::new()
         .route("/api/agents", get(list_agents).post(create_agent))
-        .route("/api/agents/{id}", get(get_agent))
-        .route("/api/agents/{id}/pause", post(pause_agent))
-        .route("/api/agents/{id}/resume", post(resume_agent))
-        .route("/api/agents/{id}/terminate", post(terminate_agent))
-        .route("/api/agents/{id}/messages", get(get_messages))
+        .route("/api/agents/:id", get(get_agent))
+        .route("/api/agents/:id/pause", post(pause_agent))
+        .route("/api/agents/:id/resume", post(resume_agent))
+        .route("/api/agents/:id/terminate", post(terminate_agent))
+        .route("/api/agents/:id/messages", get(get_messages))
         .route("/api/status", get(system_status))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
@@ -390,7 +391,7 @@ impl CreateAgentRequest {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AgentResponse {
     pub id: String,
     pub agent_type: AgentType,
@@ -413,7 +414,7 @@ impl From<Agent> for AgentResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MessageResponse {
     pub id: i64,
     pub role: String,
@@ -432,7 +433,7 @@ impl From<orchestrate_core::Message> for MessageResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SystemStatus {
     pub total_agents: usize,
     pub running_agents: usize,
@@ -440,8 +441,724 @@ pub struct SystemStatus {
     pub completed_agents: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use orchestrate_core::Database;
+    use tower::util::ServiceExt;
+
+    struct TestApp {
+        router: Router,
+        state: Arc<AppState>,
+    }
+
+    async fn setup_app() -> TestApp {
+        // Use in-memory DB for simpler testing with single connection
+        let db = Database::in_memory().await.unwrap();
+        let state = Arc::new(AppState::new(db, None));
+        let router = create_api_router(state.clone());
+        TestApp { router, state }
+    }
+
+    async fn setup_app_with_auth(api_key: &str) -> TestApp {
+        let db = Database::in_memory().await.unwrap();
+        let state = Arc::new(AppState::new(db, Some(api_key.to_string())));
+        let router = create_api_router(state.clone());
+        TestApp { router, state }
+    }
+
+    async fn body_to_string(body: Body) -> String {
+        let bytes = body.collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Helper to properly transition agent to Running state
+    fn make_running(agent: &mut Agent) {
+        agent.transition_to(AgentState::Initializing).unwrap();
+        agent.transition_to(AgentState::Running).unwrap();
+    }
+
+    // ==================== Health Check Tests ====================
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let health: HealthResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(health.status, "ok");
+        assert!(!health.version.is_empty());
+    }
+
+    // ==================== Authentication Tests ====================
+
+    #[tokio::test]
+    async fn test_auth_no_key_configured_allows_access() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_missing_key_returns_unauthorized() {
+        let test_app = setup_app_with_auth("secret-key").await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_wrong_key_returns_unauthorized() {
+        let test_app = setup_app_with_auth("secret-key").await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents")
+                    .header("x-api-key", "wrong-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_correct_key_allows_access() {
+        let test_app = setup_app_with_auth("secret-key").await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents")
+                    .header("x-api-key", "secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_bearer_token_works() {
+        let test_app = setup_app_with_auth("secret-key").await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents")
+                    .header("authorization", "Bearer secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ==================== Agent CRUD Tests ====================
+
+    #[tokio::test]
+    async fn test_list_agents_empty() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let agents: Vec<AgentResponse> = serde_json::from_str(&body).unwrap();
+        assert!(agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_agent_success() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"agent_type":"story_developer","task":"Build feature X"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let agent: AgentResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(agent.task, "Build feature X");
+        assert_eq!(agent.agent_type, AgentType::StoryDeveloper);
+        assert_eq!(agent.state, AgentState::Created);
+    }
+
+    #[tokio::test]
+    async fn test_create_agent_empty_task_fails() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent_type":"story_developer","task":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_to_string(response.into_body()).await;
+        let error: ApiError = serde_json::from_str(&body).unwrap();
+        assert_eq!(error.code, "validation_error");
+    }
+
+    #[tokio::test]
+    async fn test_create_agent_whitespace_task_fails() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent_type":"story_developer","task":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_agent_task_too_long_fails() {
+        let test_app = setup_app().await;
+
+        let long_task = "x".repeat(MAX_TASK_LENGTH + 1);
+        let body = format!(r#"{{"agent_type":"story_developer","task":"{}"}}"#, long_task);
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_agent_success() {
+        let test_app = setup_app().await;
+
+        // Create agent directly in DB
+        let agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/agents/{}", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: AgentResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.id, agent_id);
+        assert_eq!(resp.task, "Test task");
+    }
+
+    #[tokio::test]
+    async fn test_get_agent_not_found() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents/00000000-0000-0000-0000-000000000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_agent_invalid_uuid() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents/not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Axum returns 400 for invalid path params, but our route might not match
+        // Invalid UUID format in path should return 400 (bad request)
+        assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
+    }
+
+    // ==================== Agent Action Tests ====================
+
+    #[tokio::test]
+    async fn test_pause_running_agent() {
+        let test_app = setup_app().await;
+
+        // Create and start agent (Created -> Initializing -> Running)
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        make_running(&mut agent);
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/agents/{}/pause", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: AgentResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.state, AgentState::Paused);
+    }
+
+    #[tokio::test]
+    async fn test_pause_completed_agent_fails() {
+        let test_app = setup_app().await;
+
+        // Create completed agent
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        make_running(&mut agent);
+        agent.transition_to(AgentState::Completed).unwrap();
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/agents/{}/pause", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_resume_paused_agent() {
+        let test_app = setup_app().await;
+
+        // Create paused agent
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        make_running(&mut agent);
+        agent.transition_to(AgentState::Paused).unwrap();
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/agents/{}/resume", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: AgentResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.state, AgentState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_terminate_agent() {
+        let test_app = setup_app().await;
+
+        // Create running agent
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        make_running(&mut agent);
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/agents/{}/terminate", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: AgentResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.state, AgentState::Terminated);
+    }
+
+    #[tokio::test]
+    async fn test_terminate_already_terminated_agent_succeeds() {
+        let test_app = setup_app().await;
+
+        // Create terminated agent
+        // Note: The state machine allows (_, Terminated) -> true, meaning
+        // any state including Terminated can transition to Terminated
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        agent.transition_to(AgentState::Terminated).unwrap();
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/agents/{}/terminate", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Terminate is idempotent - terminating an already terminated agent succeeds
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_pause_terminated_agent_fails() {
+        let test_app = setup_app().await;
+
+        // Create terminated agent
+        let mut agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        agent.transition_to(AgentState::Terminated).unwrap();
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/agents/{}/pause", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Cannot pause a terminated agent
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // ==================== Messages Tests ====================
+
+    #[tokio::test]
+    async fn test_get_messages_empty() {
+        let test_app = setup_app().await;
+
+        let agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        let agent_id = agent.id.to_string();
+        test_app.state.db.insert_agent(&agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/agents/{}/messages", agent_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let messages: Vec<MessageResponse> = serde_json::from_str(&body).unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_messages_for_nonexistent_agent() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/agents/00000000-0000-0000-0000-000000000000/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ==================== System Status Tests ====================
+
+    #[tokio::test]
+    async fn test_system_status_empty() {
+        let test_app = setup_app().await;
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let status: SystemStatus = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.total_agents, 0);
+        assert_eq!(status.running_agents, 0);
+        assert_eq!(status.paused_agents, 0);
+        assert_eq!(status.completed_agents, 0);
+    }
+
+    #[tokio::test]
+    async fn test_system_status_with_agents() {
+        let test_app = setup_app().await;
+
+        // Create agents in different states
+        let mut running_agent = Agent::new(AgentType::StoryDeveloper, "Running task");
+        make_running(&mut running_agent);
+        test_app.state.db.insert_agent(&running_agent).await.unwrap();
+
+        let mut paused_agent = Agent::new(AgentType::StoryDeveloper, "Paused task");
+        make_running(&mut paused_agent);
+        paused_agent.transition_to(AgentState::Paused).unwrap();
+        test_app.state.db.insert_agent(&paused_agent).await.unwrap();
+
+        let mut completed_agent = Agent::new(AgentType::StoryDeveloper, "Completed task");
+        make_running(&mut completed_agent);
+        completed_agent.transition_to(AgentState::Completed).unwrap();
+        test_app.state.db.insert_agent(&completed_agent).await.unwrap();
+
+        let response = test_app.router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let status: SystemStatus = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.total_agents, 3);
+        assert_eq!(status.running_agents, 1);
+        assert_eq!(status.paused_agents, 1);
+        assert_eq!(status.completed_agents, 1);
+    }
+
+    // ==================== ApiError Tests ====================
+
+    #[test]
+    fn test_api_error_status_codes() {
+        assert_eq!(
+            ApiError::unauthorized().into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            ApiError::not_found("Agent").into_response().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ApiError::bad_request("Bad").into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::validation("Invalid").into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::conflict("Conflict").into_response().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::internal("Error").into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    // ==================== CreateAgentRequest Validation Tests ====================
+
+    #[test]
+    fn test_create_agent_request_validation() {
+        // Valid request
+        let valid = CreateAgentRequest {
+            agent_type: AgentType::StoryDeveloper,
+            task: "Valid task".to_string(),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Empty task
+        let empty_task = CreateAgentRequest {
+            agent_type: AgentType::StoryDeveloper,
+            task: "".to_string(),
+        };
+        assert!(empty_task.validate().is_err());
+
+        // Whitespace only task
+        let whitespace_task = CreateAgentRequest {
+            agent_type: AgentType::StoryDeveloper,
+            task: "   \t\n".to_string(),
+        };
+        assert!(whitespace_task.validate().is_err());
+
+        // Task at max length (should pass)
+        let max_task = CreateAgentRequest {
+            agent_type: AgentType::StoryDeveloper,
+            task: "x".repeat(MAX_TASK_LENGTH),
+        };
+        assert!(max_task.validate().is_ok());
+
+        // Task over max length
+        let over_max_task = CreateAgentRequest {
+            agent_type: AgentType::StoryDeveloper,
+            task: "x".repeat(MAX_TASK_LENGTH + 1),
+        };
+        assert!(over_max_task.validate().is_err());
+    }
+
+    // ==================== Response Conversion Tests ====================
+
+    #[test]
+    fn test_agent_response_from_agent() {
+        let agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        let response: AgentResponse = agent.clone().into();
+
+        assert_eq!(response.id, agent.id.to_string());
+        assert_eq!(response.agent_type, agent.agent_type);
+        assert_eq!(response.state, agent.state);
+        assert_eq!(response.task, agent.task);
+    }
+
+    #[test]
+    fn test_message_response_from_message() {
+        use orchestrate_core::Message;
+
+        let agent_id = Uuid::new_v4();
+        let msg = Message::user(agent_id, "Hello");
+        let response: MessageResponse = msg.into();
+
+        assert_eq!(response.role, "user");
+        assert_eq!(response.content, "Hello");
+    }
 }
