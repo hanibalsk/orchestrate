@@ -10,6 +10,8 @@
 pub mod agent;
 pub mod database;
 pub mod error;
+pub mod instruction;
+pub mod learning;
 pub mod message;
 pub mod network;
 pub mod session;
@@ -25,6 +27,15 @@ pub use session::Session;
 pub use worktree::{Worktree, WorktreeStatus};
 pub use pr::{PullRequest, PrStatus, MergeStrategy};
 pub use epic::{Epic, Story, EpicStatus, StoryStatus};
+
+// Re-export instruction types
+pub use instruction::{
+    CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
+    LearningConfig, LearningPattern, PatternStatus, PatternType,
+};
+
+// Re-export learning types
+pub use learning::{LearningEngine, CleanupResult};
 
 // Re-export network types
 pub use network::{

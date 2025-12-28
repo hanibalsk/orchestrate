@@ -2,14 +2,18 @@
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use orchestrate_core::{Agent, AgentState, AgentType, Database};
+use orchestrate_core::{
+    Agent, AgentState, AgentType, CustomInstruction, Database,
+    InstructionEffectiveness, InstructionScope, InstructionSource,
+    LearningEngine, LearningPattern, PatternStatus,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -130,6 +134,7 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
     // Routes that require authentication
     // Note: axum 0.7 uses :param syntax, axum 0.8+ uses {param}
     let protected_routes = Router::new()
+        // Agent routes
         .route("/api/agents", get(list_agents).post(create_agent))
         .route("/api/agents/:id", get(get_agent))
         .route("/api/agents/:id/pause", post(pause_agent))
@@ -137,6 +142,19 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/agents/:id/terminate", post(terminate_agent))
         .route("/api/agents/:id/messages", get(get_messages))
         .route("/api/status", get(system_status))
+        // Instruction routes
+        .route("/api/instructions", get(list_instructions).post(create_instruction))
+        .route("/api/instructions/:id", get(get_instruction).put(update_instruction).delete(delete_instruction))
+        .route("/api/instructions/:id/enable", post(enable_instruction))
+        .route("/api/instructions/:id/disable", post(disable_instruction))
+        .route("/api/instructions/:id/effectiveness", get(get_instruction_effectiveness))
+        // Learning pattern routes
+        .route("/api/patterns", get(list_patterns))
+        .route("/api/patterns/:id", get(get_pattern))
+        .route("/api/patterns/:id/approve", post(approve_pattern))
+        .route("/api/patterns/:id/reject", post(reject_pattern))
+        .route("/api/learning/process", post(process_patterns))
+        .route("/api/learning/cleanup", post(cleanup_instructions))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Public routes (no auth required)
@@ -364,6 +382,336 @@ async fn system_status(
     }))
 }
 
+// ==================== Instruction Handlers ====================
+
+async fn list_instructions(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListInstructionsParams>,
+) -> Result<Json<Vec<InstructionResponse>>, ApiError> {
+    let scope = params.scope.as_deref()
+        .map(|s| InstructionScope::from_str(s))
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("Invalid scope: {}", e)))?;
+
+    let source = params.source.as_deref()
+        .map(|s| InstructionSource::from_str(s))
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("Invalid source: {}", e)))?;
+
+    let instructions = state
+        .db
+        .list_instructions(params.enabled_only.unwrap_or(false), scope, source)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(instructions.into_iter().map(Into::into).collect()))
+}
+
+async fn get_instruction(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<InstructionResponse>, ApiError> {
+    let instruction = state
+        .db
+        .get_instruction(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Instruction"))?;
+
+    Ok(Json(instruction.into()))
+}
+
+async fn create_instruction(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateInstructionRequest>,
+) -> Result<Json<InstructionResponse>, ApiError> {
+    req.validate()?;
+
+    let mut instruction = if req.scope == Some("agent_type".to_string()) {
+        let agent_type = req.agent_type
+            .as_ref()
+            .ok_or_else(|| ApiError::validation("agent_type required for agent_type scope"))?;
+        let agent_type = AgentType::from_str(agent_type)
+            .map_err(|_| ApiError::bad_request(format!("Invalid agent_type: {}", agent_type)))?;
+        CustomInstruction::for_agent_type(&req.name, &req.content, agent_type)
+    } else {
+        CustomInstruction::global(&req.name, &req.content)
+    };
+
+    if let Some(priority) = req.priority {
+        instruction = instruction.with_priority(priority);
+    }
+    if let Some(tags) = req.tags {
+        instruction = instruction.with_tags(tags);
+    }
+    if let Some(created_by) = req.created_by {
+        instruction = instruction.with_created_by(created_by);
+    }
+
+    let id = state
+        .db
+        .insert_instruction(&instruction)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    instruction.id = id;
+    Ok(Json(instruction.into()))
+}
+
+async fn update_instruction(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateInstructionRequest>,
+) -> Result<Json<InstructionResponse>, ApiError> {
+    let mut instruction = state
+        .db
+        .get_instruction(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Instruction"))?;
+
+    if let Some(name) = req.name {
+        instruction.name = name;
+    }
+    if let Some(content) = req.content {
+        instruction.content = content;
+    }
+    if let Some(priority) = req.priority {
+        instruction.priority = priority;
+    }
+    if let Some(enabled) = req.enabled {
+        instruction.enabled = enabled;
+    }
+    if let Some(tags) = req.tags {
+        instruction.tags = tags;
+    }
+
+    state
+        .db
+        .update_instruction(&instruction)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(instruction.into()))
+}
+
+async fn delete_instruction(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Verify instruction exists
+    let _ = state
+        .db
+        .get_instruction(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Instruction"))?;
+
+    state
+        .db
+        .delete_instruction(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+async fn enable_instruction(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<InstructionResponse>, ApiError> {
+    let mut instruction = state
+        .db
+        .get_instruction(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Instruction"))?;
+
+    state
+        .db
+        .set_instruction_enabled(id, true)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    instruction.enabled = true;
+    Ok(Json(instruction.into()))
+}
+
+async fn disable_instruction(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<InstructionResponse>, ApiError> {
+    let mut instruction = state
+        .db
+        .get_instruction(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Instruction"))?;
+
+    state
+        .db
+        .set_instruction_enabled(id, false)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    instruction.enabled = false;
+    Ok(Json(instruction.into()))
+}
+
+async fn get_instruction_effectiveness(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<EffectivenessResponse>, ApiError> {
+    // Verify instruction exists
+    let _ = state
+        .db
+        .get_instruction(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Instruction"))?;
+
+    let effectiveness = state
+        .db
+        .get_instruction_effectiveness(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Effectiveness metrics"))?;
+
+    Ok(Json(effectiveness.into()))
+}
+
+// ==================== Pattern Handlers ====================
+
+async fn list_patterns(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListPatternsParams>,
+) -> Result<Json<Vec<PatternResponse>>, ApiError> {
+    let status = params.status.as_deref()
+        .map(|s| PatternStatus::from_str(s))
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("Invalid status: {}", e)))?;
+
+    let patterns = state
+        .db
+        .list_patterns(status)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(patterns.into_iter().map(Into::into).collect()))
+}
+
+async fn get_pattern(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<PatternResponse>, ApiError> {
+    let pattern = state
+        .db
+        .get_pattern(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pattern"))?;
+
+    Ok(Json(pattern.into()))
+}
+
+async fn approve_pattern(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<PatternResponse>, ApiError> {
+    let pattern = state
+        .db
+        .get_pattern(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pattern"))?;
+
+    // Generate instruction from pattern
+    let engine = LearningEngine::new();
+    let instruction = engine.generate_instruction_from_pattern(&pattern)
+        .ok_or_else(|| ApiError::bad_request("Could not generate instruction from pattern"))?;
+
+    let instruction_id = state
+        .db
+        .insert_instruction(&instruction)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    state
+        .db
+        .update_pattern_status(id, PatternStatus::Approved, Some(instruction_id))
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    // Reload pattern to get updated state
+    let updated_pattern = state
+        .db
+        .get_pattern(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pattern"))?;
+
+    Ok(Json(updated_pattern.into()))
+}
+
+async fn reject_pattern(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<PatternResponse>, ApiError> {
+    let _ = state
+        .db
+        .get_pattern(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pattern"))?;
+
+    state
+        .db
+        .update_pattern_status(id, PatternStatus::Rejected, None)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let updated_pattern = state
+        .db
+        .get_pattern(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pattern"))?;
+
+    Ok(Json(updated_pattern.into()))
+}
+
+async fn process_patterns(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProcessPatternsResponse>, ApiError> {
+    let engine = LearningEngine::new();
+
+    let created = engine
+        .process_patterns(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Processing error: {}", e)))?;
+
+    Ok(Json(ProcessPatternsResponse {
+        created_count: created.len(),
+        instruction_ids: created.iter().map(|i| i.id).collect(),
+    }))
+}
+
+async fn cleanup_instructions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CleanupResponse>, ApiError> {
+    let engine = LearningEngine::new();
+
+    let result = engine
+        .cleanup(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Cleanup error: {}", e)))?;
+
+    Ok(Json(CleanupResponse {
+        disabled_count: result.disabled_count,
+        deleted_names: result.deleted_names,
+    }))
+}
+
 // ==================== Request/Response Types ====================
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +793,173 @@ pub struct SystemStatus {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+}
+
+// ==================== Instruction Request/Response Types ====================
+
+#[derive(Debug, Deserialize)]
+pub struct ListInstructionsParams {
+    pub enabled_only: Option<bool>,
+    pub scope: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateInstructionRequest {
+    pub name: String,
+    pub content: String,
+    pub scope: Option<String>,
+    pub agent_type: Option<String>,
+    pub priority: Option<i32>,
+    pub tags: Option<Vec<String>>,
+    pub created_by: Option<String>,
+}
+
+impl CreateInstructionRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.name.trim().is_empty() {
+            return Err(ApiError::validation("Name cannot be empty"));
+        }
+        if self.content.trim().is_empty() {
+            return Err(ApiError::validation("Content cannot be empty"));
+        }
+        if self.name.len() > 255 {
+            return Err(ApiError::validation("Name exceeds maximum length of 255 characters"));
+        }
+        if self.content.len() > 10_000 {
+            return Err(ApiError::validation("Content exceeds maximum length of 10000 characters"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateInstructionRequest {
+    pub name: Option<String>,
+    pub content: Option<String>,
+    pub priority: Option<i32>,
+    pub enabled: Option<bool>,
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstructionResponse {
+    pub id: i64,
+    pub name: String,
+    pub content: String,
+    pub scope: String,
+    pub agent_type: Option<String>,
+    pub priority: i32,
+    pub enabled: bool,
+    pub source: String,
+    pub confidence: f64,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by: Option<String>,
+}
+
+impl From<CustomInstruction> for InstructionResponse {
+    fn from(inst: CustomInstruction) -> Self {
+        Self {
+            id: inst.id,
+            name: inst.name,
+            content: inst.content,
+            scope: inst.scope.as_str().to_string(),
+            agent_type: inst.agent_type.map(|t| t.as_str().to_string()),
+            priority: inst.priority,
+            enabled: inst.enabled,
+            source: inst.source.as_str().to_string(),
+            confidence: inst.confidence,
+            tags: inst.tags,
+            created_at: inst.created_at.to_rfc3339(),
+            updated_at: inst.updated_at.to_rfc3339(),
+            created_by: inst.created_by,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EffectivenessResponse {
+    pub instruction_id: i64,
+    pub usage_count: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub penalty_score: f64,
+    pub success_rate: f64,
+    pub avg_completion_time: Option<f64>,
+    pub last_success_at: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub last_penalty_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl From<InstructionEffectiveness> for EffectivenessResponse {
+    fn from(eff: InstructionEffectiveness) -> Self {
+        Self {
+            instruction_id: eff.instruction_id,
+            usage_count: eff.usage_count,
+            success_count: eff.success_count,
+            failure_count: eff.failure_count,
+            penalty_score: eff.penalty_score,
+            success_rate: eff.success_rate,
+            avg_completion_time: eff.avg_completion_time,
+            last_success_at: eff.last_success_at.map(|dt| dt.to_rfc3339()),
+            last_failure_at: eff.last_failure_at.map(|dt| dt.to_rfc3339()),
+            last_penalty_at: eff.last_penalty_at.map(|dt| dt.to_rfc3339()),
+            updated_at: eff.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+// ==================== Pattern Request/Response Types ====================
+
+#[derive(Debug, Deserialize)]
+pub struct ListPatternsParams {
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PatternResponse {
+    pub id: i64,
+    pub pattern_type: String,
+    pub agent_type: Option<String>,
+    pub pattern_signature: String,
+    pub pattern_data: serde_json::Value,
+    pub occurrence_count: i64,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub instruction_id: Option<i64>,
+    pub status: String,
+}
+
+impl From<LearningPattern> for PatternResponse {
+    fn from(pattern: LearningPattern) -> Self {
+        Self {
+            id: pattern.id,
+            pattern_type: pattern.pattern_type.as_str().to_string(),
+            agent_type: pattern.agent_type.map(|t| t.as_str().to_string()),
+            pattern_signature: pattern.pattern_signature,
+            pattern_data: pattern.pattern_data,
+            occurrence_count: pattern.occurrence_count,
+            first_seen_at: pattern.first_seen_at.to_rfc3339(),
+            last_seen_at: pattern.last_seen_at.to_rfc3339(),
+            instruction_id: pattern.instruction_id,
+            status: pattern.status.as_str().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProcessPatternsResponse {
+    pub created_count: usize,
+    pub instruction_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CleanupResponse {
+    pub disabled_count: usize,
+    pub deleted_names: Vec<String>,
 }
 
 #[cfg(test)]

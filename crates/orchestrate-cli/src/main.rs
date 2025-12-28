@@ -2,7 +2,10 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use orchestrate_core::{Agent, AgentType, Database};
+use orchestrate_core::{
+    Agent, AgentType, CustomInstruction, Database,
+    LearningEngine, PatternStatus,
+};
 use std::path::PathBuf;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -104,6 +107,16 @@ enum Commands {
     Debug {
         #[command(subcommand)]
         action: DebugAction,
+    },
+    /// Manage custom instructions
+    Instructions {
+        #[command(subcommand)]
+        action: InstructionAction,
+    },
+    /// Learning and pattern management
+    Learn {
+        #[command(subcommand)]
+        action: LearnAction,
     },
 }
 
@@ -219,6 +232,96 @@ enum DebugAction {
         /// What to dump: agents, prs, epics, all
         #[arg(default_value = "all")]
         target: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InstructionAction {
+    /// List all instructions
+    List {
+        /// Show only enabled instructions
+        #[arg(long)]
+        enabled_only: bool,
+        /// Show only learned instructions
+        #[arg(long)]
+        learned_only: bool,
+    },
+    /// Show instruction details
+    Show {
+        /// Instruction ID or name
+        id_or_name: String,
+    },
+    /// Create a new instruction
+    Create {
+        /// Instruction name
+        #[arg(short, long)]
+        name: String,
+        /// Instruction content
+        #[arg(short, long)]
+        content: String,
+        /// Scope (global or agent_type)
+        #[arg(short, long, default_value = "global")]
+        scope: String,
+        /// Agent type (required if scope is agent_type)
+        #[arg(short = 't', long)]
+        agent_type: Option<String>,
+        /// Priority (higher = injected earlier)
+        #[arg(short, long, default_value = "100")]
+        priority: i32,
+    },
+    /// Enable an instruction
+    Enable {
+        /// Instruction ID or name
+        id_or_name: String,
+    },
+    /// Disable an instruction
+    Disable {
+        /// Instruction ID or name
+        id_or_name: String,
+    },
+    /// Delete an instruction
+    Delete {
+        /// Instruction ID or name
+        id_or_name: String,
+        /// Skip confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Show instruction effectiveness statistics
+    Stats {
+        /// Instruction ID or name (optional, shows all if not specified)
+        id_or_name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LearnAction {
+    /// List learning patterns
+    Patterns {
+        /// Show only pending patterns
+        #[arg(long)]
+        pending_only: bool,
+    },
+    /// Approve a pattern and create instruction
+    Approve {
+        /// Pattern ID
+        pattern_id: i64,
+    },
+    /// Reject a pattern
+    Reject {
+        /// Pattern ID
+        pattern_id: i64,
+    },
+    /// Process patterns and create instructions
+    Analyze,
+    /// Show learning configuration
+    Config,
+    /// Cleanup ineffective instructions
+    Cleanup,
+    /// Reset penalty score for an instruction
+    ResetPenalty {
+        /// Instruction ID or name
+        id_or_name: String,
     },
 }
 
@@ -510,9 +613,267 @@ async fn main() -> Result<()> {
                 }
             }
         },
+
+        Commands::Instructions { action } => match action {
+            InstructionAction::List { enabled_only, learned_only } => {
+                let source = if learned_only {
+                    Some(orchestrate_core::InstructionSource::Learned)
+                } else {
+                    None
+                };
+                let instructions = db.list_instructions(enabled_only, None, source).await?;
+
+                if instructions.is_empty() {
+                    println!("No instructions found");
+                    return Ok(());
+                }
+
+                println!("{:<6} {:<25} {:<10} {:<8} {:<10} {}", "ID", "NAME", "SCOPE", "ENABLED", "SOURCE", "CONTENT");
+                println!("{}", "-".repeat(100));
+                for inst in instructions {
+                    let content_preview = if inst.content.len() > 40 {
+                        format!("{}...", &inst.content[..37])
+                    } else {
+                        inst.content.clone()
+                    };
+                    println!(
+                        "{:<6} {:<25} {:<10} {:<8} {:<10} {}",
+                        inst.id,
+                        if inst.name.len() > 25 { format!("{}...", &inst.name[..22]) } else { inst.name },
+                        inst.scope.as_str(),
+                        if inst.enabled { "yes" } else { "no" },
+                        inst.source.as_str(),
+                        content_preview
+                    );
+                }
+            }
+            InstructionAction::Show { id_or_name } => {
+                let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
+                println!("Instruction: {}", instruction.name);
+                println!("{}", "=".repeat(40));
+                println!("ID: {}", instruction.id);
+                println!("Scope: {}", instruction.scope.as_str());
+                if let Some(agent_type) = instruction.agent_type {
+                    println!("Agent Type: {}", agent_type.as_str());
+                }
+                println!("Priority: {}", instruction.priority);
+                println!("Enabled: {}", instruction.enabled);
+                println!("Source: {}", instruction.source.as_str());
+                println!("Confidence: {:.2}", instruction.confidence);
+                if !instruction.tags.is_empty() {
+                    println!("Tags: {}", instruction.tags.join(", "));
+                }
+                println!("Created: {}", instruction.created_at);
+                println!("Updated: {}", instruction.updated_at);
+                if let Some(ref created_by) = instruction.created_by {
+                    println!("Created By: {}", created_by);
+                }
+                println!();
+                println!("Content:");
+                println!("{}", "-".repeat(40));
+                println!("{}", instruction.content);
+            }
+            InstructionAction::Create { name, content, scope, agent_type, priority } => {
+                let instruction = if scope == "agent_type" {
+                    let agent_type = agent_type
+                        .ok_or_else(|| anyhow::anyhow!("--agent-type required for scope=agent_type"))?;
+                    let agent_type = parse_agent_type(&agent_type)?;
+                    CustomInstruction::for_agent_type(&name, &content, agent_type)
+                        .with_priority(priority)
+                } else {
+                    CustomInstruction::global(&name, &content)
+                        .with_priority(priority)
+                };
+
+                let id = db.insert_instruction(&instruction).await?;
+                println!("Created instruction: {} (ID: {})", name, id);
+            }
+            InstructionAction::Enable { id_or_name } => {
+                let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
+                db.set_instruction_enabled(instruction.id, true).await?;
+                println!("Enabled instruction: {} (ID: {})", instruction.name, instruction.id);
+            }
+            InstructionAction::Disable { id_or_name } => {
+                let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
+                db.set_instruction_enabled(instruction.id, false).await?;
+                println!("Disabled instruction: {} (ID: {})", instruction.name, instruction.id);
+            }
+            InstructionAction::Delete { id_or_name, force } => {
+                let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
+
+                if !force {
+                    print!("Delete instruction '{}' (ID: {})? [y/N] ", instruction.name, instruction.id);
+                    use std::io::{self, Write};
+                    io::stdout().flush()?;
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("Aborted");
+                        return Ok(());
+                    }
+                }
+
+                db.delete_instruction(instruction.id).await?;
+                println!("Deleted instruction: {} (ID: {})", instruction.name, instruction.id);
+            }
+            InstructionAction::Stats { id_or_name } => {
+                if let Some(ref id_or_name) = id_or_name {
+                    let instruction = get_instruction_by_id_or_name(&db, id_or_name).await?;
+                    if let Some(eff) = db.get_instruction_effectiveness(instruction.id).await? {
+                        println!("Instruction: {} (ID: {})", instruction.name, instruction.id);
+                        println!("{}", "-".repeat(40));
+                        println!("Usage count: {}", eff.usage_count);
+                        println!("Success count: {}", eff.success_count);
+                        println!("Failure count: {}", eff.failure_count);
+                        println!("Success rate: {:.1}%", eff.success_rate * 100.0);
+                        println!("Penalty score: {:.2}", eff.penalty_score);
+                        if let Some(time) = eff.avg_completion_time {
+                            println!("Avg completion time: {:.1}s", time);
+                        }
+                        if let Some(ref dt) = eff.last_success_at {
+                            println!("Last success: {}", dt);
+                        }
+                        if let Some(ref dt) = eff.last_failure_at {
+                            println!("Last failure: {}", dt);
+                        }
+                    } else {
+                        println!("No effectiveness data for instruction: {}", instruction.name);
+                    }
+                } else {
+                    let instructions = db.list_instructions(false, None, None).await?;
+                    if instructions.is_empty() {
+                        println!("No instructions found");
+                        return Ok(());
+                    }
+
+                    println!("{:<6} {:<25} {:<8} {:<8} {:<8} {:<10}", "ID", "NAME", "USAGE", "SUCCESS", "FAILURE", "PENALTY");
+                    println!("{}", "-".repeat(80));
+                    for inst in instructions {
+                        if let Some(eff) = db.get_instruction_effectiveness(inst.id).await? {
+                            println!(
+                                "{:<6} {:<25} {:<8} {:<8} {:<8} {:<10.2}",
+                                inst.id,
+                                if inst.name.len() > 25 { format!("{}...", &inst.name[..22]) } else { inst.name },
+                                eff.usage_count,
+                                eff.success_count,
+                                eff.failure_count,
+                                eff.penalty_score
+                            );
+                        }
+                    }
+                }
+            }
+        },
+
+        Commands::Learn { action } => match action {
+            LearnAction::Patterns { pending_only } => {
+                let status = if pending_only {
+                    Some(PatternStatus::Observed)
+                } else {
+                    None
+                };
+                let patterns = db.list_patterns(status).await?;
+
+                if patterns.is_empty() {
+                    println!("No patterns found");
+                    return Ok(());
+                }
+
+                println!("{:<6} {:<20} {:<15} {:<8} {:<15}", "ID", "TYPE", "AGENT_TYPE", "COUNT", "STATUS");
+                println!("{}", "-".repeat(80));
+                for pattern in patterns {
+                    println!(
+                        "{:<6} {:<20} {:<15} {:<8} {:<15}",
+                        pattern.id,
+                        pattern.pattern_type.as_str(),
+                        pattern.agent_type.map(|t| t.as_str().to_string()).unwrap_or_else(|| "global".to_string()),
+                        pattern.occurrence_count,
+                        pattern.status.as_str()
+                    );
+                }
+            }
+            LearnAction::Approve { pattern_id } => {
+                let pattern = db.get_pattern(pattern_id).await?
+                    .ok_or_else(|| anyhow::anyhow!("Pattern not found: {}", pattern_id))?;
+
+                let engine = LearningEngine::new();
+                let instruction = engine.generate_instruction_from_pattern(&pattern)
+                    .ok_or_else(|| anyhow::anyhow!("Could not generate instruction from pattern"))?;
+
+                let instruction_id = db.insert_instruction(&instruction).await?;
+                db.update_pattern_status(pattern_id, PatternStatus::Approved, Some(instruction_id)).await?;
+
+                println!("Approved pattern {} and created instruction {}", pattern_id, instruction_id);
+            }
+            LearnAction::Reject { pattern_id } => {
+                let _ = db.get_pattern(pattern_id).await?
+                    .ok_or_else(|| anyhow::anyhow!("Pattern not found: {}", pattern_id))?;
+
+                db.update_pattern_status(pattern_id, PatternStatus::Rejected, None).await?;
+                println!("Rejected pattern {}", pattern_id);
+            }
+            LearnAction::Analyze => {
+                let engine = LearningEngine::new();
+                let created = engine.process_patterns(&db).await?;
+
+                if created.is_empty() {
+                    println!("No new instructions created");
+                } else {
+                    println!("Created {} instructions:", created.len());
+                    for inst in created {
+                        println!("  - {} (ID: {})", inst.name, inst.id);
+                    }
+                }
+            }
+            LearnAction::Config => {
+                let config = orchestrate_core::LearningConfig::default();
+                println!("Learning Configuration");
+                println!("{}", "=".repeat(40));
+                println!("Min occurrences: {}", config.min_occurrences);
+                println!("Auto-approve threshold: {}", config.auto_approve_threshold);
+                println!("Auto-enable: {}", config.auto_enable);
+                println!("Penalty disable threshold: {}", config.penalty_disable_threshold);
+                println!("Min usage for deletion: {}", config.min_usage_for_deletion);
+                println!("Deletion success rate threshold: {}", config.deletion_success_rate_threshold);
+                println!("Enabled pattern types: {:?}", config.enabled_pattern_types);
+            }
+            LearnAction::Cleanup => {
+                let engine = LearningEngine::new();
+                let result = engine.cleanup(&db).await?;
+
+                println!("Cleanup Results");
+                println!("{}", "=".repeat(40));
+                println!("Instructions disabled: {}", result.disabled_count);
+                println!("Instructions deleted: {}", result.deleted_names.len());
+                if !result.deleted_names.is_empty() {
+                    println!("Deleted: {}", result.deleted_names.join(", "));
+                }
+            }
+            LearnAction::ResetPenalty { id_or_name } => {
+                let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
+                db.reset_penalty(instruction.id).await?;
+                println!("Reset penalty for instruction: {} (ID: {})", instruction.name, instruction.id);
+            }
+        },
     }
 
     Ok(())
+}
+
+async fn get_instruction_by_id_or_name(db: &Database, id_or_name: &str) -> Result<CustomInstruction> {
+    // Try parsing as ID first
+    if let Ok(id) = id_or_name.parse::<i64>() {
+        if let Some(inst) = db.get_instruction(id).await? {
+            return Ok(inst);
+        }
+    }
+
+    // Try as name
+    if let Some(inst) = db.get_instruction_by_name(id_or_name).await? {
+        return Ok(inst);
+    }
+
+    anyhow::bail!("Instruction not found: {}", id_or_name)
 }
 
 fn parse_agent_type(s: &str) -> Result<AgentType> {

@@ -1,7 +1,10 @@
 //! Agent loop runner
 
 use anyhow::Result;
-use orchestrate_core::{Agent, AgentState, Database, Message};
+use orchestrate_core::{
+    Agent, AgentState, CustomInstruction, Database, LearningEngine, Message,
+};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::client::{ClaudeClient, ContentBlock, CreateMessageRequest, MessageContent};
@@ -11,6 +14,10 @@ use crate::tools::ToolExecutor;
 pub struct LoopConfig {
     pub max_turns: u32,
     pub model: String,
+    /// Enable custom instruction injection
+    pub enable_instructions: bool,
+    /// Enable learning from agent runs
+    pub enable_learning: bool,
 }
 
 impl Default for LoopConfig {
@@ -18,6 +25,8 @@ impl Default for LoopConfig {
         Self {
             max_turns: 80,
             model: "claude-sonnet-4-20250514".to_string(),
+            enable_instructions: true,
+            enable_learning: true,
         }
     }
 }
@@ -28,6 +37,7 @@ pub struct AgentLoop {
     db: Database,
     tool_executor: ToolExecutor,
     config: LoopConfig,
+    learning_engine: LearningEngine,
 }
 
 impl AgentLoop {
@@ -38,17 +48,58 @@ impl AgentLoop {
             db,
             tool_executor: ToolExecutor::new(),
             config,
+            learning_engine: LearningEngine::new(),
+        }
+    }
+
+    /// Create a new agent loop with custom learning configuration
+    pub fn with_learning_config(
+        client: ClaudeClient,
+        db: Database,
+        config: LoopConfig,
+        learning_engine: LearningEngine,
+    ) -> Self {
+        Self {
+            client,
+            db,
+            tool_executor: ToolExecutor::new(),
+            config,
+            learning_engine,
         }
     }
 
     /// Run the agent loop
     #[tracing::instrument(skip(self, agent), fields(agent_id = %agent.id, agent_type = ?agent.agent_type))]
     pub async fn run(&self, agent: &mut Agent) -> Result<()> {
+        let start_time = Instant::now();
         info!("Starting agent loop for agent {}", agent.id);
 
         // Transition to initializing
         agent.transition_to(AgentState::Initializing)?;
         self.db.update_agent(agent).await?;
+
+        // Load custom instructions for this agent type
+        let (instructions, instruction_ids) = if self.config.enable_instructions {
+            let insts = self.db.get_instructions_for_agent(agent.agent_type).await?;
+            let ids: Vec<i64> = insts.iter().map(|i| i.id).collect();
+
+            // Record instruction usage
+            for inst in &insts {
+                if let Err(e) = self.db.record_instruction_usage(
+                    inst.id,
+                    agent.id,
+                    agent.session_id.as_deref(),
+                ).await {
+                    warn!("Failed to record instruction usage: {}", e);
+                }
+            }
+
+            (insts, ids)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        debug!("Loaded {} custom instructions for agent {}", instructions.len(), agent.id);
 
         // Load message history
         let mut messages = self.db.get_messages(agent.id).await?;
@@ -65,6 +116,7 @@ impl AgentLoop {
         self.db.update_agent(agent).await?;
 
         let mut turn = 0;
+        let mut was_blocked = false;
 
         loop {
             turn += 1;
@@ -79,12 +131,13 @@ impl AgentLoop {
             // Convert messages to API format
             let api_messages = self.messages_to_api(&messages);
 
-            // Create request
+            // Create request with custom instructions
+            let system_prompt = self.get_system_prompt_with_instructions(agent, &instructions);
             let request = CreateMessageRequest {
                 model: self.config.model.clone(),
                 max_tokens: 4096,
                 messages: api_messages,
-                system: Some(self.get_system_prompt(agent)),
+                system: Some(system_prompt),
                 tools: Some(self.tool_executor.get_tool_definitions(&agent.agent_type)),
             };
 
@@ -116,6 +169,15 @@ impl AgentLoop {
                 .with_tokens(response.usage.input_tokens, response.usage.output_tokens);
             self.db.insert_message(&assistant_msg).await?;
             messages.push(assistant_msg);
+
+            // Check for blocked status
+            if self.is_blocked_signal(&text_content) {
+                warn!("Agent {} is blocked", agent.id);
+                was_blocked = true;
+                let reason = self.extract_blocked_reason(&text_content);
+                agent.fail(&format!("Agent blocked: {}", reason))?;
+                break;
+            }
 
             // Check for completion
             if response.stop_reason.as_deref() == Some("end_turn") && tool_calls.is_empty() {
@@ -155,6 +217,45 @@ impl AgentLoop {
                 info!("Agent {} waiting for external event", agent.id);
                 agent.transition_to(AgentState::WaitingForExternal)?;
                 break;
+            }
+        }
+
+        // Record instruction outcomes and apply learning
+        let success = agent.state == AgentState::Completed;
+        let completion_time = start_time.elapsed().as_secs_f64();
+
+        if self.config.enable_instructions && !instruction_ids.is_empty() {
+            // Record outcomes for each instruction
+            for &id in &instruction_ids {
+                if let Err(e) = self.db.record_instruction_outcome(id, success, Some(completion_time)).await {
+                    warn!("Failed to record instruction outcome: {}", e);
+                }
+            }
+
+            // Apply penalties/decay based on outcome
+            if let Err(e) = self.learning_engine.apply_outcome_penalties(
+                &self.db,
+                &instruction_ids,
+                success,
+                was_blocked,
+            ).await {
+                warn!("Failed to apply outcome penalties: {}", e);
+            }
+        }
+
+        // Analyze agent run for learning patterns
+        if self.config.enable_learning && !success {
+            // Reload messages for analysis
+            let all_messages = self.db.get_messages(agent.id).await?;
+
+            if let Err(e) = self.learning_engine.analyze_agent_run(
+                &self.db,
+                agent.id,
+                agent.agent_type,
+                &all_messages,
+                success,
+            ).await {
+                warn!("Failed to analyze agent run for learning: {}", e);
             }
         }
 
@@ -217,11 +318,62 @@ If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <re
         )
     }
 
+    fn get_system_prompt_with_instructions(
+        &self,
+        agent: &Agent,
+        instructions: &[CustomInstruction],
+    ) -> String {
+        let base_prompt = self.get_system_prompt(agent);
+
+        if instructions.is_empty() {
+            return base_prompt;
+        }
+
+        // Sort instructions by priority (higher first)
+        let mut sorted_instructions: Vec<_> = instructions.iter().collect();
+        sorted_instructions.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        let instructions_block = sorted_instructions
+            .iter()
+            .map(|i| format!("- {}", i.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            r#"{}
+
+## Custom Instructions
+
+The following instructions have been learned from previous agent runs. Please follow them carefully:
+
+{}
+"#,
+            base_prompt,
+            instructions_block
+        )
+    }
+
     fn is_completion_signal(&self, text: &str) -> bool {
         text.contains("STATUS: COMPLETE")
     }
 
     fn needs_external_wait(&self, text: &str) -> bool {
         text.contains("STATUS: WAITING")
+    }
+
+    fn is_blocked_signal(&self, text: &str) -> bool {
+        text.contains("STATUS: BLOCKED")
+    }
+
+    fn extract_blocked_reason(&self, text: &str) -> String {
+        if let Some(pos) = text.find("STATUS: BLOCKED:") {
+            let after = &text[pos + "STATUS: BLOCKED:".len()..];
+            // Take the rest of the line
+            let reason = after.lines().next().unwrap_or("").trim();
+            if !reason.is_empty() {
+                return reason.to_string();
+            }
+        }
+        "Unknown reason".to_string()
     }
 }

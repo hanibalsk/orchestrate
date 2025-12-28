@@ -7,6 +7,10 @@ use uuid::Uuid;
 
 use crate::{Agent, AgentState, AgentType, Epic, EpicStatus, Message, MessageRole, PrStatus, PullRequest, MergeStrategy, Result};
 use crate::network::{AgentId, StepOutput, StepOutputType};
+use crate::instruction::{
+    CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
+    LearningPattern, PatternStatus, PatternType,
+};
 
 /// Database configuration
 pub struct DatabaseConfig {
@@ -95,6 +99,9 @@ impl Database {
             .execute(&self.pool)
             .await?;
         sqlx::query(include_str!("../../../migrations/003_step_outputs.sql"))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(include_str!("../../../migrations/004_custom_instructions.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -534,6 +541,539 @@ impl Database {
         let count = query_builder.fetch_one(&self.pool).await?;
         Ok(count)
     }
+
+    // ==================== Custom Instruction Operations ====================
+
+    /// Insert a new custom instruction
+    #[tracing::instrument(skip(self, instruction), level = "debug", fields(name = %instruction.name))]
+    pub async fn insert_instruction(&self, instruction: &CustomInstruction) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO custom_instructions (name, content, scope, agent_type, priority, enabled, source, confidence, tags, created_at, updated_at, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&instruction.name)
+        .bind(&instruction.content)
+        .bind(instruction.scope.as_str())
+        .bind(instruction.agent_type.map(|t| t.as_str()))
+        .bind(instruction.priority)
+        .bind(instruction.enabled)
+        .bind(instruction.source.as_str())
+        .bind(instruction.confidence)
+        .bind(serde_json::to_string(&instruction.tags)?)
+        .bind(instruction.created_at.to_rfc3339())
+        .bind(instruction.updated_at.to_rfc3339())
+        .bind(&instruction.created_by)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid();
+
+        // Initialize effectiveness metrics
+        sqlx::query(
+            "INSERT INTO instruction_effectiveness (instruction_id) VALUES (?)"
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Get instruction by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_instruction(&self, id: i64) -> Result<Option<CustomInstruction>> {
+        let row = sqlx::query_as::<_, InstructionRow>(
+            "SELECT * FROM custom_instructions WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get instruction by name
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_instruction_by_name(&self, name: &str) -> Result<Option<CustomInstruction>> {
+        let row = sqlx::query_as::<_, InstructionRow>(
+            "SELECT * FROM custom_instructions WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get all enabled instructions for an agent type (includes global)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_instructions_for_agent(&self, agent_type: AgentType) -> Result<Vec<CustomInstruction>> {
+        let rows = sqlx::query_as::<_, InstructionRow>(
+            r#"
+            SELECT * FROM custom_instructions
+            WHERE enabled = 1
+            AND (scope = 'global' OR (scope = 'agent_type' AND agent_type = ?))
+            ORDER BY priority DESC, created_at ASC
+            "#,
+        )
+        .bind(agent_type.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List all instructions with optional filters
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_instructions(
+        &self,
+        enabled_only: bool,
+        scope: Option<InstructionScope>,
+        source: Option<InstructionSource>,
+    ) -> Result<Vec<CustomInstruction>> {
+        let mut query = String::from("SELECT * FROM custom_instructions WHERE 1=1");
+
+        if enabled_only {
+            query.push_str(" AND enabled = 1");
+        }
+        if let Some(s) = &scope {
+            query.push_str(&format!(" AND scope = '{}'", s.as_str()));
+        }
+        if let Some(s) = &source {
+            query.push_str(&format!(" AND source = '{}'", s.as_str()));
+        }
+        query.push_str(" ORDER BY priority DESC, created_at ASC");
+
+        let rows = sqlx::query_as::<_, InstructionRow>(&query)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update an instruction
+    #[tracing::instrument(skip(self, instruction), level = "debug", fields(id = instruction.id))]
+    pub async fn update_instruction(&self, instruction: &CustomInstruction) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE custom_instructions SET
+                name = ?, content = ?, scope = ?, agent_type = ?,
+                priority = ?, enabled = ?, source = ?, confidence = ?,
+                tags = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&instruction.name)
+        .bind(&instruction.content)
+        .bind(instruction.scope.as_str())
+        .bind(instruction.agent_type.map(|t| t.as_str()))
+        .bind(instruction.priority)
+        .bind(instruction.enabled)
+        .bind(instruction.source.as_str())
+        .bind(instruction.confidence)
+        .bind(serde_json::to_string(&instruction.tags)?)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(instruction.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Enable/disable an instruction
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn set_instruction_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        sqlx::query(
+            "UPDATE custom_instructions SET enabled = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(enabled)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete an instruction
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_instruction(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM custom_instructions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Record instruction usage
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn record_instruction_usage(
+        &self,
+        instruction_id: i64,
+        agent_id: Uuid,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO instruction_usage (instruction_id, agent_id, session_id)
+            VALUES (?, ?, ?)
+            "#,
+        )
+        .bind(instruction_id)
+        .bind(agent_id.to_string())
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+
+        // Update usage count
+        sqlx::query(
+            r#"
+            UPDATE instruction_effectiveness
+            SET usage_count = usage_count + 1, updated_at = ?
+            WHERE instruction_id = ?
+            "#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(instruction_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Record instruction outcome (success/failure)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn record_instruction_outcome(
+        &self,
+        instruction_id: i64,
+        success: bool,
+        completion_time_secs: Option<f64>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        if success {
+            sqlx::query(
+                r#"
+                UPDATE instruction_effectiveness SET
+                    success_count = success_count + 1,
+                    last_success_at = ?,
+                    updated_at = ?
+                WHERE instruction_id = ?
+                "#,
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(instruction_id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE instruction_effectiveness SET
+                    failure_count = failure_count + 1,
+                    last_failure_at = ?,
+                    updated_at = ?
+                WHERE instruction_id = ?
+                "#,
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(instruction_id)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        // Update average completion time if provided
+        if let Some(time) = completion_time_secs {
+            sqlx::query(
+                r#"
+                UPDATE instruction_effectiveness SET
+                    avg_completion_time = COALESCE(
+                        (avg_completion_time * (usage_count - 1) + ?) / usage_count,
+                        ?
+                    )
+                WHERE instruction_id = ?
+                "#,
+            )
+            .bind(time)
+            .bind(time)
+            .bind(instruction_id)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply penalty to an instruction
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn apply_penalty(&self, id: i64, amount: f64, reason: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE instruction_effectiveness
+            SET penalty_score = MIN(penalty_score + ?, 2.0),
+                last_penalty_at = ?,
+                updated_at = ?
+            WHERE instruction_id = ?
+            "#,
+        )
+        .bind(amount)
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        tracing::warn!(instruction_id = id, penalty = amount, reason, "Penalty applied");
+        Ok(())
+    }
+
+    /// Decay penalty on success
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn decay_penalty(&self, id: i64, amount: f64) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE instruction_effectiveness
+            SET penalty_score = MAX(penalty_score - ?, 0.0),
+                updated_at = ?
+            WHERE instruction_id = ?
+            "#,
+        )
+        .bind(amount)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get instruction effectiveness
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_instruction_effectiveness(&self, instruction_id: i64) -> Result<Option<InstructionEffectiveness>> {
+        let row = sqlx::query_as::<_, EffectivenessRow>(
+            "SELECT * FROM instruction_effectiveness WHERE instruction_id = ?",
+        )
+        .bind(instruction_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get instructions with high penalty scores
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_high_penalty_instructions(&self, threshold: f64) -> Result<Vec<i64>> {
+        let ids = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT instruction_id FROM instruction_effectiveness
+            WHERE penalty_score >= ?
+            "#,
+        )
+        .bind(threshold)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(ids)
+    }
+
+    /// Auto-disable instructions with high penalty
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn auto_disable_penalized(&self, threshold: f64) -> Result<Vec<i64>> {
+        let disabled = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT instruction_id FROM instruction_effectiveness
+            WHERE penalty_score >= ?
+            AND instruction_id IN (
+                SELECT id FROM custom_instructions WHERE enabled = 1
+            )
+            "#,
+        )
+        .bind(threshold)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for id in &disabled {
+            self.set_instruction_enabled(*id, false).await?;
+            tracing::info!(instruction_id = id, "Auto-disabled due to high penalty");
+        }
+
+        Ok(disabled)
+    }
+
+    /// Delete ineffective learned instructions
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_ineffective_instructions(&self) -> Result<Vec<String>> {
+        let to_delete = sqlx::query_as::<_, (i64, String)>(
+            r#"
+            SELECT ci.id, ci.name FROM custom_instructions ci
+            JOIN instruction_effectiveness ie ON ci.id = ie.instruction_id
+            WHERE ie.penalty_score >= 1.0
+            AND ie.usage_count >= 10
+            AND (CAST(ie.success_count AS REAL) / NULLIF(ie.usage_count, 0)) < 0.3
+            AND ci.source = 'learned'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let names: Vec<String> = to_delete.iter().map(|(_, n)| n.clone()).collect();
+
+        for (id, name) in to_delete {
+            self.delete_instruction(id).await?;
+            tracing::info!(instruction_id = id, name = %name, "Deleted ineffective instruction");
+        }
+
+        Ok(names)
+    }
+
+    /// Reset penalty score for an instruction
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn reset_penalty(&self, id: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE instruction_effectiveness
+            SET penalty_score = 0.0, last_penalty_at = NULL, updated_at = ?
+            WHERE instruction_id = ?
+            "#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // ==================== Learning Pattern Operations ====================
+
+    /// Upsert a learning pattern (increment count if exists)
+    #[tracing::instrument(skip(self, pattern), level = "debug", fields(signature = %pattern.pattern_signature))]
+    pub async fn upsert_learning_pattern(&self, pattern: &LearningPattern) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Try to find existing pattern by signature
+        let existing = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM learning_patterns WHERE pattern_signature = ?"
+        )
+        .bind(&pattern.pattern_signature)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(id) = existing {
+            // Update existing pattern
+            sqlx::query(
+                r#"
+                UPDATE learning_patterns SET
+                    occurrence_count = occurrence_count + 1,
+                    last_seen_at = ?,
+                    pattern_data = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(&now)
+            .bind(serde_json::to_string(&pattern.pattern_data)?)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            Ok(id)
+        } else {
+            // Insert new pattern
+            let result = sqlx::query(
+                r#"
+                INSERT INTO learning_patterns (pattern_type, agent_type, pattern_signature, pattern_data, first_seen_at, last_seen_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(pattern.pattern_type.as_str())
+            .bind(pattern.agent_type.map(|t| t.as_str()))
+            .bind(&pattern.pattern_signature)
+            .bind(serde_json::to_string(&pattern.pattern_data)?)
+            .bind(&now)
+            .bind(&now)
+            .bind(pattern.status.as_str())
+            .execute(&self.pool)
+            .await?;
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    /// Get pattern by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_pattern(&self, id: i64) -> Result<Option<LearningPattern>> {
+        let row = sqlx::query_as::<_, PatternRow>(
+            "SELECT * FROM learning_patterns WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get patterns ready for instruction generation
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_patterns_for_review(&self, min_occurrences: i64) -> Result<Vec<LearningPattern>> {
+        let rows = sqlx::query_as::<_, PatternRow>(
+            r#"
+            SELECT * FROM learning_patterns
+            WHERE status = 'observed'
+            AND occurrence_count >= ?
+            ORDER BY occurrence_count DESC
+            "#,
+        )
+        .bind(min_occurrences)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List all patterns with optional status filter
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_patterns(&self, status: Option<PatternStatus>) -> Result<Vec<LearningPattern>> {
+        let rows = if let Some(s) = status {
+            sqlx::query_as::<_, PatternRow>(
+                "SELECT * FROM learning_patterns WHERE status = ? ORDER BY occurrence_count DESC",
+            )
+            .bind(s.as_str())
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, PatternRow>(
+                "SELECT * FROM learning_patterns ORDER BY occurrence_count DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update pattern status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_pattern_status(
+        &self,
+        id: i64,
+        status: PatternStatus,
+        instruction_id: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE learning_patterns SET status = ?, instruction_id = ? WHERE id = ?",
+        )
+        .bind(status.as_str())
+        .bind(instruction_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 // ==================== Row Types for SQLx ====================
@@ -732,6 +1272,159 @@ impl TryFrom<StepOutputRow> for StepOutput {
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct InstructionRow {
+    id: i64,
+    name: String,
+    content: String,
+    scope: String,
+    agent_type: Option<String>,
+    priority: i32,
+    enabled: bool,
+    source: String,
+    confidence: f64,
+    tags: Option<String>,
+    created_at: String,
+    updated_at: String,
+    created_by: Option<String>,
+}
+
+impl TryFrom<InstructionRow> for CustomInstruction {
+    type Error = crate::Error;
+
+    fn try_from(row: InstructionRow) -> Result<Self> {
+        let agent_type = row.agent_type
+            .map(|s| AgentType::from_str(&s))
+            .transpose()?;
+
+        let tags: Vec<String> = row.tags
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(CustomInstruction {
+            id: row.id,
+            name: row.name,
+            content: row.content,
+            scope: InstructionScope::from_str(&row.scope)?,
+            agent_type,
+            priority: row.priority,
+            enabled: row.enabled,
+            source: InstructionSource::from_str(&row.source)?,
+            confidence: row.confidence,
+            tags,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            created_by: row.created_by,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct EffectivenessRow {
+    instruction_id: i64,
+    usage_count: i64,
+    success_count: i64,
+    failure_count: i64,
+    penalty_score: f64,
+    avg_completion_time: Option<f64>,
+    last_success_at: Option<String>,
+    last_failure_at: Option<String>,
+    last_penalty_at: Option<String>,
+    updated_at: String,
+}
+
+impl TryFrom<EffectivenessRow> for InstructionEffectiveness {
+    type Error = crate::Error;
+
+    fn try_from(row: EffectivenessRow) -> Result<Self> {
+        let last_success_at = row.last_success_at
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(Into::into);
+
+        let last_failure_at = row.last_failure_at
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(Into::into);
+
+        let last_penalty_at = row.last_penalty_at
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(Into::into);
+
+        let success_rate = if row.usage_count > 0 {
+            row.success_count as f64 / row.usage_count as f64
+        } else {
+            0.0
+        };
+
+        Ok(InstructionEffectiveness {
+            instruction_id: row.instruction_id,
+            usage_count: row.usage_count,
+            success_count: row.success_count,
+            failure_count: row.failure_count,
+            penalty_score: row.penalty_score,
+            avg_completion_time: row.avg_completion_time,
+            success_rate,
+            last_success_at,
+            last_failure_at,
+            last_penalty_at,
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PatternRow {
+    id: i64,
+    pattern_type: String,
+    agent_type: Option<String>,
+    pattern_signature: String,
+    pattern_data: String,
+    occurrence_count: i64,
+    first_seen_at: String,
+    last_seen_at: String,
+    instruction_id: Option<i64>,
+    status: String,
+}
+
+impl TryFrom<PatternRow> for LearningPattern {
+    type Error = crate::Error;
+
+    fn try_from(row: PatternRow) -> Result<Self> {
+        let agent_type = row.agent_type
+            .map(|s| AgentType::from_str(&s))
+            .transpose()?;
+
+        Ok(LearningPattern {
+            id: row.id,
+            pattern_type: PatternType::from_str(&row.pattern_type)?,
+            agent_type,
+            pattern_signature: row.pattern_signature,
+            pattern_data: serde_json::from_str(&row.pattern_data)?,
+            occurrence_count: row.occurrence_count,
+            first_seen_at: chrono::DateTime::parse_from_rfc3339(&row.first_seen_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            last_seen_at: chrono::DateTime::parse_from_rfc3339(&row.last_seen_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            instruction_id: row.instruction_id,
+            status: PatternStatus::from_str(&row.status)?,
         })
     }
 }

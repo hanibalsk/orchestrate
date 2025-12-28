@@ -673,3 +673,330 @@ mod workflow {
         assert_eq!(all_outputs[0].consumed_by, Some(agent_b));
     }
 }
+
+// ==================== Instruction System Integration Tests ====================
+
+mod instructions {
+    use super::*;
+    use orchestrate_core::{
+        CustomInstruction, InstructionSource, LearningEngine, LearningPattern,
+        PatternStatus, PatternType,
+    };
+
+    #[tokio::test]
+    async fn test_instruction_crud() {
+        let db = setup_db().await;
+
+        // Create a global instruction
+        let instruction = CustomInstruction::global(
+            "no-force-push",
+            "Never use git push --force without explicit user approval",
+        ).with_priority(150);
+
+        let id = db.insert_instruction(&instruction).await.unwrap();
+        assert!(id > 0);
+
+        // Retrieve by ID
+        let fetched = db.get_instruction(id).await.unwrap().unwrap();
+        assert_eq!(fetched.name, "no-force-push");
+        assert_eq!(fetched.priority, 150);
+        assert!(fetched.enabled);
+
+        // Retrieve by name
+        let fetched_by_name = db.get_instruction_by_name("no-force-push").await.unwrap().unwrap();
+        assert_eq!(fetched_by_name.id, id);
+
+        // Update
+        let mut updated = fetched;
+        updated.content = "Never use force push".to_string();
+        updated.priority = 200;
+        db.update_instruction(&updated).await.unwrap();
+
+        let fetched = db.get_instruction(id).await.unwrap().unwrap();
+        assert_eq!(fetched.content, "Never use force push");
+        assert_eq!(fetched.priority, 200);
+
+        // Disable
+        db.set_instruction_enabled(id, false).await.unwrap();
+        let fetched = db.get_instruction(id).await.unwrap().unwrap();
+        assert!(!fetched.enabled);
+
+        // Delete
+        db.delete_instruction(id).await.unwrap();
+        let fetched = db.get_instruction(id).await.unwrap();
+        assert!(fetched.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_instructions_for_agent_type() {
+        let db = setup_db().await;
+
+        // Create global instruction
+        let global = CustomInstruction::global(
+            "global-rule",
+            "This applies to all agents",
+        );
+        db.insert_instruction(&global).await.unwrap();
+
+        // Create instruction for StoryDeveloper
+        let story_dev = CustomInstruction::for_agent_type(
+            "story-dev-rule",
+            "This applies only to story developers",
+            AgentType::StoryDeveloper,
+        );
+        db.insert_instruction(&story_dev).await.unwrap();
+
+        // Create instruction for CodeReviewer
+        let code_rev = CustomInstruction::for_agent_type(
+            "code-rev-rule",
+            "This applies only to code reviewers",
+            AgentType::CodeReviewer,
+        );
+        db.insert_instruction(&code_rev).await.unwrap();
+
+        // Story developer should get global + story-dev-rule
+        let story_insts = db.get_instructions_for_agent(AgentType::StoryDeveloper).await.unwrap();
+        assert_eq!(story_insts.len(), 2);
+        assert!(story_insts.iter().any(|i| i.name == "global-rule"));
+        assert!(story_insts.iter().any(|i| i.name == "story-dev-rule"));
+        assert!(!story_insts.iter().any(|i| i.name == "code-rev-rule"));
+
+        // Code reviewer should get global + code-rev-rule
+        let code_insts = db.get_instructions_for_agent(AgentType::CodeReviewer).await.unwrap();
+        assert_eq!(code_insts.len(), 2);
+        assert!(code_insts.iter().any(|i| i.name == "global-rule"));
+        assert!(code_insts.iter().any(|i| i.name == "code-rev-rule"));
+        assert!(!code_insts.iter().any(|i| i.name == "story-dev-rule"));
+    }
+
+    #[tokio::test]
+    async fn test_instruction_usage_and_effectiveness() {
+        let db = setup_db().await;
+
+        // Create instruction
+        let instruction = CustomInstruction::global("test-rule", "Test content");
+        let id = db.insert_instruction(&instruction).await.unwrap();
+
+        // Create an agent
+        let agent = Agent::new(AgentType::StoryDeveloper, "Test task");
+        db.insert_agent(&agent).await.unwrap();
+
+        // Record usage
+        db.record_instruction_usage(id, agent.id, None).await.unwrap();
+        db.record_instruction_usage(id, agent.id, None).await.unwrap();
+
+        // Record outcomes
+        db.record_instruction_outcome(id, true, Some(10.5)).await.unwrap();
+        db.record_instruction_outcome(id, false, Some(5.0)).await.unwrap();
+
+        // Check effectiveness
+        let eff = db.get_instruction_effectiveness(id).await.unwrap().unwrap();
+        assert_eq!(eff.usage_count, 2);
+        assert_eq!(eff.success_count, 1);
+        assert_eq!(eff.failure_count, 1);
+        assert_eq!(eff.success_rate, 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_penalty_system() {
+        let db = setup_db().await;
+
+        // Create instruction
+        let instruction = CustomInstruction::global("penalty-test", "Test content");
+        let id = db.insert_instruction(&instruction).await.unwrap();
+
+        // Apply penalties
+        db.apply_penalty(id, 0.2, "test_failure").await.unwrap();
+        db.apply_penalty(id, 0.3, "another_failure").await.unwrap();
+
+        let eff = db.get_instruction_effectiveness(id).await.unwrap().unwrap();
+        assert!((eff.penalty_score - 0.5).abs() < 0.001);
+
+        // Decay penalty
+        db.decay_penalty(id, 0.1).await.unwrap();
+
+        let eff = db.get_instruction_effectiveness(id).await.unwrap().unwrap();
+        assert!((eff.penalty_score - 0.4).abs() < 0.001);
+
+        // Reset penalty
+        db.reset_penalty(id).await.unwrap();
+
+        let eff = db.get_instruction_effectiveness(id).await.unwrap().unwrap();
+        assert!((eff.penalty_score).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_auto_disable_penalized() {
+        let db = setup_db().await;
+
+        // Create instructions with different penalty scores
+        let low_penalty = CustomInstruction::global("low-penalty", "Content");
+        let id1 = db.insert_instruction(&low_penalty).await.unwrap();
+        db.apply_penalty(id1, 0.3, "minor").await.unwrap();
+
+        let high_penalty = CustomInstruction::global("high-penalty", "Content");
+        let id2 = db.insert_instruction(&high_penalty).await.unwrap();
+        db.apply_penalty(id2, 0.8, "major").await.unwrap();
+
+        // Auto-disable with threshold 0.7
+        let disabled = db.auto_disable_penalized(0.7).await.unwrap();
+        assert_eq!(disabled.len(), 1);
+        assert!(disabled.contains(&id2));
+
+        // Verify states
+        let inst1 = db.get_instruction(id1).await.unwrap().unwrap();
+        assert!(inst1.enabled);
+
+        let inst2 = db.get_instruction(id2).await.unwrap().unwrap();
+        assert!(!inst2.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_learning_pattern_workflow() {
+        let db = setup_db().await;
+
+        // Create a pattern
+        let pattern = LearningPattern::new(
+            PatternType::ErrorPattern,
+            "error_12345678",
+            serde_json::json!({
+                "error_text": "Permission denied",
+                "category": "permission_error",
+            }),
+        ).with_agent_type(AgentType::StoryDeveloper);
+
+        db.upsert_learning_pattern(&pattern).await.unwrap();
+
+        // Check patterns
+        let patterns = db.list_patterns(None).await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].occurrence_count, 1);
+
+        // Upsert same pattern - should increment count
+        db.upsert_learning_pattern(&pattern).await.unwrap();
+
+        let patterns = db.list_patterns(None).await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].occurrence_count, 2);
+
+        // Get pattern by ID
+        let fetched = db.get_pattern(patterns[0].id).await.unwrap().unwrap();
+        assert_eq!(fetched.pattern_signature, "error_12345678");
+    }
+
+    #[tokio::test]
+    async fn test_pattern_approval_creates_instruction() {
+        let db = setup_db().await;
+
+        // Create a pattern
+        let pattern = LearningPattern::new(
+            PatternType::ErrorPattern,
+            "approve_test_123",
+            serde_json::json!({
+                "error_text": "Connection timeout",
+                "category": "timeout_error",
+            }),
+        );
+
+        db.upsert_learning_pattern(&pattern).await.unwrap();
+
+        let patterns = db.list_patterns(Some(PatternStatus::Observed)).await.unwrap();
+        let pattern_id = patterns[0].id;
+
+        // Generate instruction from pattern
+        let engine = LearningEngine::new();
+        let instruction = engine.generate_instruction_from_pattern(&patterns[0]).unwrap();
+
+        // Insert instruction and update pattern status
+        let instruction_id = db.insert_instruction(&instruction).await.unwrap();
+        db.update_pattern_status(pattern_id, PatternStatus::Approved, Some(instruction_id)).await.unwrap();
+
+        // Verify pattern is now approved
+        let pattern = db.get_pattern(pattern_id).await.unwrap().unwrap();
+        assert_eq!(pattern.status, PatternStatus::Approved);
+        assert_eq!(pattern.instruction_id, Some(instruction_id));
+
+        // Verify instruction was created
+        let inst = db.get_instruction(instruction_id).await.unwrap().unwrap();
+        assert!(inst.name.starts_with("learned_"));
+        assert_eq!(inst.source, InstructionSource::Learned);
+    }
+
+    #[tokio::test]
+    async fn test_process_patterns() {
+        let db = setup_db().await;
+
+        // Create multiple occurrences of same pattern (to meet threshold)
+        let pattern = LearningPattern::new(
+            PatternType::ErrorPattern,
+            "process_test_456",
+            serde_json::json!({
+                "error_text": "File not found",
+                "category": "not_found_error",
+            }),
+        );
+
+        // Insert pattern multiple times to meet min_occurrences
+        for _ in 0..5 {
+            db.upsert_learning_pattern(&pattern).await.unwrap();
+        }
+
+        // Process patterns with default config (min_occurrences = 3)
+        let engine = LearningEngine::new();
+        let created = engine.process_patterns(&db).await.unwrap();
+
+        assert_eq!(created.len(), 1);
+        assert!(created[0].name.starts_with("learned_"));
+
+        // Pattern should now be pending_review (confidence < auto_approve_threshold)
+        // because 5 occurrences gives confidence of 0.8 < 0.9
+        let patterns = db.list_patterns(Some(PatternStatus::PendingReview)).await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert!(patterns[0].instruction_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_ineffective_instructions() {
+        let db = setup_db().await;
+
+        // Create an agent first for usage tracking
+        let agent = Agent::new(AgentType::StoryDeveloper, "Test");
+        db.insert_agent(&agent).await.unwrap();
+
+        // Create a learned instruction with high penalty and low success
+        let instruction = CustomInstruction::learned(
+            "ineffective-learned",
+            "This instruction doesn't help",
+            0.5,
+        );
+        let id = db.insert_instruction(&instruction).await.unwrap();
+
+        // Simulate lots of usage with low success
+        // Need to record usage (increments usage_count) and outcomes
+        for _ in 0..15 {
+            db.record_instruction_usage(id, agent.id, None).await.unwrap();
+            db.record_instruction_outcome(id, false, None).await.unwrap();
+        }
+        db.record_instruction_usage(id, agent.id, None).await.unwrap();
+        db.record_instruction_outcome(id, true, None).await.unwrap();
+
+        // Apply high penalty
+        db.apply_penalty(id, 1.0, "high_failure_rate").await.unwrap();
+
+        // Verify metrics before deletion
+        let eff = db.get_instruction_effectiveness(id).await.unwrap().unwrap();
+        assert_eq!(eff.usage_count, 16);
+        assert_eq!(eff.success_count, 1);
+        assert_eq!(eff.failure_count, 15);
+        assert!(eff.penalty_score >= 1.0);
+
+        // Delete ineffective (penalty >= 1.0, usage >= 10, success < 30%, source = learned)
+        let deleted = db.delete_ineffective_instructions().await.unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted.contains(&"ineffective-learned".to_string()));
+
+        // Verify deleted
+        let inst = db.get_instruction(id).await.unwrap();
+        assert!(inst.is_none());
+    }
+}
