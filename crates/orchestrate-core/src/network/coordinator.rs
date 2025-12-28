@@ -528,6 +528,15 @@ impl NetworkCoordinator {
         Arc::clone(&self.skill_registry)
     }
 
+    /// Get dependency agent IDs for an agent
+    pub async fn get_dependency_ids(&self, agent_id: AgentId) -> Vec<AgentId> {
+        let agents = self.agents.read().await;
+        agents
+            .get(&agent_id)
+            .map(|a| a.dependencies.clone())
+            .unwrap_or_default()
+    }
+
     /// Get network statistics
     pub async fn stats(&self) -> NetworkStats {
         let agents = self.agents.read().await;

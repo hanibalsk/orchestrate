@@ -24,11 +24,13 @@ pub use state::{StateGraph, StateMachine, StatePropagation, StateTransition};
 pub use validation::{NetworkValidator, ValidationError, ValidationResult};
 
 use crate::AgentType;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
 /// Unique identifier for an agent in the network
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId(pub Uuid);
 
 impl AgentId {
@@ -167,4 +169,195 @@ pub trait DependencyVisibility {
 
     /// Get all agent types this can observe
     fn observable_types(agent_type: AgentType) -> Vec<AgentType>;
+}
+
+// ==================== Step Output Types ====================
+
+/// Type of output produced by a workflow step
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOutputType {
+    /// Direct skill execution result
+    SkillResult,
+    /// State change metadata
+    StateTransition,
+    /// File or resource created
+    Artifact,
+    /// Error information
+    Error,
+}
+
+impl StepOutputType {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StepOutputType::SkillResult => "skill_result",
+            StepOutputType::StateTransition => "state_transition",
+            StepOutputType::Artifact => "artifact",
+            StepOutputType::Error => "error",
+        }
+    }
+
+    /// Parse from string representation
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "skill_result" => Some(StepOutputType::SkillResult),
+            "state_transition" => Some(StepOutputType::StateTransition),
+            "artifact" => Some(StepOutputType::Artifact),
+            "error" => Some(StepOutputType::Error),
+            _ => None,
+        }
+    }
+}
+
+/// Output from a workflow step that can be consumed by dependent agents
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepOutput {
+    /// Unique output ID (from database)
+    pub id: i64,
+    /// Agent that produced this output
+    pub agent_id: AgentId,
+    /// Skill that produced this output
+    pub skill_name: String,
+    /// Type of output
+    pub output_type: StepOutputType,
+    /// Output data (JSON)
+    pub data: serde_json::Value,
+    /// Whether this output has been consumed
+    pub consumed: bool,
+    /// Agent that consumed this output (if any)
+    pub consumed_by: Option<AgentId>,
+    /// When the output was created
+    pub created_at: DateTime<Utc>,
+}
+
+impl StepOutput {
+    /// Create a new step output (without database ID)
+    pub fn new(
+        agent_id: AgentId,
+        skill_name: impl Into<String>,
+        output_type: StepOutputType,
+        data: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: 0, // Will be set by database
+            agent_id,
+            skill_name: skill_name.into(),
+            output_type,
+            data,
+            consumed: false,
+            consumed_by: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Create a skill result output
+    pub fn skill_result(
+        agent_id: AgentId,
+        skill_name: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self::new(agent_id, skill_name, StepOutputType::SkillResult, data)
+    }
+
+    /// Create an error output
+    pub fn error(
+        agent_id: AgentId,
+        skill_name: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            agent_id,
+            skill_name,
+            StepOutputType::Error,
+            serde_json::json!({ "error": error_message.into() }),
+        )
+    }
+
+    /// Create an artifact output
+    pub fn artifact(
+        agent_id: AgentId,
+        skill_name: impl Into<String>,
+        artifact_path: impl Into<String>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        Self::new(
+            agent_id,
+            skill_name,
+            StepOutputType::Artifact,
+            serde_json::json!({
+                "path": artifact_path.into(),
+                "metadata": metadata,
+            }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_step_output_creation() {
+        let agent_id = AgentId::new();
+
+        // Test skill result creation
+        let output = StepOutput::skill_result(
+            agent_id,
+            "develop",
+            serde_json::json!({"files_changed": 5, "tests_passed": true}),
+        );
+
+        assert_eq!(output.agent_id, agent_id);
+        assert_eq!(output.skill_name, "develop");
+        assert_eq!(output.output_type, StepOutputType::SkillResult);
+        assert!(!output.consumed);
+        assert!(output.consumed_by.is_none());
+    }
+
+    #[test]
+    fn test_step_output_error() {
+        let agent_id = AgentId::new();
+
+        let output = StepOutput::error(agent_id, "test", "Tests failed");
+
+        assert_eq!(output.output_type, StepOutputType::Error);
+        assert_eq!(output.data["error"], "Tests failed");
+    }
+
+    #[test]
+    fn test_step_output_artifact() {
+        let agent_id = AgentId::new();
+
+        let output = StepOutput::artifact(
+            agent_id,
+            "build",
+            "/path/to/artifact.zip",
+            serde_json::json!({"size": 1024}),
+        );
+
+        assert_eq!(output.output_type, StepOutputType::Artifact);
+        assert_eq!(output.data["path"], "/path/to/artifact.zip");
+    }
+
+    #[test]
+    fn test_step_output_type_conversion() {
+        assert_eq!(StepOutputType::SkillResult.as_str(), "skill_result");
+        assert_eq!(StepOutputType::from_str("skill_result"), Some(StepOutputType::SkillResult));
+        assert_eq!(StepOutputType::from_str("artifact"), Some(StepOutputType::Artifact));
+        assert_eq!(StepOutputType::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn test_agent_id_serialization() {
+        let agent_id = AgentId::new();
+
+        // Test serialization
+        let json = serde_json::to_string(&agent_id).unwrap();
+        assert!(json.contains(&agent_id.0.to_string()));
+
+        // Test deserialization
+        let deserialized: AgentId = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, agent_id);
+    }
 }

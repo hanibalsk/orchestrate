@@ -32,5 +32,5 @@ pub use network::{
     DependencySet, NetworkCoordinator, NetworkEvent, NetworkValidator,
     RecoveryAction, Skill, SkillDefinition, SkillRegistry, StateGraph,
     StateMachine, StatePropagation, StateRequirement, StateTransition,
-    ValidationError, ValidationResult,
+    StepOutput, StepOutputType, ValidationError, ValidationResult,
 };

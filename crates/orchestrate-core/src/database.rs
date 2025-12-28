@@ -6,6 +6,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{Agent, AgentState, AgentType, Epic, EpicStatus, Message, MessageRole, PrStatus, PullRequest, MergeStrategy, Result};
+use crate::network::{AgentId, StepOutput, StepOutputType};
 
 /// Database configuration
 pub struct DatabaseConfig {
@@ -85,6 +86,12 @@ impl Database {
     /// Run database migrations
     async fn run_migrations(&self) -> Result<()> {
         sqlx::query(include_str!("../../../migrations/001_initial.sql"))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(include_str!("../../../migrations/002_agent_network.sql"))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(include_str!("../../../migrations/003_step_outputs.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -359,6 +366,133 @@ impl Database {
 
         rows.into_iter().map(|r| r.try_into()).collect()
     }
+
+    // ==================== Step Output Operations ====================
+
+    /// Insert a step output
+    pub async fn insert_step_output(&self, output: &StepOutput) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO step_outputs (agent_id, skill_name, output_type, data, consumed, consumed_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(output.agent_id.0.to_string())
+        .bind(&output.skill_name)
+        .bind(output.output_type.as_str())
+        .bind(serde_json::to_string(&output.data)?)
+        .bind(output.consumed)
+        .bind(output.consumed_by.map(|id| id.0.to_string()))
+        .bind(output.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get step outputs for an agent
+    pub async fn get_step_outputs(&self, agent_id: Uuid) -> Result<Vec<StepOutput>> {
+        let rows = sqlx::query_as::<_, StepOutputRow>(
+            "SELECT * FROM step_outputs WHERE agent_id = ? ORDER BY created_at DESC",
+        )
+        .bind(agent_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get unconsumed step outputs from specific agents (dependencies)
+    pub async fn get_dependency_outputs(&self, dependency_agent_ids: &[Uuid]) -> Result<Vec<StepOutput>> {
+        if dependency_agent_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build placeholders for IN clause
+        let placeholders: Vec<String> = dependency_agent_ids.iter().map(|_| "?".to_string()).collect();
+        let query = format!(
+            "SELECT * FROM step_outputs WHERE agent_id IN ({}) AND consumed = 0 ORDER BY created_at ASC",
+            placeholders.join(", ")
+        );
+
+        let mut query_builder = sqlx::query_as::<_, StepOutputRow>(&query);
+        for id in dependency_agent_ids {
+            query_builder = query_builder.bind(id.to_string());
+        }
+
+        let rows = query_builder.fetch_all(&self.pool).await?;
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get the latest step output from an agent
+    pub async fn get_latest_step_output(&self, agent_id: Uuid) -> Result<Option<StepOutput>> {
+        let row = sqlx::query_as::<_, StepOutputRow>(
+            "SELECT * FROM step_outputs WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(agent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get step outputs by skill name
+    pub async fn get_step_outputs_by_skill(&self, agent_id: Uuid, skill_name: &str) -> Result<Vec<StepOutput>> {
+        let rows = sqlx::query_as::<_, StepOutputRow>(
+            "SELECT * FROM step_outputs WHERE agent_id = ? AND skill_name = ? ORDER BY created_at DESC",
+        )
+        .bind(agent_id.to_string())
+        .bind(skill_name)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Mark step outputs as consumed by an agent
+    pub async fn mark_outputs_consumed(&self, output_ids: &[i64], consumed_by: Uuid) -> Result<u64> {
+        if output_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders: Vec<String> = output_ids.iter().map(|_| "?".to_string()).collect();
+        let query = format!(
+            "UPDATE step_outputs SET consumed = 1, consumed_by = ?, consumed_at = ? WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut query_builder = sqlx::query(&query)
+            .bind(consumed_by.to_string())
+            .bind(chrono::Utc::now().to_rfc3339());
+
+        for id in output_ids {
+            query_builder = query_builder.bind(id);
+        }
+
+        let result = query_builder.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Get unconsumed step output count for an agent's dependencies
+    pub async fn count_unconsumed_outputs(&self, dependency_agent_ids: &[Uuid]) -> Result<i64> {
+        if dependency_agent_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders: Vec<String> = dependency_agent_ids.iter().map(|_| "?".to_string()).collect();
+        let query = format!(
+            "SELECT COUNT(*) as count FROM step_outputs WHERE agent_id IN ({}) AND consumed = 0",
+            placeholders.join(", ")
+        );
+
+        let mut query_builder = sqlx::query_scalar::<_, i64>(&query);
+        for id in dependency_agent_ids {
+            query_builder = query_builder.bind(id.to_string());
+        }
+
+        let count = query_builder.fetch_one(&self.pool).await?;
+        Ok(count)
+    }
 }
 
 // ==================== Row Types for SQLx ====================
@@ -505,6 +639,51 @@ impl TryFrom<EpicRow> for Epic {
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
             updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
             completed_at: row.completed_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StepOutputRow {
+    id: i64,
+    agent_id: String,
+    skill_name: String,
+    output_type: String,
+    data: String,
+    consumed: bool,
+    consumed_by: Option<String>,
+    #[allow(dead_code)]
+    consumed_at: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<StepOutputRow> for StepOutput {
+    type Error = crate::Error;
+
+    fn try_from(row: StepOutputRow) -> Result<Self> {
+        let agent_uuid = Uuid::parse_str(&row.agent_id)
+            .map_err(|e| crate::Error::Other(e.to_string()))?;
+
+        let consumed_by = row.consumed_by
+            .map(|s| Uuid::parse_str(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(AgentId::from_uuid);
+
+        let output_type = StepOutputType::from_str(&row.output_type)
+            .ok_or_else(|| crate::Error::Other(format!("Unknown output type: {}", row.output_type)))?;
+
+        Ok(StepOutput {
+            id: row.id,
+            agent_id: AgentId::from_uuid(agent_uuid),
+            skill_name: row.skill_name,
+            output_type,
+            data: serde_json::from_str(&row.data)?,
+            consumed: row.consumed,
+            consumed_by,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
         })
     }
 }
