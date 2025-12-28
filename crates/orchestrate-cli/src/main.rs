@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_core::{
     Agent, AgentType, CustomInstruction, Database,
-    LearningEngine, PatternStatus, ShellState, QueueEntry,
+    LearningEngine, PatternStatus, ShellState,
 };
 use std::path::PathBuf;
 use tracing::Level;
@@ -117,6 +117,11 @@ enum Commands {
     Learn {
         #[command(subcommand)]
         action: LearnAction,
+    },
+    /// Review agent history and past actions
+    History {
+        #[command(subcommand)]
+        action: HistoryAction,
     },
 }
 
@@ -322,6 +327,58 @@ enum LearnAction {
     ResetPenalty {
         /// Instruction ID or name
         id_or_name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HistoryAction {
+    /// List agents with pagination and filters
+    Agents {
+        /// Filter by state (running, paused, completed, terminated)
+        #[arg(short, long)]
+        state: Option<String>,
+        /// Filter by agent type
+        #[arg(short = 't', long)]
+        agent_type: Option<String>,
+        /// Number of results to show
+        #[arg(short, long, default_value = "20")]
+        limit: i64,
+        /// Offset for pagination
+        #[arg(short, long, default_value = "0")]
+        offset: i64,
+    },
+    /// Show messages for an agent
+    Messages {
+        /// Agent ID
+        agent_id: String,
+        /// Number of messages to show
+        #[arg(short, long, default_value = "50")]
+        limit: i64,
+        /// Offset for pagination
+        #[arg(short, long, default_value = "0")]
+        offset: i64,
+        /// Show full message content
+        #[arg(long)]
+        full: bool,
+    },
+    /// Show agent statistics
+    Stats {
+        /// Agent ID
+        agent_id: String,
+    },
+    /// Show tool errors for an agent
+    Errors {
+        /// Agent ID
+        agent_id: String,
+        /// Number of errors to show
+        #[arg(short, long, default_value = "20")]
+        limit: i64,
+    },
+    /// Show a summary of recent agent activity
+    Summary {
+        /// Number of recent agents to analyze
+        #[arg(short, long, default_value = "10")]
+        limit: i64,
     },
 }
 
@@ -916,6 +973,196 @@ async fn main() -> Result<()> {
                 println!("Reset penalty for instruction: {} (ID: {})", instruction.name, instruction.id);
             }
         },
+
+        Commands::History { action } => match action {
+            HistoryAction::Agents { state, agent_type, limit, offset } => {
+                let state_filter = state.as_ref().map(|s| parse_agent_state(s)).transpose()?;
+                let type_filter = agent_type.as_ref().map(|t| parse_agent_type(t)).transpose()?;
+
+                let agents = db.list_agents_paginated(limit, offset, state_filter, type_filter).await?;
+                let total = db.count_agents().await?;
+
+                if agents.is_empty() {
+                    println!("No agents found");
+                    return Ok(());
+                }
+
+                println!("Showing {} of {} agents (offset {})", agents.len(), total, offset);
+                println!();
+                println!("{:<36} {:<18} {:<12} {:<20}", "ID", "TYPE", "STATE", "CREATED");
+                println!("{}", "-".repeat(90));
+                for agent in agents {
+                    println!(
+                        "{:<36} {:<18} {:<12} {:<20}",
+                        agent.id,
+                        agent.agent_type.as_str(),
+                        format!("{:?}", agent.state),
+                        agent.created_at.format("%Y-%m-%d %H:%M:%S")
+                    );
+                }
+                println!();
+                if offset + limit < total {
+                    println!("Use --offset {} to see more", offset + limit);
+                }
+            }
+            HistoryAction::Messages { agent_id, limit, offset, full } => {
+                let uuid = uuid::Uuid::parse_str(&agent_id)?;
+                let messages = db.get_messages_paginated(uuid, limit, offset).await?;
+                let total = db.count_messages(uuid).await?;
+
+                if messages.is_empty() {
+                    println!("No messages found for agent {}", agent_id);
+                    return Ok(());
+                }
+
+                // Get agent info
+                if let Some(agent) = db.get_agent(uuid).await? {
+                    println!("Agent: {} ({:?})", agent.id, agent.agent_type);
+                    println!("Task: {}", &agent.task[..agent.task.len().min(80)]);
+                    println!();
+                }
+
+                println!("Showing {} of {} messages (offset {})", messages.len(), total, offset);
+                println!();
+
+                for (i, msg) in messages.iter().enumerate() {
+                    let role = match msg.role {
+                        orchestrate_core::MessageRole::User => "USER",
+                        orchestrate_core::MessageRole::Assistant => "ASST",
+                        orchestrate_core::MessageRole::System => "SYS",
+                        orchestrate_core::MessageRole::Tool => "TOOL",
+                    };
+
+                    let content = if full {
+                        msg.content.clone()
+                    } else {
+                        // Truncate content for display
+                        let first_line = msg.content.lines().next().unwrap_or(&msg.content);
+                        if first_line.len() > 100 {
+                            format!("{}...", &first_line[..97])
+                        } else if msg.content.lines().count() > 1 {
+                            format!("{}...", first_line)
+                        } else {
+                            first_line.to_string()
+                        }
+                    };
+
+                    let tokens = if msg.input_tokens > 0 || msg.output_tokens > 0 {
+                        format!(" [in:{} out:{}]", msg.input_tokens, msg.output_tokens)
+                    } else {
+                        String::new()
+                    };
+
+                    println!("[{}] {:4}{}", role, i + offset as usize + 1, tokens);
+                    if full {
+                        println!("{}", content);
+                        println!("{}", "-".repeat(60));
+                    } else {
+                        println!("  {}", content);
+                    }
+                }
+
+                println!();
+                if offset + limit < total {
+                    println!("Use --offset {} to see more", offset + limit);
+                }
+            }
+            HistoryAction::Stats { agent_id } => {
+                let uuid = uuid::Uuid::parse_str(&agent_id)?;
+
+                // Get agent info
+                if let Some(agent) = db.get_agent(uuid).await? {
+                    println!("Agent Statistics");
+                    println!("{}", "=".repeat(50));
+                    println!("ID: {}", agent.id);
+                    println!("Type: {:?}", agent.agent_type);
+                    println!("State: {:?}", agent.state);
+                    println!("Task: {}", agent.task);
+                    println!("Worktree: {}", agent.worktree_id.as_deref().unwrap_or("(none)"));
+                    println!("Created: {}", agent.created_at);
+                    println!("Updated: {}", agent.updated_at);
+                    println!();
+
+                    let stats = db.get_agent_stats(uuid).await?;
+                    println!("Message Statistics");
+                    println!("{}", "-".repeat(50));
+                    println!("Total messages: {}", stats.message_count);
+                    println!("Input tokens: {}", stats.total_input_tokens);
+                    println!("Output tokens: {}", stats.total_output_tokens);
+                    println!("Total tokens: {}", stats.total_tokens);
+                    println!("Tool calls: {}", stats.tool_call_count);
+                    println!("Errors: {}", stats.error_count);
+                    if let Some(ref first) = stats.first_message_at {
+                        println!("First message: {}", first);
+                    }
+                    if let Some(ref last) = stats.last_message_at {
+                        println!("Last message: {}", last);
+                    }
+                } else {
+                    println!("Agent not found: {}", agent_id);
+                }
+            }
+            HistoryAction::Errors { agent_id, limit } => {
+                let uuid = uuid::Uuid::parse_str(&agent_id)?;
+                let errors = db.get_tool_errors(uuid, limit).await?;
+
+                if errors.is_empty() {
+                    println!("No errors found for agent {}", agent_id);
+                    return Ok(());
+                }
+
+                println!("Tool Errors for Agent {}", agent_id);
+                println!("{}", "=".repeat(60));
+
+                for (i, msg) in errors.iter().enumerate() {
+                    println!("[{}] {}", i + 1, msg.created_at.format("%Y-%m-%d %H:%M:%S"));
+                    // Extract error message from content
+                    let content = if msg.content.len() > 200 {
+                        format!("{}...", &msg.content[..197])
+                    } else {
+                        msg.content.clone()
+                    };
+                    println!("{}", content);
+                    println!("{}", "-".repeat(60));
+                }
+            }
+            HistoryAction::Summary { limit } => {
+                let agents = db.list_agents_paginated(limit, 0, None, None).await?;
+
+                if agents.is_empty() {
+                    println!("No agents found");
+                    return Ok(());
+                }
+
+                println!("╔══════════════════════════════════════════════════════════════════════════════╗");
+                println!("║                         AGENT ACTIVITY SUMMARY                               ║");
+                println!("╠══════════════════════════════════════════════════════════════════════════════╣");
+
+                for agent in agents {
+                    let stats = db.get_agent_stats(agent.id).await?;
+                    let type_str = format!("{:?}", agent.agent_type);
+                    let state_str = format!("{:?}", agent.state);
+
+                    println!("║ {} ║", agent.id);
+                    println!("║   Type: {:<15} State: {:<12} Msgs: {:<6} Tokens: {:<10} ║",
+                        &type_str[..type_str.len().min(15)],
+                        &state_str[..state_str.len().min(12)],
+                        stats.message_count,
+                        stats.total_tokens
+                    );
+                    println!("║   Task: {:<68} ║",
+                        if agent.task.len() > 68 {
+                            format!("{}...", &agent.task[..65])
+                        } else {
+                            agent.task.clone()
+                        }
+                    );
+                    println!("╟──────────────────────────────────────────────────────────────────────────────╢");
+                }
+
+                println!("╚══════════════════════════════════════════════════════════════════════════════╝");
+            }
+        },
     }
 
     Ok(())
@@ -949,5 +1196,21 @@ fn parse_agent_type(s: &str) -> Result<AgentType> {
         "pr-controller" | "prcontroller" => Ok(AgentType::PrController),
         "conflict-resolver" | "conflictresolver" => Ok(AgentType::ConflictResolver),
         _ => anyhow::bail!("Unknown agent type: {}", s),
+    }
+}
+
+fn parse_agent_state(s: &str) -> Result<orchestrate_core::AgentState> {
+    use orchestrate_core::AgentState;
+    match s.to_lowercase().as_str() {
+        "created" => Ok(AgentState::Created),
+        "initializing" => Ok(AgentState::Initializing),
+        "running" => Ok(AgentState::Running),
+        "waiting-for-input" | "waitingforinput" => Ok(AgentState::WaitingForInput),
+        "waiting-for-external" | "waitingforexternal" => Ok(AgentState::WaitingForExternal),
+        "paused" => Ok(AgentState::Paused),
+        "completed" => Ok(AgentState::Completed),
+        "failed" => Ok(AgentState::Failed),
+        "terminated" => Ok(AgentState::Terminated),
+        _ => anyhow::bail!("Unknown agent state: {}. Valid: created, initializing, running, paused, completed, failed, terminated", s),
     }
 }

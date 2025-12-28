@@ -1,14 +1,21 @@
 //! Agent loop runner
+//!
+//! Features:
+//! - Token optimization with message windowing
+//! - Prompt caching for reduced costs
+//! - Session management for continuity
+//! - Dynamic output token allocation
 
 use anyhow::Result;
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CustomInstruction, Database, LearningEngine, Message,
+    Agent, AgentState, AgentType, CustomInstruction, Database, LearningEngine, Message, Session,
 };
 use std::path::Path;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::client::{ClaudeClient, ContentBlock, CreateMessageRequest, MessageContent};
+use crate::token::{ContextManager, TokenConfig, TokenEstimator};
 use crate::tools::ToolExecutor;
 
 /// Configuration for the agent loop
@@ -23,6 +30,10 @@ pub struct LoopConfig {
     pub max_idle_turns: u32,
     /// Max consecutive errors before aborting
     pub max_consecutive_errors: u32,
+    /// Enable token optimization (windowing, caching)
+    pub enable_token_optimization: bool,
+    /// Enable session tracking
+    pub enable_sessions: bool,
 }
 
 impl Default for LoopConfig {
@@ -34,6 +45,8 @@ impl Default for LoopConfig {
             enable_learning: true,
             max_idle_turns: 5,
             max_consecutive_errors: 3,
+            enable_token_optimization: true,
+            enable_sessions: true,
         }
     }
 }
@@ -45,15 +58,20 @@ pub struct AgentLoop {
     tool_executor: ToolExecutor,
     config: LoopConfig,
     learning_engine: LearningEngine,
+    context_manager: ContextManager,
+    token_estimator: TokenEstimator,
 }
 
 impl AgentLoop {
     /// Create a new agent loop
     pub fn new(client: ClaudeClient, db: Database, config: LoopConfig) -> Self {
+        let context_manager = ContextManager::for_model(&config.model);
         Self {
             client,
             db,
             tool_executor: ToolExecutor::new(),
+            context_manager,
+            token_estimator: TokenEstimator::new(),
             config,
             learning_engine: LearningEngine::new(),
         }
@@ -66,10 +84,13 @@ impl AgentLoop {
         config: LoopConfig,
         learning_engine: LearningEngine,
     ) -> Self {
+        let context_manager = ContextManager::for_model(&config.model);
         Self {
             client,
             db,
             tool_executor: ToolExecutor::new(),
+            context_manager,
+            token_estimator: TokenEstimator::new(),
             config,
             learning_engine,
         }
@@ -127,6 +148,24 @@ impl AgentLoop {
         let mut idle_turns = 0;  // Turns without tool calls or status signal
         let mut consecutive_errors = 0;  // Consecutive API or tool errors
         let mut last_tool_error: Option<String> = None;  // Track repeated errors
+        let mut total_input_tokens = 0i32;
+        let mut total_output_tokens = 0i32;
+        let mut total_cache_read_tokens = 0i32;
+        let mut total_cache_write_tokens = 0i32;
+
+        // Create or get session for this agent
+        let session_id = if self.config.enable_sessions {
+            let session = Session::new(agent.id);
+            if let Err(e) = self.db.create_session(&session).await {
+                warn!("Failed to create session: {}", e);
+            }
+            // Update agent with session ID
+            agent.session_id = Some(session.id.clone());
+            self.db.update_agent(agent).await?;
+            Some(session.id)
+        } else {
+            agent.session_id.clone()
+        };
 
         info!(
             "[AGENT {}] Starting loop | Type: {:?} | Max turns: {} | Task: {}",
@@ -196,17 +235,58 @@ impl AgentLoop {
                 break;
             }
 
-            // Convert messages to API format
-            let api_messages = self.messages_to_api(&messages);
+            // Apply message windowing if enabled
+            let (api_messages, windowed_info) = if self.config.enable_token_optimization {
+                let windowed = self.context_manager.window_messages(&messages);
+                let mut msgs = Vec::new();
 
-            // Create request with custom instructions
-            let system_prompt = self.get_system_prompt_with_instructions(agent, &instructions);
-            let request = CreateMessageRequest {
-                model: self.config.model.clone(),
-                max_tokens: 4096,
-                messages: api_messages,
-                system: Some(system_prompt),
-                tools: Some(self.tool_executor.get_tool_definitions(&agent.agent_type)),
+                // Add summary as first user message if present
+                if let Some(ref summary) = windowed.summary {
+                    msgs.push(MessageContent {
+                        role: "user".to_string(),
+                        content: serde_json::json!(summary),
+                    });
+                }
+
+                // Add windowed messages
+                msgs.extend(self.messages_to_api(&windowed.messages));
+
+                debug!(
+                    "[AGENT {}] Windowed messages: {} -> {} (summarized: {})",
+                    agent.id, windowed.original_count, windowed.messages.len(), windowed.summarized_count
+                );
+
+                (msgs, Some(windowed))
+            } else {
+                (self.messages_to_api(&messages), None)
+            };
+
+            // Calculate dynamic max_tokens based on context usage
+            let estimated_context = self.token_estimator.estimate_messages(&messages);
+            let max_tokens = if self.config.enable_token_optimization {
+                self.context_manager.calculate_output_tokens(estimated_context) as u32
+            } else {
+                4096
+            };
+
+            // Create request with prompt caching
+            let (base_prompt, dynamic_suffix) = self.get_system_prompt_parts(agent, &instructions);
+            let tools = self.tool_executor.get_tool_definitions(&agent.agent_type);
+
+            // Build request - use caching if client supports it
+            let request = if self.client.caching_enabled() && self.config.enable_token_optimization {
+                CreateMessageRequest::new(self.config.model.clone(), max_tokens, api_messages)
+                    .with_cached_system(&base_prompt, Some(&dynamic_suffix))
+                    .with_tools(tools)
+            } else {
+                let full_prompt = if dynamic_suffix.is_empty() {
+                    base_prompt
+                } else {
+                    format!("{}\n\n{}", base_prompt, dynamic_suffix)
+                };
+                CreateMessageRequest::new(self.config.model.clone(), max_tokens, api_messages)
+                    .with_system(full_prompt)
+                    .with_tools(tools)
             };
 
             // Call Claude API with error handling
@@ -225,6 +305,58 @@ impl AgentLoop {
                     continue;  // Retry
                 }
             };
+
+            // Track token usage
+            total_input_tokens += response.usage.input_tokens;
+            total_output_tokens += response.usage.output_tokens;
+            total_cache_read_tokens += response.usage.cache_read_input_tokens;
+            total_cache_write_tokens += response.usage.cache_creation_input_tokens;
+
+            // Log cache efficiency
+            if response.usage.cache_read_input_tokens > 0 || response.usage.cache_creation_input_tokens > 0 {
+                debug!(
+                    "[AGENT {}] Cache stats: read={} write={} hit_rate={:.1}%",
+                    agent.id,
+                    response.usage.cache_read_input_tokens,
+                    response.usage.cache_creation_input_tokens,
+                    response.usage.cache_hit_rate()
+                );
+            }
+
+            // Record token stats for this turn
+            if let Some(ref sid) = session_id {
+                let (msgs_included, msgs_summarized) = if let Some(ref w) = windowed_info {
+                    (w.messages.len() as i32, w.summarized_count as i32)
+                } else {
+                    (messages.len() as i32, 0)
+                };
+
+                if let Err(e) = self.db.record_session_tokens(
+                    sid,
+                    agent.id,
+                    turn as i32,
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    response.usage.cache_read_input_tokens,
+                    response.usage.cache_creation_input_tokens,
+                    estimated_context as i32,
+                    msgs_included,
+                    msgs_summarized,
+                ).await {
+                    warn!("Failed to record session tokens: {}", e);
+                }
+            }
+
+            // Update daily token usage
+            if let Err(e) = self.db.update_daily_token_usage(
+                &self.config.model,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                response.usage.cache_read_input_tokens,
+                response.usage.cache_creation_input_tokens,
+            ).await {
+                warn!("Failed to update daily token usage: {}", e);
+            }
 
             // Extract text and tool calls
             let mut text_content = String::new();
@@ -359,10 +491,31 @@ impl AgentLoop {
         }
 
         let total_elapsed = start_time.elapsed();
+
+        // Calculate cache savings
+        let cache_hit_rate = if total_input_tokens > 0 {
+            (total_cache_read_tokens as f64 / total_input_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+
         info!(
-            "[AGENT {}] Loop finished | State: {:?} | Turns: {} | Time: {:?}",
-            agent.id, agent.state, turn, total_elapsed
+            "[AGENT {}] Loop finished | State: {:?} | Turns: {} | Time: {:?} | Tokens: in={} out={} cache_hit={:.1}%",
+            agent.id, agent.state, turn, total_elapsed,
+            total_input_tokens, total_output_tokens, cache_hit_rate
         );
+
+        // Close session
+        if let Some(ref sid) = session_id {
+            if let Err(e) = self.db.close_session(sid).await {
+                warn!("Failed to close session: {}", e);
+            }
+
+            // Update session total tokens
+            if let Err(e) = self.db.update_session_tokens(sid, (total_input_tokens + total_output_tokens) as i64).await {
+                warn!("Failed to update session tokens: {}", e);
+            }
+        }
 
         // Record instruction outcomes and apply learning
         let success = agent.state == AgentState::Completed;
@@ -373,6 +526,17 @@ impl AgentLoop {
             for &id in &instruction_ids {
                 if let Err(e) = self.db.record_instruction_outcome(id, success, Some(completion_time)).await {
                     warn!("Failed to record instruction outcome: {}", e);
+                }
+
+                // Track tokens per instruction
+                if let Err(e) = self.db.update_instruction_tokens(
+                    id,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_read_tokens,
+                    total_cache_write_tokens,
+                ).await {
+                    warn!("Failed to update instruction tokens: {}", e);
                 }
             }
 
@@ -443,46 +607,74 @@ impl AgentLoop {
     }
 
     fn get_system_prompt(&self, agent: &Agent) -> String {
+        let (base, suffix) = self.get_system_prompt_parts(agent, &[]);
+        if suffix.is_empty() {
+            base
+        } else {
+            format!("{}\n\n{}", base, suffix)
+        }
+    }
+
+    /// Get system prompt split into cacheable base and dynamic suffix
+    ///
+    /// The base prompt (agent identity, tools, status signals) is static and cacheable.
+    /// The suffix (current task, custom instructions) changes per run.
+    fn get_system_prompt_parts(&self, agent: &Agent, instructions: &[CustomInstruction]) -> (String, String) {
         // Try to load agent prompt from .claude/agents/ file
         let agent_prompt = self.load_agent_prompt(&agent.agent_type);
 
-        if let Some(custom_prompt) = agent_prompt {
+        // Base prompt - static, cacheable
+        let base_prompt = if let Some(ref custom_prompt) = agent_prompt {
             format!(
                 r#"{}
-
-## Current Task
-
-{}
 
 ## Status Signals
 
 When you complete your task, respond with "STATUS: COMPLETE" in your message.
 If you need to wait for an external event (like PR review or CI), respond with "STATUS: WAITING".
-If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <reason>".
-"#,
-                custom_prompt,
-                agent.task
+If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <reason>"."#,
+                custom_prompt
             )
         } else {
-            // Fallback to default prompt
             format!(
-                r#"You are an autonomous agent working on the following task:
-
-{}
-
-Your agent type is: {:?}
+                r#"You are an autonomous agent of type: {:?}
 
 You have access to these tools: {:?}
 
+## Status Signals
+
 When you complete your task, respond with "STATUS: COMPLETE" in your message.
 If you need to wait for an external event (like PR review or CI), respond with "STATUS: WAITING".
-If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <reason>".
-"#,
-                agent.task,
+If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <reason>"."#,
                 agent.agent_type,
                 agent.agent_type.allowed_tools()
             )
+        };
+
+        // Dynamic suffix - changes per run
+        let mut suffix_parts = Vec::new();
+
+        // Add current task
+        suffix_parts.push(format!("## Current Task\n\n{}", agent.task));
+
+        // Add custom instructions if any
+        if !instructions.is_empty() {
+            let mut sorted_instructions: Vec<_> = instructions.iter().collect();
+            sorted_instructions.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+            let instructions_block = sorted_instructions
+                .iter()
+                .map(|i| format!("- {}", i.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            suffix_parts.push(format!(
+                "## Custom Instructions\n\nThe following instructions have been learned from previous agent runs. Please follow them carefully:\n\n{}",
+                instructions_block
+            ));
         }
+
+        (base_prompt, suffix_parts.join("\n\n"))
     }
 
     /// Load agent prompt from .claude/agents/<type>.md file
@@ -539,41 +731,6 @@ If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <re
 
         // No frontmatter, return full content
         content.trim().to_string()
-    }
-
-    fn get_system_prompt_with_instructions(
-        &self,
-        agent: &Agent,
-        instructions: &[CustomInstruction],
-    ) -> String {
-        let base_prompt = self.get_system_prompt(agent);
-
-        if instructions.is_empty() {
-            return base_prompt;
-        }
-
-        // Sort instructions by priority (higher first)
-        let mut sorted_instructions: Vec<_> = instructions.iter().collect();
-        sorted_instructions.sort_by(|a, b| b.priority.cmp(&a.priority));
-
-        let instructions_block = sorted_instructions
-            .iter()
-            .map(|i| format!("- {}", i.content))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            r#"{}
-
-## Custom Instructions
-
-The following instructions have been learned from previous agent runs. Please follow them carefully:
-
-{}
-"#,
-            base_prompt,
-            instructions_block
-        )
     }
 
     fn is_completion_signal(&self, text: &str) -> bool {

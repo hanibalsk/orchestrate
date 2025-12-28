@@ -104,6 +104,11 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/004_custom_instructions.sql"))
             .execute(&self.pool)
             .await?;
+        // Token tracking migration - uses ALTER TABLE which may fail if columns exist
+        // This is safe because SQLite ALTER TABLE ADD COLUMN is idempotent for this use case
+        let _ = sqlx::query(include_str!("../../../migrations/005_token_tracking.sql"))
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -258,6 +263,230 @@ impl Database {
         .await?;
 
         rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get messages for an agent with pagination
+    pub async fn get_messages_paginated(
+        &self,
+        agent_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Message>> {
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT * FROM agent_messages WHERE agent_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
+        )
+        .bind(agent_id.to_string())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Count messages for an agent
+    pub async fn count_messages(&self, agent_id: Uuid) -> Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_messages WHERE agent_id = ?",
+        )
+        .bind(agent_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(result)
+    }
+
+    /// Get agent message statistics (token usage, tool calls)
+    pub async fn get_agent_stats(&self, agent_id: Uuid) -> Result<AgentStats> {
+        let row = sqlx::query_as::<_, AgentStatsRow>(
+            r#"
+            SELECT
+                COUNT(*) as message_count,
+                SUM(input_tokens) as total_input_tokens,
+                SUM(output_tokens) as total_output_tokens,
+                COUNT(CASE WHEN tool_calls IS NOT NULL AND tool_calls != '[]' THEN 1 END) as tool_call_count,
+                COUNT(CASE WHEN tool_results LIKE '%"is_error":true%' THEN 1 END) as error_count,
+                MIN(created_at) as first_message_at,
+                MAX(created_at) as last_message_at
+            FROM agent_messages
+            WHERE agent_id = ?
+            "#,
+        )
+        .bind(agent_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// List agents with pagination and optional filters
+    pub async fn list_agents_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+        state_filter: Option<AgentState>,
+        agent_type_filter: Option<AgentType>,
+    ) -> Result<Vec<Agent>> {
+        let mut query = String::from("SELECT * FROM agents WHERE 1=1");
+
+        if state_filter.is_some() {
+            query.push_str(" AND state = ?");
+        }
+        if agent_type_filter.is_some() {
+            query.push_str(" AND agent_type = ?");
+        }
+        query.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+
+        let mut q = sqlx::query_as::<_, AgentRow>(&query);
+
+        if let Some(state) = state_filter {
+            q = q.bind(state.as_str());
+        }
+        if let Some(agent_type) = agent_type_filter {
+            q = q.bind(agent_type.as_str());
+        }
+        q = q.bind(limit).bind(offset);
+
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Count total agents
+    pub async fn count_agents(&self) -> Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agents",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(result)
+    }
+
+    /// Get recent tool errors for an agent
+    pub async fn get_tool_errors(&self, agent_id: Uuid, limit: i64) -> Result<Vec<Message>> {
+        let rows = sqlx::query_as::<_, MessageRow>(
+            r#"
+            SELECT * FROM agent_messages
+            WHERE agent_id = ?
+            AND tool_results LIKE '%"is_error":true%'
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(agent_id.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // ==================== Session Operations ====================
+
+    /// Create a new session for an agent
+    pub async fn create_session(&self, session: &crate::Session) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (id, agent_id, parent_id, api_session_id, total_tokens, is_forked, forked_at, created_at, closed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&session.id)
+        .bind(session.agent_id.to_string())
+        .bind(&session.parent_id)
+        .bind(&session.api_session_id)
+        .bind(session.total_tokens)
+        .bind(session.is_forked)
+        .bind(session.forked_at.map(|dt| dt.to_rfc3339()))
+        .bind(session.created_at.to_rfc3339())
+        .bind(session.closed_at.map(|dt| dt.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get session by ID
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<crate::Session>> {
+        let row = sqlx::query_as::<_, SessionRow>(
+            "SELECT * FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get open session for an agent
+    pub async fn get_open_session_for_agent(&self, agent_id: Uuid) -> Result<Option<crate::Session>> {
+        let row = sqlx::query_as::<_, SessionRow>(
+            r#"
+            SELECT * FROM sessions
+            WHERE agent_id = ? AND closed_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(agent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update session tokens
+    pub async fn update_session_tokens(&self, session_id: &str, total_tokens: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE sessions SET total_tokens = ? WHERE id = ?",
+        )
+        .bind(total_tokens)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Set API session ID for a session
+    pub async fn set_api_session_id(&self, session_id: &str, api_session_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE sessions SET api_session_id = ? WHERE id = ?",
+        )
+        .bind(api_session_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Close a session
+    pub async fn close_session(&self, session_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE sessions SET closed_at = ? WHERE id = ?",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get session stats (total tokens used)
+    pub async fn get_session_token_total(&self, agent_id: Uuid) -> Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COALESCE(SUM(total_tokens), 0) FROM sessions
+            WHERE agent_id = ?
+            "#,
+        )
+        .bind(agent_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(result)
     }
 
     // ==================== PR Operations ====================
@@ -1074,6 +1303,283 @@ impl Database {
 
         Ok(())
     }
+
+    // ==================== Token Tracking Operations ====================
+
+    /// Record token usage for a session turn
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn record_session_tokens(
+        &self,
+        session_id: &str,
+        agent_id: Uuid,
+        turn_number: i32,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_tokens: i32,
+        cache_write_tokens: i32,
+        context_window_used: i32,
+        messages_included: i32,
+        messages_summarized: i32,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO session_token_stats (
+                session_id, agent_id, turn_number,
+                input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens,
+                context_window_used, messages_included, messages_summarized
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(session_id)
+        .bind(agent_id.to_string())
+        .bind(turn_number)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_write_tokens)
+        .bind(context_window_used)
+        .bind(messages_included)
+        .bind(messages_summarized)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update daily token usage aggregation
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_daily_token_usage(
+        &self,
+        model: &str,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_tokens: i32,
+        cache_write_tokens: i32,
+    ) -> Result<()> {
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Try to update existing row first
+        let result = sqlx::query(
+            r#"
+            UPDATE daily_token_usage SET
+                total_input_tokens = total_input_tokens + ?,
+                total_output_tokens = total_output_tokens + ?,
+                total_cache_read_tokens = total_cache_read_tokens + ?,
+                total_cache_write_tokens = total_cache_write_tokens + ?,
+                request_count = request_count + 1,
+                updated_at = ?
+            WHERE date = ? AND model = ?
+            "#,
+        )
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_write_tokens)
+        .bind(&now)
+        .bind(&date)
+        .bind(model)
+        .execute(&self.pool)
+        .await?;
+
+        // If no row was updated, insert a new one
+        if result.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO daily_token_usage (
+                    date, model,
+                    total_input_tokens, total_output_tokens,
+                    total_cache_read_tokens, total_cache_write_tokens,
+                    request_count, agent_count
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, 1)
+                "#,
+            )
+            .bind(&date)
+            .bind(model)
+            .bind(input_tokens)
+            .bind(output_tokens)
+            .bind(cache_read_tokens)
+            .bind(cache_write_tokens)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Update instruction effectiveness with token data
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_instruction_tokens(
+        &self,
+        instruction_id: i64,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_tokens: i32,
+        cache_write_tokens: i32,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE instruction_effectiveness SET
+                total_input_tokens = COALESCE(total_input_tokens, 0) + ?,
+                total_output_tokens = COALESCE(total_output_tokens, 0) + ?,
+                total_cache_read_tokens = COALESCE(total_cache_read_tokens, 0) + ?,
+                total_cache_write_tokens = COALESCE(total_cache_write_tokens, 0) + ?,
+                avg_tokens_per_run = (
+                    COALESCE(total_input_tokens, 0) + ? + COALESCE(total_output_tokens, 0) + ?
+                ) / CAST(COALESCE(usage_count, 1) AS REAL),
+                updated_at = ?
+            WHERE instruction_id = ?
+            "#,
+        )
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_write_tokens)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(instruction_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get token usage stats for an agent's session
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_session_token_stats(&self, session_id: &str) -> Result<TokenStats> {
+        let row = sqlx::query_as::<_, TokenStatsRow>(
+            r#"
+            SELECT
+                COUNT(*) as turn_count,
+                COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens,
+                COALESCE(SUM(cache_write_tokens), 0) as total_cache_write_tokens,
+                COALESCE(AVG(context_window_used), 0) as avg_context_used,
+                COALESCE(AVG(messages_included), 0) as avg_messages_included,
+                COALESCE(SUM(messages_summarized), 0) as total_messages_summarized
+            FROM session_token_stats
+            WHERE session_id = ?
+            "#,
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Get daily token usage for cost analysis
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_daily_token_usage(&self, days: i32) -> Result<Vec<DailyTokenUsage>> {
+        let rows = sqlx::query_as::<_, DailyTokenUsageRow>(
+            r#"
+            SELECT * FROM daily_token_usage
+            WHERE date >= date('now', '-' || ? || ' days')
+            ORDER BY date DESC, model
+            "#,
+        )
+        .bind(days)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+/// Token usage statistics
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TokenStats {
+    pub turn_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub total_cache_write_tokens: i64,
+    pub avg_context_used: f64,
+    pub avg_messages_included: f64,
+    pub total_messages_summarized: i64,
+    pub cache_hit_rate: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct TokenStatsRow {
+    turn_count: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_tokens: i64,
+    total_cache_write_tokens: i64,
+    avg_context_used: f64,
+    avg_messages_included: f64,
+    total_messages_summarized: i64,
+}
+
+impl From<TokenStatsRow> for TokenStats {
+    fn from(row: TokenStatsRow) -> Self {
+        let total_input = row.total_input_tokens;
+        let cache_read = row.total_cache_read_tokens;
+        let cache_hit_rate = if total_input > 0 {
+            (cache_read as f64 / total_input as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Self {
+            turn_count: row.turn_count,
+            total_input_tokens: row.total_input_tokens,
+            total_output_tokens: row.total_output_tokens,
+            total_cache_read_tokens: row.total_cache_read_tokens,
+            total_cache_write_tokens: row.total_cache_write_tokens,
+            avg_context_used: row.avg_context_used,
+            avg_messages_included: row.avg_messages_included,
+            total_messages_summarized: row.total_messages_summarized,
+            cache_hit_rate,
+        }
+    }
+}
+
+/// Daily token usage for cost tracking
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DailyTokenUsage {
+    pub date: String,
+    pub model: String,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub total_cache_write_tokens: i64,
+    pub request_count: i64,
+    pub agent_count: i64,
+    pub estimated_cost_usd: Option<f64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct DailyTokenUsageRow {
+    date: String,
+    model: String,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_tokens: i64,
+    total_cache_write_tokens: i64,
+    request_count: i64,
+    agent_count: i64,
+    estimated_cost_usd: Option<f64>,
+}
+
+impl From<DailyTokenUsageRow> for DailyTokenUsage {
+    fn from(row: DailyTokenUsageRow) -> Self {
+        Self {
+            date: row.date,
+            model: row.model,
+            total_input_tokens: row.total_input_tokens,
+            total_output_tokens: row.total_output_tokens,
+            total_cache_read_tokens: row.total_cache_read_tokens,
+            total_cache_write_tokens: row.total_cache_write_tokens,
+            request_count: row.request_count,
+            agent_count: row.agent_count,
+            estimated_cost_usd: row.estimated_cost_usd,
+        }
+    }
 }
 
 // ==================== Row Types for SQLx ====================
@@ -1111,6 +1617,78 @@ impl TryFrom<AgentRow> for Agent {
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
             updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
             completed_at: row.completed_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+        })
+    }
+}
+
+/// Statistics for an agent's message history
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentStats {
+    pub message_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_tokens: i64,
+    pub tool_call_count: i64,
+    pub error_count: i64,
+    pub first_message_at: Option<String>,
+    pub last_message_at: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AgentStatsRow {
+    message_count: i64,
+    total_input_tokens: Option<i64>,
+    total_output_tokens: Option<i64>,
+    tool_call_count: i64,
+    error_count: i64,
+    first_message_at: Option<String>,
+    last_message_at: Option<String>,
+}
+
+impl From<AgentStatsRow> for AgentStats {
+    fn from(row: AgentStatsRow) -> Self {
+        let input = row.total_input_tokens.unwrap_or(0);
+        let output = row.total_output_tokens.unwrap_or(0);
+        Self {
+            message_count: row.message_count,
+            total_input_tokens: input,
+            total_output_tokens: output,
+            total_tokens: input + output,
+            tool_call_count: row.tool_call_count,
+            error_count: row.error_count,
+            first_message_at: row.first_message_at,
+            last_message_at: row.last_message_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SessionRow {
+    id: String,
+    agent_id: String,
+    parent_id: Option<String>,
+    api_session_id: Option<String>,
+    total_tokens: i64,
+    is_forked: bool,
+    forked_at: Option<String>,
+    created_at: String,
+    closed_at: Option<String>,
+}
+
+impl TryFrom<SessionRow> for crate::Session {
+    type Error = crate::Error;
+
+    fn try_from(row: SessionRow) -> Result<Self> {
+        Ok(crate::Session {
+            id: row.id,
+            agent_id: Uuid::parse_str(&row.agent_id).map_err(|e| crate::Error::Other(e.to_string()))?,
+            parent_id: row.parent_id,
+            api_session_id: row.api_session_id,
+            total_tokens: row.total_tokens,
+            is_forked: row.is_forked,
+            forked_at: row.forked_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
+            closed_at: row.closed_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
         })
     }
 }

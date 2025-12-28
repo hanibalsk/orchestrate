@@ -21,7 +21,7 @@ pub mod pr;
 pub mod epic;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
-pub use database::Database;
+pub use database::{Database, AgentStats, TokenStats, DailyTokenUsage};
 pub use error::{Error, Result};
 pub use message::{Message, MessageRole};
 pub use session::Session;
