@@ -18,17 +18,12 @@ CREATE TABLE IF NOT EXISTS step_outputs (
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
 );
 
--- Index for finding outputs by agent
-CREATE INDEX IF NOT EXISTS idx_step_outputs_agent ON step_outputs(agent_id);
-
--- Index for finding unconsumed outputs (for dependency queries)
-CREATE INDEX IF NOT EXISTS idx_step_outputs_unconsumed ON step_outputs(consumed, agent_id);
+-- Composite index for common query pattern: get outputs for specific agents, filtering by consumed status
+-- This index serves: WHERE agent_id = ? AND consumed = ?, and also WHERE agent_id = ?
+CREATE INDEX IF NOT EXISTS idx_step_outputs_agent_consumed ON step_outputs(agent_id, consumed);
 
 -- Index for finding outputs by skill
 CREATE INDEX IF NOT EXISTS idx_step_outputs_skill ON step_outputs(skill_name);
 
 -- Index for finding outputs by type
 CREATE INDEX IF NOT EXISTS idx_step_outputs_type ON step_outputs(output_type);
-
--- Composite index for common query pattern: get unconsumed outputs for specific agents
-CREATE INDEX IF NOT EXISTS idx_step_outputs_agent_unconsumed ON step_outputs(agent_id, consumed);

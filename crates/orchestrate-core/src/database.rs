@@ -58,8 +58,11 @@ impl Database {
             .connect(&url)
             .await?;
 
-        // Enable WAL mode and set busy timeout
+        // Enable WAL mode, foreign keys, and set busy timeout
         sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA foreign_keys=ON")
             .execute(&pool)
             .await?;
         sqlx::query("PRAGMA busy_timeout=5000")
@@ -391,11 +394,11 @@ impl Database {
     }
 
     /// Get step outputs for an agent
-    pub async fn get_step_outputs(&self, agent_id: Uuid) -> Result<Vec<StepOutput>> {
+    pub async fn get_step_outputs(&self, agent_id: AgentId) -> Result<Vec<StepOutput>> {
         let rows = sqlx::query_as::<_, StepOutputRow>(
             "SELECT * FROM step_outputs WHERE agent_id = ? ORDER BY created_at DESC",
         )
-        .bind(agent_id.to_string())
+        .bind(agent_id.0.to_string())
         .fetch_all(&self.pool)
         .await?;
 
@@ -403,9 +406,19 @@ impl Database {
     }
 
     /// Get unconsumed step outputs from specific agents (dependencies)
-    pub async fn get_dependency_outputs(&self, dependency_agent_ids: &[Uuid]) -> Result<Vec<StepOutput>> {
+    pub async fn get_dependency_outputs(&self, dependency_agent_ids: &[AgentId]) -> Result<Vec<StepOutput>> {
         if dependency_agent_ids.is_empty() {
             return Ok(vec![]);
+        }
+
+        // Limit batch size to prevent DoS
+        const MAX_BATCH_SIZE: usize = 1000;
+        if dependency_agent_ids.len() > MAX_BATCH_SIZE {
+            return Err(crate::Error::Other(format!(
+                "Batch size {} exceeds maximum of {}",
+                dependency_agent_ids.len(),
+                MAX_BATCH_SIZE
+            )));
         }
 
         // Build placeholders for IN clause
@@ -417,7 +430,7 @@ impl Database {
 
         let mut query_builder = sqlx::query_as::<_, StepOutputRow>(&query);
         for id in dependency_agent_ids {
-            query_builder = query_builder.bind(id.to_string());
+            query_builder = query_builder.bind(id.0.to_string());
         }
 
         let rows = query_builder.fetch_all(&self.pool).await?;
@@ -425,11 +438,11 @@ impl Database {
     }
 
     /// Get the latest step output from an agent
-    pub async fn get_latest_step_output(&self, agent_id: Uuid) -> Result<Option<StepOutput>> {
+    pub async fn get_latest_step_output(&self, agent_id: AgentId) -> Result<Option<StepOutput>> {
         let row = sqlx::query_as::<_, StepOutputRow>(
             "SELECT * FROM step_outputs WHERE agent_id = ? ORDER BY created_at DESC LIMIT 1",
         )
-        .bind(agent_id.to_string())
+        .bind(agent_id.0.to_string())
         .fetch_optional(&self.pool)
         .await?;
 
@@ -437,11 +450,11 @@ impl Database {
     }
 
     /// Get step outputs by skill name
-    pub async fn get_step_outputs_by_skill(&self, agent_id: Uuid, skill_name: &str) -> Result<Vec<StepOutput>> {
+    pub async fn get_step_outputs_by_skill(&self, agent_id: AgentId, skill_name: &str) -> Result<Vec<StepOutput>> {
         let rows = sqlx::query_as::<_, StepOutputRow>(
             "SELECT * FROM step_outputs WHERE agent_id = ? AND skill_name = ? ORDER BY created_at DESC",
         )
-        .bind(agent_id.to_string())
+        .bind(agent_id.0.to_string())
         .bind(skill_name)
         .fetch_all(&self.pool)
         .await?;
@@ -450,19 +463,31 @@ impl Database {
     }
 
     /// Mark step outputs as consumed by an agent
-    pub async fn mark_outputs_consumed(&self, output_ids: &[i64], consumed_by: Uuid) -> Result<u64> {
+    /// Returns the number of outputs that were actually consumed (not already consumed)
+    pub async fn mark_outputs_consumed(&self, output_ids: &[i64], consumed_by: AgentId) -> Result<u64> {
         if output_ids.is_empty() {
             return Ok(0);
         }
 
+        // Limit batch size to prevent DoS
+        const MAX_BATCH_SIZE: usize = 1000;
+        if output_ids.len() > MAX_BATCH_SIZE {
+            return Err(crate::Error::Other(format!(
+                "Batch size {} exceeds maximum of {}",
+                output_ids.len(),
+                MAX_BATCH_SIZE
+            )));
+        }
+
         let placeholders: Vec<String> = output_ids.iter().map(|_| "?".to_string()).collect();
+        // Add AND consumed = 0 to prevent race condition - only consume if not already consumed
         let query = format!(
-            "UPDATE step_outputs SET consumed = 1, consumed_by = ?, consumed_at = ? WHERE id IN ({})",
+            "UPDATE step_outputs SET consumed = 1, consumed_by = ?, consumed_at = ? WHERE id IN ({}) AND consumed = 0",
             placeholders.join(", ")
         );
 
         let mut query_builder = sqlx::query(&query)
-            .bind(consumed_by.to_string())
+            .bind(consumed_by.0.to_string())
             .bind(chrono::Utc::now().to_rfc3339());
 
         for id in output_ids {
@@ -474,9 +499,19 @@ impl Database {
     }
 
     /// Get unconsumed step output count for an agent's dependencies
-    pub async fn count_unconsumed_outputs(&self, dependency_agent_ids: &[Uuid]) -> Result<i64> {
+    pub async fn count_unconsumed_outputs(&self, dependency_agent_ids: &[AgentId]) -> Result<i64> {
         if dependency_agent_ids.is_empty() {
             return Ok(0);
+        }
+
+        // Limit batch size to prevent DoS
+        const MAX_BATCH_SIZE: usize = 1000;
+        if dependency_agent_ids.len() > MAX_BATCH_SIZE {
+            return Err(crate::Error::Other(format!(
+                "Batch size {} exceeds maximum of {}",
+                dependency_agent_ids.len(),
+                MAX_BATCH_SIZE
+            )));
         }
 
         let placeholders: Vec<String> = dependency_agent_ids.iter().map(|_| "?".to_string()).collect();
@@ -487,7 +522,7 @@ impl Database {
 
         let mut query_builder = sqlx::query_scalar::<_, i64>(&query);
         for id in dependency_agent_ids {
-            query_builder = query_builder.bind(id.to_string());
+            query_builder = query_builder.bind(id.0.to_string());
         }
 
         let count = query_builder.fetch_one(&self.pool).await?;
@@ -652,7 +687,6 @@ struct StepOutputRow {
     data: String,
     consumed: bool,
     consumed_by: Option<String>,
-    #[allow(dead_code)]
     consumed_at: Option<String>,
     created_at: String,
 }
@@ -661,6 +695,8 @@ impl TryFrom<StepOutputRow> for StepOutput {
     type Error = crate::Error;
 
     fn try_from(row: StepOutputRow) -> Result<Self> {
+        use std::str::FromStr;
+
         let agent_uuid = Uuid::parse_str(&row.agent_id)
             .map_err(|e| crate::Error::Other(e.to_string()))?;
 
@@ -670,17 +706,23 @@ impl TryFrom<StepOutputRow> for StepOutput {
             .map_err(|e| crate::Error::Other(e.to_string()))?
             .map(AgentId::from_uuid);
 
-        let output_type = StepOutputType::from_str(&row.output_type)
-            .ok_or_else(|| crate::Error::Other(format!("Unknown output type: {}", row.output_type)))?;
+        let consumed_at = row.consumed_at
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(Into::into);
+
+        let output_type = StepOutputType::from_str(&row.output_type)?;
 
         Ok(StepOutput {
-            id: row.id,
+            id: Some(row.id),
             agent_id: AgentId::from_uuid(agent_uuid),
             skill_name: row.skill_name,
             output_type,
             data: serde_json::from_str(&row.data)?,
             consumed: row.consumed,
             consumed_by,
+            consumed_at,
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),

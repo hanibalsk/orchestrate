@@ -33,4 +33,5 @@ pub use network::{
     RecoveryAction, Skill, SkillDefinition, SkillRegistry, StateGraph,
     StateMachine, StatePropagation, StateRequirement, StateTransition,
     StepOutput, StepOutputType, ValidationError, ValidationResult,
+    MAX_STEP_OUTPUT_DATA_SIZE,
 };
