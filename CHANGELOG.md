@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2025-12-28
+
+### Features
+
+- **Self-learning custom instructions system** (`5ce3b04`)
+  - Automatic pattern detection from agent failures (errors, tool usage, behaviors)
+  - Instruction generation with configurable confidence thresholds
+  - Penalty scoring system with auto-disable and cleanup
+  - Instructions injected into agent system prompts at runtime
+  - Support for global and per-agent-type instruction scopes
+
+- **REST API for instruction management**
+  - CRUD endpoints for instructions and patterns
+  - Effectiveness metrics endpoint
+  - Pattern approval/rejection endpoints
+  - Learning process and cleanup triggers
+
+- **CLI commands for instructions and learning**
+  - `instructions list|show|create|enable|disable|delete|stats`
+  - `learn patterns|approve|reject|analyze|config|cleanup|reset-penalty`
+
+### Database
+
+- New migration: `004_custom_instructions.sql`
+  - `custom_instructions` table with scope, priority, and confidence
+  - `instruction_usage` for tracking when instructions are applied
+  - `instruction_effectiveness` with penalty scoring
+  - `learning_patterns` for storing detected patterns
+
+### Testing
+
+- 10 new integration tests for the instruction system
+- Tests for CRUD, scoping, usage tracking, penalty system, and learning workflow
+
 ## [0.1.1] - 2025-12-28
 
 ### Features
