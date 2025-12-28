@@ -187,6 +187,96 @@ uninstall() {
     [[ -z "$quiet" ]] && log_info "Uninstall complete"
 }
 
+# Parse manifest from installed location
+parse_installed_manifest() {
+    local manifest_file="$1"
+    local filter="${2:-}"
+
+    if [[ ! -f "$manifest_file" ]]; then
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Parse: TYPE PATH [MODE]
+        read -r type path mode <<< "$line"
+
+        # Skip if type doesn't match filter
+        if [[ -n "$filter" ]] && [[ ! ",$filter," == *",$type,"* ]]; then
+            continue
+        fi
+
+        echo "$type $path"
+    done < "$manifest_file"
+}
+
+uninstall_local() {
+    local target="${1:-.}"
+    local install_dir="$target/.orchestrate"
+    local claude_dir="$target/.claude"
+    local manifest_file="$install_dir/MANIFEST"
+
+    if [[ ! -f "$manifest_file" ]]; then
+        log_error "No installation found at $target (missing $manifest_file)"
+        return 1
+    fi
+
+    log_info "Uninstalling from: $target"
+
+    # Remove files based on installed manifest
+    parse_installed_manifest "$manifest_file" "bin,script,agent,skill,config" | while read -r type path; do
+        local dst
+
+        case "$type" in
+            bin)
+                dst="$install_dir/$(basename "$path")"
+                ;;
+            script)
+                dst="$install_dir/scripts/$(basename "$path")"
+                ;;
+            agent)
+                dst="$claude_dir/agents/$(basename "$path")"
+                ;;
+            skill)
+                dst="$claude_dir/skills/$(basename "$path")"
+                ;;
+            config)
+                dst="$install_dir/$(basename "$path")"
+                ;;
+            *)
+                dst="$install_dir/$path"
+                ;;
+        esac
+
+        if [[ -e "$dst" ]]; then
+            rm "$dst"
+            log_info "Removed: $dst"
+        fi
+    done
+
+    # Remove wrapper script
+    if [[ -e "$target/orchestrate" ]]; then
+        rm "$target/orchestrate"
+        log_info "Removed: $target/orchestrate"
+    fi
+
+    # Remove manifest
+    rm "$manifest_file"
+    log_info "Removed: $manifest_file"
+
+    # Clean up empty directories
+    rmdir "$install_dir/scripts" 2>/dev/null || true
+    rmdir "$install_dir" 2>/dev/null || true
+    rmdir "$claude_dir/agents" 2>/dev/null || true
+    rmdir "$claude_dir/skills" 2>/dev/null || true
+    rmdir "$claude_dir" 2>/dev/null || true
+
+    log_info "Uninstall complete"
+}
+
 install() {
     log_info "Installing to: $INSTALL_DIR"
 
@@ -488,7 +578,8 @@ Commands:
   install              Install to ~/.local/share/orchestrate
   install-local [dir]  Install to local project directory
   install-rust         Build and install Rust crates
-  uninstall            Remove installation
+  uninstall            Remove global installation
+  uninstall-local [dir] Remove local installation (uses installed manifest)
   backup               Backup current installation
   restore [backup]     Restore from backup (latest if not specified)
   list-backups         List available backups
@@ -535,6 +626,9 @@ case "$cmd" in
         ;;
     uninstall|remove)
         uninstall
+        ;;
+    uninstall-local|remove-local)
+        uninstall_local "${1:-.}"
         ;;
     backup)
         backup
