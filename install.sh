@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# install.sh - Install/Uninstall Simple Multi-Agent Orchestrator
+# install.sh - Install/Uninstall Orchestrate
 #
 # Usage:
 #   ./install.sh              Install to target directory
 #   ./install.sh uninstall    Remove installation
 #   ./install.sh backup       Backup existing installation
 #   ./install.sh restore      Restore from backup
+#   ./install.sh list         List files from manifest
 #
+# The MANIFEST file defines what gets installed.
 
 set -euo pipefail
 
@@ -15,14 +17,17 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_debug() { [[ "${VERBOSE:-}" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" || true; }
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MANIFEST_FILE="$SCRIPT_DIR/MANIFEST"
 DEFAULT_INSTALL_DIR="$HOME/.local/share/orchestrate"
 DEFAULT_BIN_DIR="$HOME/.local/bin"
 BACKUP_DIR="$HOME/.local/share/orchestrate-backup"
@@ -30,22 +35,50 @@ BACKUP_DIR="$HOME/.local/share/orchestrate-backup"
 INSTALL_DIR="${ORCHESTRATE_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 BIN_DIR="${ORCHESTRATE_BIN_DIR:-$DEFAULT_BIN_DIR}"
 
-# Files to install
-FILES=(
-    "orchestrate"
-    "README.md"
-    ".gitignore"
-)
+# ==================== Manifest Parsing ====================
 
-AGENT_FILES=(
-    ".claude/agents/bmad-orchestrator.md"
-    ".claude/agents/bmad-planner.md"
-    ".claude/agents/story-developer.md"
-    ".claude/agents/pr-shepherd.md"
-    ".claude/agents/code-reviewer.md"
-    ".claude/agents/issue-fixer.md"
-    ".claude/agents/explorer.md"
-)
+# Parse manifest and return entries of specified type(s)
+# Usage: parse_manifest [type1,type2,...]
+# Returns: "type path mode" per line
+parse_manifest() {
+    local filter="${1:-}"
+
+    if [[ ! -f "$MANIFEST_FILE" ]]; then
+        log_error "Manifest file not found: $MANIFEST_FILE"
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Parse: TYPE PATH [MODE]
+        read -r type path mode <<< "$line"
+
+        # Skip if type doesn't match filter
+        if [[ -n "$filter" ]] && [[ ! ",$filter," == *",$type,"* ]]; then
+            continue
+        fi
+
+        # Default modes
+        if [[ -z "$mode" ]]; then
+            case "$type" in
+                bin|script) mode="755" ;;
+                *) mode="644" ;;
+            esac
+        fi
+
+        echo "$type $path $mode"
+    done < "$MANIFEST_FILE"
+}
+
+# Get all files from manifest
+get_manifest_files() {
+    parse_manifest "${1:-}" | while read -r type path mode; do
+        echo "$path"
+    done
+}
 
 # ==================== Functions ====================
 
@@ -56,10 +89,10 @@ check_requirements() {
     command -v claude &>/dev/null || missing+=("claude (Claude Code CLI)")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "Missing requirements: ${missing[*]}"
+        log_warn "Optional requirements not found: ${missing[*]}"
         echo ""
         echo "Install Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code"
-        return 1
+        echo ""
     fi
 
     return 0
@@ -84,6 +117,11 @@ backup() {
     # Backup symlink target
     if [[ -L "$BIN_DIR/orchestrate" ]]; then
         echo "$(readlink "$BIN_DIR/orchestrate")" > "$backup_path/.symlink"
+    fi
+
+    # Save manifest snapshot
+    if [[ -f "$MANIFEST_FILE" ]]; then
+        cp "$MANIFEST_FILE" "$backup_path/.manifest"
     fi
 
     log_info "Backup complete: $backup_path"
@@ -131,11 +169,14 @@ uninstall() {
 
     [[ -z "$quiet" ]] && log_info "Uninstalling from: $INSTALL_DIR"
 
-    # Remove symlink
-    if [[ -L "$BIN_DIR/orchestrate" ]]; then
-        rm "$BIN_DIR/orchestrate"
-        [[ -z "$quiet" ]] && log_info "Removed: $BIN_DIR/orchestrate"
-    fi
+    # Remove symlinks for bin types
+    parse_manifest "bin,script" | while read -r type path mode; do
+        local name=$(basename "$path")
+        if [[ -L "$BIN_DIR/$name" ]]; then
+            rm "$BIN_DIR/$name"
+            [[ -z "$quiet" ]] && log_info "Removed symlink: $BIN_DIR/$name"
+        fi
+    done
 
     # Remove installation directory
     if [[ -d "$INSTALL_DIR" ]]; then
@@ -150,7 +191,7 @@ install() {
     log_info "Installing to: $INSTALL_DIR"
 
     # Check requirements
-    check_requirements || return 1
+    check_requirements
 
     # Backup existing if present
     if [[ -d "$INSTALL_DIR" ]]; then
@@ -158,33 +199,44 @@ install() {
         backup
     fi
 
-    # Create directories
+    # Create base directories
     mkdir -p "$INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR/.claude/agents"
     mkdir -p "$BIN_DIR"
 
-    # Copy files
-    for file in "${FILES[@]}"; do
-        if [[ -f "$SCRIPT_DIR/$file" ]]; then
-            cp "$SCRIPT_DIR/$file" "$INSTALL_DIR/$file"
-            log_info "Installed: $file"
+    local installed=0
+    local skipped=0
+
+    # Install files from manifest
+    parse_manifest | while read -r type path mode; do
+        local src="$SCRIPT_DIR/$path"
+        local dst="$INSTALL_DIR/$path"
+
+        if [[ ! -e "$src" ]]; then
+            log_debug "Skipping (not found): $path"
+            ((skipped++)) || true
+            continue
+        fi
+
+        # Create parent directory
+        mkdir -p "$(dirname "$dst")"
+
+        # Copy file
+        cp "$src" "$dst"
+        chmod "$mode" "$dst"
+
+        log_info "Installed: $path ($type)"
+        ((installed++)) || true
+
+        # Create symlink for bin/script types
+        if [[ "$type" == "bin" || "$type" == "script" ]]; then
+            local name=$(basename "$path")
+            ln -sf "$dst" "$BIN_DIR/$name"
+            log_debug "Symlinked: $BIN_DIR/$name -> $dst"
         fi
     done
 
-    # Copy agent files
-    for file in "${AGENT_FILES[@]}"; do
-        if [[ -f "$SCRIPT_DIR/$file" ]]; then
-            cp "$SCRIPT_DIR/$file" "$INSTALL_DIR/$file"
-            log_info "Installed: $file"
-        fi
-    done
-
-    # Make executable
-    chmod +x "$INSTALL_DIR/orchestrate"
-
-    # Create symlink
-    ln -sf "$INSTALL_DIR/orchestrate" "$BIN_DIR/orchestrate"
-    log_info "Created symlink: $BIN_DIR/orchestrate"
+    # Copy manifest itself
+    cp "$MANIFEST_FILE" "$INSTALL_DIR/MANIFEST"
 
     # Check if BIN_DIR is in PATH
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
@@ -210,25 +262,74 @@ install_local() {
 
     # Create directories
     mkdir -p "$target/.claude/agents"
+    mkdir -p "$target/scripts"
 
-    # Copy agent files only
-    for file in "${AGENT_FILES[@]}"; do
-        if [[ -f "$SCRIPT_DIR/$file" ]]; then
-            cp "$SCRIPT_DIR/$file" "$target/$file"
-            log_info "Installed: $file"
+    # Install only bin, script, and agent types
+    parse_manifest "bin,script,agent" | while read -r type path mode; do
+        local src="$SCRIPT_DIR/$path"
+        local dst="$target/$path"
+
+        if [[ ! -e "$src" ]]; then
+            log_debug "Skipping (not found): $path"
+            continue
         fi
-    done
 
-    # Copy orchestrate
-    cp "$SCRIPT_DIR/orchestrate" "$target/orchestrate"
-    chmod +x "$target/orchestrate"
-    log_info "Installed: orchestrate"
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst"
+        chmod "$mode" "$dst"
+
+        log_info "Installed: $path"
+    done
 
     log_info "Local installation complete!"
     echo ""
     echo "Usage:"
     echo "  cd $target"
     echo "  ./orchestrate help"
+}
+
+install_rust() {
+    log_info "Building and installing Rust crates..."
+
+    if ! command -v cargo &>/dev/null; then
+        log_error "Cargo not found. Install Rust: https://rustup.rs"
+        return 1
+    fi
+
+    cd "$SCRIPT_DIR"
+
+    # Build release
+    log_info "Building release..."
+    cargo build --release
+
+    # Install binary
+    local bin_path="$SCRIPT_DIR/target/release/orchestrate"
+    if [[ -f "$bin_path" ]]; then
+        cp "$bin_path" "$BIN_DIR/orchestrate-rs"
+        chmod 755 "$BIN_DIR/orchestrate-rs"
+        log_info "Installed: $BIN_DIR/orchestrate-rs"
+    fi
+
+    log_info "Rust installation complete!"
+}
+
+list_manifest() {
+    local filter="${1:-}"
+
+    echo "Files in MANIFEST${filter:+ (filter: $filter)}:"
+    echo ""
+
+    printf "%-10s %-50s %s\n" "TYPE" "PATH" "MODE"
+    printf "%-10s %-50s %s\n" "----" "----" "----"
+
+    parse_manifest "$filter" | while read -r type path mode; do
+        local exists=" "
+        [[ -e "$SCRIPT_DIR/$path" ]] && exists="*"
+        printf "%-10s %-50s %s %s\n" "$type" "$path" "$mode" "$exists"
+    done
+
+    echo ""
+    echo "* = file exists in source"
 }
 
 list_backups() {
@@ -243,28 +344,74 @@ list_backups() {
     done
 }
 
+verify_install() {
+    log_info "Verifying installation..."
+
+    local errors=0
+
+    # Check each manifest entry
+    parse_manifest | while read -r type path mode; do
+        local dst="$INSTALL_DIR/$path"
+
+        if [[ ! -e "$dst" ]]; then
+            log_error "Missing: $path"
+            ((errors++)) || true
+        else
+            log_debug "OK: $path"
+        fi
+    done
+
+    # Check symlinks
+    parse_manifest "bin,script" | while read -r type path mode; do
+        local name=$(basename "$path")
+        if [[ ! -L "$BIN_DIR/$name" ]]; then
+            log_error "Missing symlink: $BIN_DIR/$name"
+            ((errors++)) || true
+        fi
+    done
+
+    if [[ $errors -eq 0 ]]; then
+        log_info "Verification passed!"
+    else
+        log_error "Verification failed with $errors errors"
+        return 1
+    fi
+}
+
 show_help() {
     cat <<EOF
-Simple Multi-Agent Orchestrator Installer
+Orchestrate Installer
 
 Usage: $0 <command> [args]
 
 Commands:
   install              Install to ~/.local/share/orchestrate
   install-local [dir]  Install to local project directory
+  install-rust         Build and install Rust crates
   uninstall            Remove installation
   backup               Backup current installation
   restore [backup]     Restore from backup (latest if not specified)
   list-backups         List available backups
+  list [type]          List files from manifest (optionally filter by type)
+  verify               Verify installation integrity
   help                 Show this help
+
+File Types (in MANIFEST):
+  bin      Executable binaries (symlinked to BIN_DIR)
+  script   Helper scripts (symlinked to BIN_DIR)
+  agent    Claude agent definitions
+  doc      Documentation files
+  config   Configuration templates
 
 Environment Variables:
   ORCHESTRATE_INSTALL_DIR   Installation directory (default: ~/.local/share/orchestrate)
   ORCHESTRATE_BIN_DIR       Binary directory (default: ~/.local/bin)
+  VERBOSE                   Enable debug output (set to "true")
 
 Examples:
   $0 install                    # Install globally
   $0 install-local ./my-project # Install to project
+  $0 list agent                 # List agent files
   $0 backup                     # Backup current
   $0 uninstall                  # Remove
   $0 restore                    # Restore latest backup
@@ -283,6 +430,9 @@ case "$cmd" in
     install-local|local)
         install_local "${1:-.}"
         ;;
+    install-rust|rust)
+        install_rust
+        ;;
     uninstall|remove)
         uninstall
         ;;
@@ -294,6 +444,12 @@ case "$cmd" in
         ;;
     list-backups|backups)
         list_backups
+        ;;
+    list|manifest)
+        list_manifest "${1:-}"
+        ;;
+    verify|check)
+        verify_install
         ;;
     help|--help|-h)
         show_help

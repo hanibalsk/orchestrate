@@ -1,0 +1,38 @@
+# Orchestrate Installation Manifest
+# Format: TYPE PATH [MODE]
+#   TYPE: bin (executable), lib (library), agent (claude agent), script (helper script), doc (documentation), config (configuration)
+#   PATH: relative path from project root
+#   MODE: optional file permissions (default: 644 for files, 755 for bin/script)
+
+# Main executable
+bin     orchestrate
+
+# Scripts
+script  scripts/bump-version.sh
+
+# Claude agents
+agent   .claude/agents/bmad-orchestrator.md
+agent   .claude/agents/bmad-planner.md
+agent   .claude/agents/story-developer.md
+agent   .claude/agents/pr-shepherd.md
+agent   .claude/agents/code-reviewer.md
+agent   .claude/agents/issue-fixer.md
+agent   .claude/agents/explorer.md
+agent   .claude/agents/pr-controller.md
+agent   .claude/agents/conflict-resolver.md
+agent   .claude/agents/background-controller.md
+
+# Documentation
+doc     README.md
+doc     CHANGELOG.md
+
+# Configuration templates
+config  .gitignore
+
+# Rust crates (for cargo install)
+# These are built from source, not copied
+# crate   crates/orchestrate-cli
+# crate   crates/orchestrate-core
+# crate   crates/orchestrate-claude
+# crate   crates/orchestrate-github
+# crate   crates/orchestrate-web
