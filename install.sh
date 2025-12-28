@@ -258,19 +258,21 @@ install() {
 install_local() {
     local target="${1:-.}"
     local install_dir="$target/.orchestrate"
+    local claude_dir="$target/.claude"
 
-    log_info "Installing to local project: $install_dir"
+    log_info "Installing to local project: $target"
 
-    # Create .orchestrate directory structure
-    mkdir -p "$install_dir/agents"
+    # Create directory structure
     mkdir -p "$install_dir/scripts"
+    mkdir -p "$claude_dir/agents"
+    mkdir -p "$claude_dir/skills"
 
-    # Install files to .orchestrate directory
-    parse_manifest "bin,script,agent,config" | while read -r type path mode; do
+    # Install files
+    parse_manifest "bin,script,agent,skill,config" | while read -r type path mode; do
         local src="$SCRIPT_DIR/$path"
         local dst
 
-        # Map paths to .orchestrate structure
+        # Map paths to appropriate directories
         case "$type" in
             bin)
                 dst="$install_dir/$(basename "$path")"
@@ -279,8 +281,12 @@ install_local() {
                 dst="$install_dir/scripts/$(basename "$path")"
                 ;;
             agent)
-                # .claude/agents/foo.md -> .orchestrate/agents/foo.md
-                dst="$install_dir/agents/$(basename "$path")"
+                # Keep in .claude/agents/
+                dst="$claude_dir/agents/$(basename "$path")"
+                ;;
+            skill)
+                # Keep in .claude/skills/
+                dst="$claude_dir/skills/$(basename "$path")"
                 ;;
             config)
                 dst="$install_dir/$(basename "$path")"
@@ -316,7 +322,10 @@ WRAPPER
 
     log_info "Local installation complete!"
     echo ""
-    echo "Files installed to: $install_dir"
+    echo "Installed to:"
+    echo "  $install_dir/        - orchestrate scripts"
+    echo "  $claude_dir/agents/  - Claude agents"
+    echo "  $claude_dir/skills/  - Claude skills"
     echo ""
     echo "Usage:"
     echo "  cd $target"
