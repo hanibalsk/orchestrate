@@ -3,11 +3,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_core::{
-    Agent, AgentType, CustomInstruction, Database,
+    Agent, AgentState, AgentType, CustomInstruction, Database,
     LearningEngine, PatternStatus, ShellState,
 };
+use orchestrate_claude::{AgentLoop, ClaudeClient};
 use std::path::PathBuf;
-use tracing::Level;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Semaphore;
+use tracing::{info, warn, error, Level};
 use tracing_subscriber::EnvFilter;
 
 /// Initialize logging with the specified verbosity level
@@ -134,8 +138,18 @@ enum Commands {
 enum DaemonAction {
     /// Start the daemon
     Start {
-        #[arg(short, long, default_value = "9999")]
+        /// Port for web API (0 to disable)
+        #[arg(short, long, default_value = "8080")]
         port: u16,
+        /// Maximum concurrent agents
+        #[arg(short = 'c', long, default_value = "3")]
+        max_concurrent: usize,
+        /// Poll interval in seconds
+        #[arg(short = 'i', long, default_value = "5")]
+        poll_interval: u64,
+        /// Claude model to use
+        #[arg(short, long, default_value = "claude-sonnet-4-20250514")]
+        model: String,
     },
     /// Stop the daemon
     Stop,
@@ -442,17 +456,17 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Daemon { action } => match action {
-            DaemonAction::Start { port } => {
-                println!("Starting daemon on port {}...", port);
-                // TODO: Implement daemon
-                println!("Daemon started");
+            DaemonAction::Start { port, max_concurrent, poll_interval, model } => {
+                run_daemon(db, port, max_concurrent, poll_interval, model).await?;
             }
             DaemonAction::Stop => {
                 println!("Stopping daemon...");
-                // TODO: Implement daemon stop
+                // TODO: Implement daemon stop via signal/file
+                println!("Note: Use Ctrl+C to stop the running daemon");
             }
             DaemonAction::Status => {
-                println!("Daemon status: not implemented");
+                println!("Daemon status: Check if process is running");
+                // TODO: Implement status check via PID file
             }
         },
 
@@ -1415,4 +1429,192 @@ fn format_tokens(tokens: i64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+/// Run the daemon to execute agents
+async fn run_daemon(
+    db: Database,
+    port: u16,
+    max_concurrent: usize,
+    poll_interval: u64,
+    model: String,
+) -> Result<()> {
+    // Get API key from environment
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| std::env::var("CLAUDE_API_KEY"))
+        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY or CLAUDE_API_KEY environment variable not set"))?;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                    ORCHESTRATE DAEMON                        ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Model:           {:<42} ║", &model[..model.len().min(42)]);
+    println!("║  Max concurrent:  {:<42} ║", max_concurrent);
+    println!("║  Poll interval:   {:<42} ║", format!("{}s", poll_interval));
+    if port > 0 {
+        println!("║  Web API:         {:<42} ║", format!("http://localhost:{}", port));
+    } else {
+        println!("║  Web API:         {:<42} ║", "disabled");
+    }
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("Press Ctrl+C to stop the daemon");
+    println!();
+
+    // Setup shutdown signal
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("Shutdown signal received");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    });
+
+    // Create Claude client
+    let client = ClaudeClient::new(api_key);
+
+    // Create semaphore for concurrency control
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+
+    // Start web API if port > 0
+    if port > 0 {
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            let state = Arc::new(orchestrate_web::api::AppState::new(db_clone, None));
+            let router = orchestrate_web::api::create_api_router(state);
+            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+                .await
+                .expect("Failed to bind to port");
+            info!("Web API listening on port {}", port);
+            axum::serve(listener, router).await.ok();
+        });
+    }
+
+    // Main polling loop
+    let mut active_agents: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+
+    while !shutdown.load(Ordering::SeqCst) {
+        // Get pending agents (Created state)
+        let pending = match db.list_agents_by_state(AgentState::Created).await {
+            Ok(agents) => agents,
+            Err(e) => {
+                error!("Failed to query pending agents: {}", e);
+                tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+                continue;
+            }
+        };
+
+        // Filter out agents we're already running
+        let new_agents: Vec<_> = pending
+            .into_iter()
+            .filter(|a| !active_agents.contains(&a.id))
+            .collect();
+
+        if !new_agents.is_empty() {
+            info!("Found {} new agent(s) to run", new_agents.len());
+        }
+
+        // Spawn tasks for new agents
+        for agent in new_agents {
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    info!("Max concurrent agents reached, waiting...");
+                    break;
+                }
+            };
+
+            let agent_id = agent.id;
+            active_agents.insert(agent_id);
+
+            let db_clone = db.clone();
+            let client_clone = client.clone();
+            let model_clone = model.clone();
+            let shutdown_clone = shutdown.clone();
+
+            tokio::spawn(async move {
+                let _permit = permit; // Hold permit until done
+
+                info!("[AGENT {}] Starting execution", agent_id);
+
+                match run_single_agent(db_clone, client_clone, agent, model_clone, shutdown_clone).await {
+                    Ok(()) => {
+                        info!("[AGENT {}] Completed successfully", agent_id);
+                    }
+                    Err(e) => {
+                        error!("[AGENT {}] Failed: {}", agent_id, e);
+                    }
+                }
+            });
+        }
+
+        // Clean up completed agents from tracking set
+        let running = db.list_agents_by_state(AgentState::Running).await.unwrap_or_default();
+        let running_ids: std::collections::HashSet<_> = running.iter().map(|a| a.id).collect();
+        active_agents.retain(|id| running_ids.contains(id));
+
+        // Wait before next poll
+        tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+    }
+
+    info!("Daemon shutting down...");
+
+    // Wait for running agents to complete (with timeout)
+    let timeout = std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+
+    while semaphore.available_permits() < max_concurrent {
+        if start.elapsed() > timeout {
+            warn!("Timeout waiting for agents to complete, forcing shutdown");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    println!("Daemon stopped");
+    Ok(())
+}
+
+/// Run a single agent to completion
+async fn run_single_agent(
+    db: Database,
+    client: ClaudeClient,
+    mut agent: Agent,
+    model: String,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    use orchestrate_claude::loop_runner::LoopConfig;
+
+    let config = LoopConfig {
+        model,
+        max_turns: 80,
+        enable_instructions: true,
+        enable_learning: true,
+        max_idle_turns: 5,
+        max_consecutive_errors: 3,
+        enable_token_optimization: true,
+        enable_sessions: true,
+    };
+
+    let agent_loop = AgentLoop::new(client, db.clone(), config);
+
+    // Run with periodic shutdown check
+    let result = tokio::select! {
+        result = agent_loop.run(&mut agent) => result,
+        _ = async {
+            while !shutdown.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        } => {
+            // Shutdown requested, mark agent as paused
+            agent.transition_to(AgentState::Paused).ok();
+            db.update_agent(&agent).await.ok();
+            return Ok(());
+        }
+    };
+
+    // Update final state
+    db.update_agent(&agent).await?;
+
+    result
 }
