@@ -245,3 +245,172 @@ impl Story {
         self.completed_at = Some(Utc::now());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== EpicStatus Tests ====================
+
+    #[test]
+    fn test_epic_status_as_str() {
+        assert_eq!(EpicStatus::Pending.as_str(), "pending");
+        assert_eq!(EpicStatus::InProgress.as_str(), "in_progress");
+        assert_eq!(EpicStatus::Completed.as_str(), "completed");
+        assert_eq!(EpicStatus::Blocked.as_str(), "blocked");
+    }
+
+    #[test]
+    fn test_epic_status_from_str() {
+        assert_eq!(EpicStatus::from_str("pending").unwrap(), EpicStatus::Pending);
+        assert_eq!(EpicStatus::from_str("in_progress").unwrap(), EpicStatus::InProgress);
+        assert_eq!(EpicStatus::from_str("completed").unwrap(), EpicStatus::Completed);
+        assert!(EpicStatus::from_str("invalid").is_err());
+    }
+
+    // ==================== BmadPhase Tests ====================
+
+    #[test]
+    fn test_bmad_phase_display() {
+        assert_eq!(format!("{}", BmadPhase::FindEpic), "FIND_EPIC");
+        assert_eq!(format!("{}", BmadPhase::CreateBranch), "CREATE_BRANCH");
+        assert_eq!(format!("{}", BmadPhase::DevelopStories), "DEVELOP_STORIES");
+        assert_eq!(format!("{}", BmadPhase::Done), "DONE");
+    }
+
+    // ==================== Epic Tests ====================
+
+    #[test]
+    fn test_epic_new() {
+        let epic = Epic::new("7A", "Implement authentication");
+
+        assert_eq!(epic.id, "7A");
+        assert_eq!(epic.title, "Implement authentication");
+        assert_eq!(epic.status, EpicStatus::Pending);
+        assert!(epic.current_phase.is_none());
+        assert!(epic.agent_id.is_none());
+        assert!(epic.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_epic_with_source() {
+        let epic = Epic::new("7A", "Auth")
+            .with_source("docs/epics/auth.md");
+
+        assert_eq!(epic.source_file, Some("docs/epics/auth.md".to_string()));
+    }
+
+    #[test]
+    fn test_epic_start() {
+        let mut epic = Epic::new("7A", "Auth");
+        let agent_id = Uuid::new_v4();
+        let initial_updated = epic.updated_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        epic.start(agent_id);
+
+        assert_eq!(epic.status, EpicStatus::InProgress);
+        assert_eq!(epic.agent_id, Some(agent_id));
+        assert_eq!(epic.current_phase, Some(BmadPhase::CreateBranch));
+        assert!(epic.updated_at > initial_updated);
+    }
+
+    #[test]
+    fn test_epic_complete() {
+        let mut epic = Epic::new("7A", "Auth");
+        epic.complete();
+
+        assert_eq!(epic.status, EpicStatus::Completed);
+        assert_eq!(epic.current_phase, Some(BmadPhase::Done));
+        assert!(epic.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_epic_block() {
+        let mut epic = Epic::new("7A", "Auth");
+        epic.block("CI failed");
+
+        assert_eq!(epic.status, EpicStatus::Blocked);
+        assert_eq!(epic.current_phase, Some(BmadPhase::Blocked));
+        assert_eq!(epic.error_message, Some("CI failed".to_string()));
+    }
+
+    #[test]
+    fn test_epic_set_phase() {
+        let mut epic = Epic::new("7A", "Auth");
+        let initial_updated = epic.updated_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        epic.set_phase(BmadPhase::CodeReview);
+
+        assert_eq!(epic.current_phase, Some(BmadPhase::CodeReview));
+        assert!(epic.updated_at > initial_updated);
+    }
+
+    // ==================== Story Tests ====================
+
+    #[test]
+    fn test_story_new() {
+        let story = Story::new("7A-1", "7A", "Add login form");
+
+        assert_eq!(story.id, "7A-1");
+        assert_eq!(story.epic_id, "7A");
+        assert_eq!(story.title, "Add login form");
+        assert_eq!(story.status, StoryStatus::Pending);
+        assert!(story.agent_id.is_none());
+        assert!(story.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_story_with_criteria() {
+        let criteria = serde_json::json!([
+            "User can enter email",
+            "User can enter password",
+            "Form validates input"
+        ]);
+
+        let story = Story::new("7A-1", "7A", "Add login form")
+            .with_criteria(criteria.clone());
+
+        assert_eq!(story.acceptance_criteria, Some(criteria));
+    }
+
+    #[test]
+    fn test_story_start() {
+        let mut story = Story::new("7A-1", "7A", "Add login form");
+        let agent_id = Uuid::new_v4();
+        let initial_updated = story.updated_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        story.start(agent_id);
+
+        assert_eq!(story.status, StoryStatus::InProgress);
+        assert_eq!(story.agent_id, Some(agent_id));
+        assert!(story.updated_at > initial_updated);
+    }
+
+    #[test]
+    fn test_story_complete() {
+        let mut story = Story::new("7A-1", "7A", "Add login form");
+        story.complete();
+
+        assert_eq!(story.status, StoryStatus::Completed);
+        assert!(story.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_story_lifecycle() {
+        let mut story = Story::new("7A-1", "7A", "Add login form");
+        let agent_id = Uuid::new_v4();
+
+        // Start story
+        story.start(agent_id);
+        assert_eq!(story.status, StoryStatus::InProgress);
+        assert!(story.completed_at.is_none());
+
+        // Complete story
+        story.complete();
+        assert_eq!(story.status, StoryStatus::Completed);
+        assert!(story.completed_at.is_some());
+    }
+}

@@ -208,3 +208,158 @@ impl PullRequest {
         self.updated_at = Utc::now();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== PrStatus Tests ====================
+
+    #[test]
+    fn test_pr_status_as_str() {
+        assert_eq!(PrStatus::Queued.as_str(), "queued");
+        assert_eq!(PrStatus::Open.as_str(), "open");
+        assert_eq!(PrStatus::Merged.as_str(), "merged");
+        assert_eq!(PrStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn test_pr_status_from_str() {
+        assert_eq!(PrStatus::from_str("queued").unwrap(), PrStatus::Queued);
+        assert_eq!(PrStatus::from_str("open").unwrap(), PrStatus::Open);
+        assert_eq!(PrStatus::from_str("merged").unwrap(), PrStatus::Merged);
+        assert!(PrStatus::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_pr_status_is_terminal() {
+        assert!(PrStatus::Merged.is_terminal());
+        assert!(PrStatus::Failed.is_terminal());
+        assert!(PrStatus::Closed.is_terminal());
+        assert!(!PrStatus::Queued.is_terminal());
+        assert!(!PrStatus::Open.is_terminal());
+        assert!(!PrStatus::Reviewing.is_terminal());
+    }
+
+    #[test]
+    fn test_pr_status_is_active() {
+        assert!(PrStatus::Queued.is_active());
+        assert!(PrStatus::Open.is_active());
+        assert!(PrStatus::Reviewing.is_active());
+        assert!(!PrStatus::Merged.is_active());
+        assert!(!PrStatus::Failed.is_active());
+    }
+
+    // ==================== MergeStrategy Tests ====================
+
+    #[test]
+    fn test_merge_strategy_as_str() {
+        assert_eq!(MergeStrategy::Squash.as_str(), "squash");
+        assert_eq!(MergeStrategy::Rebase.as_str(), "rebase");
+        assert_eq!(MergeStrategy::Merge.as_str(), "merge");
+    }
+
+    #[test]
+    fn test_merge_strategy_from_str() {
+        assert_eq!(MergeStrategy::from_str("squash").unwrap(), MergeStrategy::Squash);
+        assert_eq!(MergeStrategy::from_str("rebase").unwrap(), MergeStrategy::Rebase);
+        assert_eq!(MergeStrategy::from_str("merge").unwrap(), MergeStrategy::Merge);
+        assert!(MergeStrategy::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_merge_strategy_default() {
+        assert_eq!(MergeStrategy::default(), MergeStrategy::Squash);
+    }
+
+    // ==================== PullRequest Tests ====================
+
+    #[test]
+    fn test_pull_request_new() {
+        let pr = PullRequest::new("feature/auth");
+
+        assert_eq!(pr.branch_name, "feature/auth");
+        assert_eq!(pr.status, PrStatus::Queued);
+        assert_eq!(pr.merge_strategy, MergeStrategy::Squash);
+        assert!(pr.title.is_none());
+        assert!(pr.pr_number.is_none());
+        assert!(pr.error_message.is_none());
+    }
+
+    #[test]
+    fn test_pull_request_with_epic() {
+        let pr = PullRequest::new("feature/auth")
+            .with_epic("epic-7A");
+
+        assert_eq!(pr.epic_id, Some("epic-7A".to_string()));
+    }
+
+    #[test]
+    fn test_pull_request_with_worktree() {
+        let pr = PullRequest::new("feature/auth")
+            .with_worktree("wt-123");
+
+        assert_eq!(pr.worktree_id, Some("wt-123".to_string()));
+    }
+
+    #[test]
+    fn test_pull_request_with_title() {
+        let pr = PullRequest::new("feature/auth")
+            .with_title("Add authentication");
+
+        assert_eq!(pr.title, Some("Add authentication".to_string()));
+    }
+
+    #[test]
+    fn test_pull_request_with_strategy() {
+        let pr = PullRequest::new("feature/auth")
+            .with_strategy(MergeStrategy::Rebase);
+
+        assert_eq!(pr.merge_strategy, MergeStrategy::Rebase);
+    }
+
+    #[test]
+    fn test_pull_request_set_status() {
+        let mut pr = PullRequest::new("feature/auth");
+        let initial_updated = pr.updated_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        pr.set_status(PrStatus::Open);
+
+        assert_eq!(pr.status, PrStatus::Open);
+        assert!(pr.updated_at > initial_updated);
+        assert!(pr.merged_at.is_none());
+    }
+
+    #[test]
+    fn test_pull_request_set_status_merged() {
+        let mut pr = PullRequest::new("feature/auth");
+        pr.set_status(PrStatus::Merged);
+
+        assert_eq!(pr.status, PrStatus::Merged);
+        assert!(pr.merged_at.is_some());
+    }
+
+    #[test]
+    fn test_pull_request_fail() {
+        let mut pr = PullRequest::new("feature/auth");
+        pr.fail("Merge conflict");
+
+        assert_eq!(pr.status, PrStatus::Failed);
+        assert_eq!(pr.error_message, Some("Merge conflict".to_string()));
+    }
+
+    #[test]
+    fn test_pull_request_builder_chain() {
+        let pr = PullRequest::new("feature/auth")
+            .with_epic("epic-1")
+            .with_worktree("wt-1")
+            .with_title("Auth feature")
+            .with_strategy(MergeStrategy::Rebase);
+
+        assert_eq!(pr.epic_id, Some("epic-1".to_string()));
+        assert_eq!(pr.worktree_id, Some("wt-1".to_string()));
+        assert_eq!(pr.title, Some("Auth feature".to_string()));
+        assert_eq!(pr.merge_strategy, MergeStrategy::Rebase);
+    }
+}
