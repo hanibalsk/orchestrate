@@ -6,12 +6,13 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use orchestrate_core::{
     Agent, AgentState, AgentType, CustomInstruction, Database, InstructionEffectiveness,
     InstructionScope, InstructionSource, LearningEngine, LearningPattern, PatternStatus,
+    Schedule, ScheduleRun,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,16 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/patterns/:id/reject", post(reject_pattern))
         .route("/api/learning/process", post(process_patterns))
         .route("/api/learning/cleanup", post(cleanup_instructions))
+        // Schedule routes
+        .route("/api/schedules", get(list_schedules).post(create_schedule))
+        .route(
+            "/api/schedules/:id",
+            get(get_schedule).put(update_schedule).delete(delete_schedule),
+        )
+        .route("/api/schedules/:id/pause", post(pause_schedule))
+        .route("/api/schedules/:id/resume", post(resume_schedule))
+        .route("/api/schedules/:id/run", post(run_schedule))
+        .route("/api/schedules/:id/runs", get(get_schedule_runs))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -742,6 +753,223 @@ async fn cleanup_instructions(
     }))
 }
 
+// ==================== Schedule Handlers ====================
+
+async fn list_schedules(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ScheduleResponse>>, ApiError> {
+    let schedules = state
+        .db
+        .list_schedules(false)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedules.into_iter().map(Into::into).collect()))
+}
+
+async fn get_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn create_schedule(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateScheduleRequest>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    req.validate()?;
+
+    let mut schedule = Schedule::new(
+        req.name,
+        req.cron_expression,
+        req.agent_type,
+        req.task,
+    );
+
+    // Validate cron expression
+    schedule
+        .validate_cron()
+        .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
+
+    // Calculate next run
+    schedule
+        .update_next_run()
+        .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
+
+    if let Some(enabled) = req.enabled {
+        schedule.enabled = enabled;
+    }
+
+    let id = state
+        .db
+        .insert_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    schedule.id = id;
+    Ok(Json(schedule.into()))
+}
+
+async fn update_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateScheduleRequest>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let mut schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    if let Some(name) = req.name {
+        schedule.name = name;
+    }
+    if let Some(cron_expression) = req.cron_expression {
+        schedule.cron_expression = cron_expression;
+        // Validate and recalculate next run
+        schedule
+            .validate_cron()
+            .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
+        schedule
+            .update_next_run()
+            .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
+    }
+    if let Some(agent_type) = req.agent_type {
+        schedule.agent_type = agent_type;
+    }
+    if let Some(task) = req.task {
+        schedule.task = task;
+    }
+    if let Some(enabled) = req.enabled {
+        schedule.enabled = enabled;
+    }
+
+    state
+        .db
+        .update_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn delete_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let deleted = state
+        .db
+        .delete_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    if !deleted {
+        return Err(ApiError::not_found("Schedule"));
+    }
+
+    Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+async fn pause_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let mut schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    schedule.enabled = false;
+
+    state
+        .db
+        .update_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn resume_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let mut schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    schedule.enabled = true;
+
+    state
+        .db
+        .update_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn run_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<AgentResponse>, ApiError> {
+    let schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    // Parse agent type
+    let agent_type = AgentType::from_str(&schedule.agent_type)
+        .map_err(|_| ApiError::bad_request(format!("Invalid agent type: {}", schedule.agent_type)))?;
+
+    // Create and insert agent
+    let agent = Agent::new(agent_type, schedule.task.clone());
+    state
+        .db
+        .insert_agent(&agent)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(agent.into()))
+}
+
+async fn get_schedule_runs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<ScheduleRunResponse>>, ApiError> {
+    // Verify schedule exists
+    let _ = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    let runs = state
+        .db
+        .get_schedule_runs(id, 100)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(runs.into_iter().map(Into::into).collect()))
+}
+
 // ==================== Request/Response Types ====================
 
 #[derive(Debug, Deserialize)]
@@ -996,6 +1224,107 @@ pub struct ProcessPatternsResponse {
 pub struct CleanupResponse {
     pub disabled_count: usize,
     pub deleted_names: Vec<String>,
+}
+
+// ==================== Schedule Request/Response Types ====================
+
+#[derive(Debug, Deserialize)]
+pub struct CreateScheduleRequest {
+    pub name: String,
+    pub cron_expression: String,
+    pub agent_type: String,
+    pub task: String,
+    pub enabled: Option<bool>,
+}
+
+impl CreateScheduleRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.name.trim().is_empty() {
+            return Err(ApiError::validation("Name cannot be empty"));
+        }
+        if self.cron_expression.trim().is_empty() {
+            return Err(ApiError::validation("Cron expression cannot be empty"));
+        }
+        if self.agent_type.trim().is_empty() {
+            return Err(ApiError::validation("Agent type cannot be empty"));
+        }
+        if self.task.trim().is_empty() {
+            return Err(ApiError::validation("Task cannot be empty"));
+        }
+        if self.name.len() > 255 {
+            return Err(ApiError::validation("Name exceeds maximum length of 255 characters"));
+        }
+        if self.task.len() > MAX_TASK_LENGTH {
+            return Err(ApiError::validation(format!(
+                "Task exceeds maximum length of {} characters",
+                MAX_TASK_LENGTH
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateScheduleRequest {
+    pub name: Option<String>,
+    pub cron_expression: Option<String>,
+    pub agent_type: Option<String>,
+    pub task: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScheduleResponse {
+    pub id: i64,
+    pub name: String,
+    pub cron_expression: String,
+    pub agent_type: String,
+    pub task: String,
+    pub enabled: bool,
+    pub last_run: Option<String>,
+    pub next_run: Option<String>,
+    pub created_at: String,
+}
+
+impl From<Schedule> for ScheduleResponse {
+    fn from(schedule: Schedule) -> Self {
+        Self {
+            id: schedule.id,
+            name: schedule.name,
+            cron_expression: schedule.cron_expression,
+            agent_type: schedule.agent_type,
+            task: schedule.task,
+            enabled: schedule.enabled,
+            last_run: schedule.last_run.map(|dt| dt.to_rfc3339()),
+            next_run: schedule.next_run.map(|dt| dt.to_rfc3339()),
+            created_at: schedule.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScheduleRunResponse {
+    pub id: i64,
+    pub schedule_id: i64,
+    pub agent_id: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub status: String,
+    pub error_message: Option<String>,
+}
+
+impl From<ScheduleRun> for ScheduleRunResponse {
+    fn from(run: ScheduleRun) -> Self {
+        Self {
+            id: run.id,
+            schedule_id: run.schedule_id,
+            agent_id: run.agent_id,
+            started_at: run.started_at.to_rfc3339(),
+            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
+            status: run.status.as_str().to_string(),
+            error_message: run.error_message,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1760,5 +2089,484 @@ mod tests {
 
         assert_eq!(response.role, "user");
         assert_eq!(response.content, "Hello");
+    }
+
+    // ==================== Schedule Tests ====================
+
+    #[tokio::test]
+    async fn test_list_schedules_empty() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/schedules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let schedules: Vec<ScheduleResponse> = serde_json::from_str(&body).unwrap();
+        assert!(schedules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_schedule_success() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/schedules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"daily-backup","cron_expression":"0 2 * * *","agent_type":"story_developer","task":"Run backup"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let schedule: ScheduleResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(schedule.name, "daily-backup");
+        assert_eq!(schedule.cron_expression, "0 2 * * *");
+        assert_eq!(schedule.agent_type, "story_developer");
+        assert_eq!(schedule.task, "Run backup");
+        assert!(schedule.enabled);
+        assert!(schedule.next_run.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_schedule_invalid_cron() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/schedules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"bad-schedule","cron_expression":"invalid","agent_type":"story_developer","task":"Test"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_to_string(response.into_body()).await;
+        let error: ApiError = serde_json::from_str(&body).unwrap();
+        assert_eq!(error.code, "validation_error");
+    }
+
+    #[tokio::test]
+    async fn test_create_schedule_empty_name() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/schedules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"","cron_expression":"0 2 * * *","agent_type":"story_developer","task":"Test"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_schedule_success() {
+        let test_app = setup_app().await;
+
+        // Create schedule directly in DB
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/schedules/{}", id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.id, id);
+        assert_eq!(resp.name, "test-schedule");
+    }
+
+    #[tokio::test]
+    async fn test_get_schedule_not_found() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/schedules/999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_schedule_success() {
+        let test_app = setup_app().await;
+
+        // Create schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Original task".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/schedules/{}", id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"task":"Updated task"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.task, "Updated task");
+        assert_eq!(resp.name, "test-schedule"); // Unchanged
+    }
+
+    #[tokio::test]
+    async fn test_update_schedule_cron_expression() {
+        let test_app = setup_app().await;
+
+        // Create schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/schedules/{}", id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cron_expression":"@hourly"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.cron_expression, "@hourly");
+    }
+
+    #[tokio::test]
+    async fn test_update_schedule_invalid_cron() {
+        let test_app = setup_app().await;
+
+        // Create schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/schedules/{}", id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"cron_expression":"invalid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_schedule_success() {
+        let test_app = setup_app().await;
+
+        // Create schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/schedules/{}", id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify it's deleted
+        let schedule = test_app.state.db.get_schedule(id).await.unwrap();
+        assert!(schedule.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_schedule_not_found() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/schedules/999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_pause_schedule() {
+        let test_app = setup_app().await;
+
+        // Create enabled schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/schedules/{}/pause", id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
+        assert!(!resp.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_resume_schedule() {
+        let test_app = setup_app().await;
+
+        // Create disabled schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.enabled = false;
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/schedules/{}/resume", id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
+        assert!(resp.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_run_schedule_immediately() {
+        let test_app = setup_app().await;
+
+        // Create schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task for immediate run".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/schedules/{}/run", id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let agent: AgentResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(agent.task, "Test task for immediate run");
+        assert_eq!(agent.agent_type, AgentType::StoryDeveloper);
+    }
+
+    #[tokio::test]
+    async fn test_get_schedule_runs_empty() {
+        let test_app = setup_app().await;
+
+        // Create schedule
+        let mut schedule = Schedule::new(
+            "test-schedule".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.update_next_run().unwrap();
+        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/schedules/{}/runs", id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let runs: Vec<ScheduleRunResponse> = serde_json::from_str(&body).unwrap();
+        assert!(runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_schedule_runs_not_found() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/schedules/999/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_schedule_response_from_schedule() {
+        let mut schedule = Schedule::new(
+            "test".to_string(),
+            "@daily".to_string(),
+            "story_developer".to_string(),
+            "Test task".to_string(),
+        );
+        schedule.id = 42;
+        let response: ScheduleResponse = schedule.clone().into();
+
+        assert_eq!(response.id, 42);
+        assert_eq!(response.name, "test");
+        assert_eq!(response.cron_expression, "@daily");
+        assert_eq!(response.agent_type, "story_developer");
+        assert_eq!(response.task, "Test task");
     }
 }
