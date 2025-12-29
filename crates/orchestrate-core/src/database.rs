@@ -1853,6 +1853,59 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Get schedules that are due for execution
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_due_schedules(&self) -> Result<Vec<Schedule>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT * FROM schedules WHERE enabled = 1 AND next_run <= ? ORDER BY next_run ASC",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Try to acquire a lock for schedule execution
+    ///
+    /// Returns true if lock was acquired, false if schedule is already locked.
+    /// Locks expire after 5 minutes to prevent deadlocks.
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn try_lock_schedule(&self, schedule_id: i64) -> Result<bool> {
+        let now = chrono::Utc::now();
+        let lock_expiry = now - chrono::Duration::minutes(5);
+
+        // Try to acquire lock using UPDATE with WHERE clause
+        // This will only update if the schedule is not locked or lock has expired
+        let result = sqlx::query(
+            r#"
+            UPDATE schedules
+            SET locked_at = ?
+            WHERE id = ?
+            AND (locked_at IS NULL OR locked_at < ?)
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(schedule_id)
+        .bind(lock_expiry.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release a schedule lock
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn unlock_schedule(&self, schedule_id: i64) -> Result<()> {
+        sqlx::query("UPDATE schedules SET locked_at = NULL WHERE id = ?")
+            .bind(schedule_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
     /// Insert a schedule run record
     #[tracing::instrument(skip(self, run), level = "debug", fields(schedule_id = run.schedule_id))]
     pub async fn insert_schedule_run(&self, run: &ScheduleRun) -> Result<i64> {

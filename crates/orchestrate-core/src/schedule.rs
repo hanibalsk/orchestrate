@@ -97,6 +97,35 @@ pub struct ScheduleRun {
     pub error_message: Option<String>,
 }
 
+impl ScheduleRun {
+    /// Create a new schedule run record
+    pub fn new(schedule_id: i64) -> Self {
+        Self {
+            id: 0, // Will be set by database
+            schedule_id,
+            agent_id: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            status: ScheduleRunStatus::Running,
+            error_message: None,
+        }
+    }
+
+    /// Mark the run as completed
+    pub fn mark_completed(&mut self, agent_id: String) {
+        self.agent_id = Some(agent_id);
+        self.completed_at = Some(Utc::now());
+        self.status = ScheduleRunStatus::Completed;
+    }
+
+    /// Mark the run as failed
+    pub fn mark_failed(&mut self, error: String) {
+        self.completed_at = Some(Utc::now());
+        self.status = ScheduleRunStatus::Failed;
+        self.error_message = Some(error);
+    }
+}
+
 /// Status of a schedule run
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScheduleRunStatus {

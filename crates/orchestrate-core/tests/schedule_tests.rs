@@ -282,3 +282,74 @@ async fn test_cascade_delete_schedule_runs() {
     let runs_after = db.get_schedule_runs(schedule_id, 10).await.unwrap();
     assert_eq!(runs_after.len(), 0);
 }
+
+#[tokio::test]
+async fn test_schedule_locking() {
+    let db = Database::in_memory().await.unwrap();
+
+    let schedule = Schedule::new(
+        "test-lock".to_string(),
+        "0 0 * * *".to_string(),
+        "BackgroundController".to_string(),
+        "Test locking".to_string(),
+    );
+
+    let schedule_id = db.insert_schedule(&schedule).await.unwrap();
+
+    // First lock should succeed
+    let locked1 = db.try_lock_schedule(schedule_id).await.unwrap();
+    assert!(locked1);
+
+    // Second lock should fail (already locked)
+    let locked2 = db.try_lock_schedule(schedule_id).await.unwrap();
+    assert!(!locked2);
+
+    // Unlock
+    db.unlock_schedule(schedule_id).await.unwrap();
+
+    // Third lock should succeed (unlocked)
+    let locked3 = db.try_lock_schedule(schedule_id).await.unwrap();
+    assert!(locked3);
+}
+
+#[tokio::test]
+async fn test_get_due_schedules() {
+    use chrono::TimeZone;
+    let db = Database::in_memory().await.unwrap();
+
+    // Schedule 1: due (past)
+    let mut schedule1 = Schedule::new(
+        "due-schedule".to_string(),
+        "0 0 * * *".to_string(),
+        "BackgroundController".to_string(),
+        "Due task".to_string(),
+    );
+    schedule1.next_run = Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+    db.insert_schedule(&schedule1).await.unwrap();
+
+    // Schedule 2: not due (future)
+    let mut schedule2 = Schedule::new(
+        "future-schedule".to_string(),
+        "0 0 * * *".to_string(),
+        "BackgroundController".to_string(),
+        "Future task".to_string(),
+    );
+    schedule2.next_run = Some(Utc::now() + chrono::Duration::hours(24));
+    db.insert_schedule(&schedule2).await.unwrap();
+
+    // Schedule 3: disabled but due
+    let mut schedule3 = Schedule::new(
+        "disabled-schedule".to_string(),
+        "0 0 * * *".to_string(),
+        "BackgroundController".to_string(),
+        "Disabled task".to_string(),
+    );
+    schedule3.enabled = false;
+    schedule3.next_run = Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+    db.insert_schedule(&schedule3).await.unwrap();
+
+    // Get due schedules - should only return schedule1
+    let due = db.get_due_schedules().await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].name, "due-schedule");
+}
