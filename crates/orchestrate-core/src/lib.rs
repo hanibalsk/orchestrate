@@ -8,22 +8,37 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
-pub mod change_test_analyzer;
-pub mod coverage;
+pub mod approval;
+pub mod approval_service;
+pub mod condition_evaluator;
+pub mod cron;
 pub mod database;
 #[cfg(test)]
+mod database_approval_tests;
+#[cfg(test)]
 mod database_webhook_tests;
+#[cfg(test)]
+mod database_pipeline_tests;
+#[cfg(test)]
+mod database_environment_tests;
+pub mod environment;
 pub mod epic;
 pub mod error;
+pub mod feedback;
 pub mod instruction;
 pub mod learning;
 pub mod message;
 pub mod network;
+pub mod pipeline;
+pub mod pipeline_executor;
+pub mod pipeline_parser;
+pub mod pipeline_template;
 pub mod pr;
+pub mod schedule;
+pub mod secrets;
+pub mod schedule_template;
 pub mod session;
 pub mod shell_state;
-pub mod test_generation;
-pub mod test_quality;
 pub mod webhook;
 pub mod webhook_config;
 pub mod worktree;
@@ -40,11 +55,15 @@ pub use worktree::{create_pr_worktree, Worktree, WorktreeStatus};
 // Re-export instruction types
 pub use instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
-    LearningConfig, LearningPattern, PatternStatus, PatternType,
+    LearningConfig, LearningPattern, PatternStatus, PatternType, SuccessPattern,
+    SuccessPatternType,
 };
 
 // Re-export learning types
-pub use learning::{CleanupResult, LearningEngine};
+pub use learning::{CleanupResult, LearningEngine, SuccessRecommendations};
+
+// Re-export feedback types
+pub use feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
 
 // Re-export network types
 pub use network::{
@@ -57,31 +76,41 @@ pub use network::{
 // Re-export shell state types
 pub use shell_state::{QueueEntry, ShellState, ShepherdLock};
 
+// Re-export schedule types
+pub use schedule::{Schedule, ScheduleRun, ScheduleRunStatus};
+
+// Re-export schedule template types
+pub use schedule_template::ScheduleTemplate;
+
+// Re-export cron types
+pub use cron::CronSchedule;
+
 // Re-export webhook types
 pub use webhook::{WebhookEvent, WebhookEventStatus};
 pub use webhook_config::{EventConfig, EventFilter, WebhookConfig};
 
-// Re-export test generation types
-pub use test_generation::{
-    AcceptanceCriterion, E2ETestPlatform, E2ETestResult, FunctionSignature,
-    IntegrationTestResult, InterfaceInfo, InterfaceType, Language, ModuleInfo, Parameter,
-    PropertyTestCase, PropertyTestResult, PropertyType, TestCase, TestCategory, TestFixture,
-    TestGenerationResult, TestGenerationService, TestType,
+// Re-export pipeline types
+pub use pipeline::{
+    Pipeline, PipelineRun, PipelineRunStatus, PipelineStage, PipelineStageStatus, RollbackEvent,
+    RollbackStatus, RollbackTriggerType,
+};
+pub use pipeline_executor::{ExecutionContext, PipelineExecutor};
+pub use pipeline_parser::{
+    FailureAction, PipelineDefinition, StageCondition, StageDefinition, TriggerDefinition,
 };
 
-// Re-export coverage types
-pub use coverage::{
-    CoverageFormat, CoverageReport, CoverageService, FileCoverage, ModuleCoverage,
-};
+// Re-export condition evaluator types
+pub use condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationResult, SkipReason};
 
-// Re-export test quality types
-pub use test_quality::{
-    MutationDetail, MutationTestResult, MutationType, TestIssueType, TestQualityIssue,
-    TestQualityReport, TestQualityService,
-};
+// Re-export approval types
+pub use approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
+pub use approval_service::ApprovalService;
 
-// Re-export change test analyzer types
-pub use change_test_analyzer::{
-    ChangeAnalysisResult, ChangeTestAnalyzer, ChangeType, ChangedFunction, Priority,
-    TestCoverage, TestSuggestion,
-};
+// Re-export pipeline template types
+pub use pipeline_template::PipelineTemplate;
+
+// Re-export environment types
+pub use environment::{CreateEnvironment, Environment, EnvironmentType};
+
+// Re-export secrets types
+pub use secrets::{get_encryption_key, SecretsManager};
