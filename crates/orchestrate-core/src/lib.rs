@@ -22,6 +22,7 @@ mod database_pipeline_tests;
 pub mod documentation;
 pub mod epic;
 pub mod requirements;
+pub mod multi_repo;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -162,4 +163,11 @@ pub use requirements::{
     ArtifactType, ClarifyingQuestion, EffortEstimate, GeneratedStory, ImpactAnalysis, LinkType,
     Requirement, RequirementPriority, RequirementStatus, RequirementType, RiskLevel,
     StoryComplexity, TraceCoverage, TraceabilityLink, TraceabilityMatrix,
+};
+
+// Re-export multi-repo types
+pub use multi_repo::{
+    CoordinatedRelease, CrossRepoBranch, LinkedPr, LinkedPrGroup, LinkedPrStatus, ReleaseStatus,
+    RepoBranchStatus, RepoConfig, RepoDependencyGraph, RepoProvider, RepoRelease, RepoStatus,
+    Repository,
 };

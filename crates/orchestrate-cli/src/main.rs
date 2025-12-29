@@ -191,6 +191,11 @@ enum Commands {
         #[command(subcommand)]
         action: RequirementsAction,
     },
+    /// Multi-repository management
+    Repo {
+        #[command(subcommand)]
+        action: RepoAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1143,6 +1148,44 @@ enum RequirementsAction {
     Impact {
         /// Requirement ID
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoAction {
+    /// Add a repository
+    Add {
+        /// Repository URL (GitHub, GitLab, or Bitbucket)
+        url: String,
+        /// Local path to clone to
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Repository name (defaults to URL basename)
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// List repositories
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a repository
+    Remove {
+        /// Repository name
+        name: String,
+    },
+    /// Show repository dependencies
+    Dependencies {
+        /// Output as Mermaid diagram
+        #[arg(long)]
+        mermaid: bool,
+    },
+    /// Sync all repositories
+    Sync {
+        /// Specific repository to sync
+        #[arg(short, long)]
+        repo: Option<String>,
     },
 }
 
@@ -4154,6 +4197,202 @@ async fn main() -> Result<()> {
                 println!("Recommendations:");
                 for rec in &analysis.recommendations {
                     println!("  - {}", rec);
+                }
+            }
+        },
+        Commands::Repo { action } => match action {
+            RepoAction::Add { url, path, name } => {
+                use orchestrate_core::{Repository, RepoProvider};
+
+                let repo_name = name.unwrap_or_else(|| {
+                    url.split('/').last().unwrap_or("repo")
+                        .trim_end_matches(".git")
+                        .to_string()
+                });
+
+                let provider = RepoProvider::from_url(&url);
+                let local_path = path.unwrap_or_else(|| format!(".repos/{}", repo_name));
+
+                let repo = Repository::new(&repo_name, &url)
+                    .with_local_path(&local_path);
+
+                // Store in repos.yaml
+                let repos_file = std::path::Path::new("repos.yaml");
+                let mut repos: Vec<serde_json::Value> = if repos_file.exists() {
+                    let content = std::fs::read_to_string(repos_file)?;
+                    serde_yaml::from_str(&content).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+
+                repos.push(serde_json::json!({
+                    "name": repo.name,
+                    "url": repo.url,
+                    "local_path": repo.local_path,
+                    "provider": provider.as_str(),
+                }));
+
+                std::fs::write(repos_file, serde_yaml::to_string(&repos)?)?;
+
+                println!("Added repository: {}", repo_name);
+                println!("  URL: {}", url);
+                println!("  Provider: {}", provider.as_str());
+                println!("  Local path: {}", local_path);
+                println!();
+                println!("To clone, run: git clone {} {}", url, local_path);
+            }
+            RepoAction::List { json } => {
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    println!("No repositories configured. Use 'orchestrate repo add' to add one.");
+                    return Ok(());
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&repos)?);
+                } else {
+                    println!("Repositories");
+                    println!("{}", "=".repeat(60));
+                    for repo in &repos {
+                        println!("{}: {} [{}]",
+                            repo["name"].as_str().unwrap_or(""),
+                            repo["url"].as_str().unwrap_or(""),
+                            repo["provider"].as_str().unwrap_or("unknown"),
+                        );
+                        if let Some(path) = repo["local_path"].as_str() {
+                            println!("  Path: {}", path);
+                        }
+                    }
+                    println!("\nTotal: {} repositories", repos.len());
+                }
+            }
+            RepoAction::Remove { name } => {
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    anyhow::bail!("No repositories configured");
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                let filtered: Vec<_> = repos.into_iter()
+                    .filter(|r| r["name"].as_str() != Some(&name))
+                    .collect();
+
+                std::fs::write(repos_file, serde_yaml::to_string(&filtered)?)?;
+                println!("Removed repository: {}", name);
+            }
+            RepoAction::Dependencies { mermaid } => {
+                use orchestrate_core::RepoDependencyGraph;
+
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    println!("No repositories configured");
+                    return Ok(());
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                let mut graph = RepoDependencyGraph::new();
+                for repo in &repos {
+                    let name = repo["name"].as_str().unwrap_or("").to_string();
+                    let deps: Vec<String> = repo["depends_on"]
+                        .as_array()
+                        .map(|arr| arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .collect())
+                        .unwrap_or_default();
+                    graph.add_repo(&name, deps);
+                }
+
+                graph.detect_circular();
+
+                if mermaid {
+                    println!("{}", graph.to_mermaid());
+                } else {
+                    println!("Repository Dependencies");
+                    println!("{}", "=".repeat(60));
+
+                    if graph.has_circular {
+                        println!("WARNING: Circular dependencies detected!");
+                        for path in &graph.circular_paths {
+                            println!("  Cycle: {} -> {}", path.join(" -> "), path.first().unwrap_or(&String::new()));
+                        }
+                        println!();
+                    }
+
+                    for (repo, deps) in &graph.repositories {
+                        if deps.is_empty() {
+                            println!("{}: (no dependencies)", repo);
+                        } else {
+                            println!("{}: depends on {}", repo, deps.join(", "));
+                        }
+                    }
+                }
+            }
+            RepoAction::Sync { repo } => {
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    println!("No repositories configured");
+                    return Ok(());
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                for r in &repos {
+                    let name = r["name"].as_str().unwrap_or("");
+                    if let Some(ref filter) = repo {
+                        if name != filter {
+                            continue;
+                        }
+                    }
+
+                    if let Some(path) = r["local_path"].as_str() {
+                        if std::path::Path::new(path).exists() {
+                            println!("Syncing {}...", name);
+                            let output = std::process::Command::new("git")
+                                .args(["pull", "--rebase"])
+                                .current_dir(path)
+                                .output();
+
+                            match output {
+                                Ok(o) if o.status.success() => {
+                                    println!("  ✓ Synced successfully");
+                                }
+                                Ok(o) => {
+                                    println!("  ✗ Sync failed: {}", String::from_utf8_lossy(&o.stderr));
+                                }
+                                Err(e) => {
+                                    println!("  ✗ Error: {}", e);
+                                }
+                            }
+                        } else {
+                            println!("Cloning {}...", name);
+                            if let Some(url) = r["url"].as_str() {
+                                let output = std::process::Command::new("git")
+                                    .args(["clone", url, path])
+                                    .output();
+
+                                match output {
+                                    Ok(o) if o.status.success() => {
+                                        println!("  ✓ Cloned successfully");
+                                    }
+                                    Ok(o) => {
+                                        println!("  ✗ Clone failed: {}", String::from_utf8_lossy(&o.stderr));
+                                    }
+                                    Err(e) => {
+                                        println!("  ✗ Error: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         },
