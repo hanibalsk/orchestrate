@@ -167,6 +167,11 @@ enum Commands {
         #[command(subcommand)]
         action: FeedbackAction,
     },
+    /// A/B experiment management
+    Experiment {
+        #[command(subcommand)]
+        action: ExperimentAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -445,6 +450,21 @@ enum LearnAction {
         /// Skip confirmation
         #[arg(short, long)]
         force: bool,
+    },
+    /// Analyze instruction effectiveness
+    Effectiveness {
+        /// Minimum usage count to include in analysis
+        #[arg(short = 'u', long, default_value = "1")]
+        min_usage: i64,
+        /// Include disabled instructions
+        #[arg(long)]
+        include_disabled: bool,
+        /// Show only ineffective instructions
+        #[arg(long)]
+        ineffective_only: bool,
+        /// Show summary statistics only
+        #[arg(long)]
+        summary: bool,
     },
 }
 
@@ -804,6 +824,100 @@ enum FeedbackAction {
     Delete {
         /// Feedback ID
         id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExperimentAction {
+    /// Create a new experiment
+    Create {
+        /// Experiment name (unique identifier)
+        name: String,
+        /// Experiment type (prompt, model, instruction, context, custom)
+        #[arg(short = 't', long, default_value = "prompt")]
+        experiment_type: String,
+        /// Primary metric (success_rate, completion_time, token_usage, cost, feedback_score)
+        #[arg(short, long, default_value = "success_rate")]
+        metric: String,
+        /// Optional description
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Optional hypothesis
+        #[arg(long)]
+        hypothesis: Option<String>,
+        /// Agent type filter
+        #[arg(short, long)]
+        agent_type: Option<String>,
+        /// Minimum samples for significance
+        #[arg(long, default_value = "100")]
+        min_samples: i64,
+        /// Confidence level (0.90, 0.95, 0.99)
+        #[arg(long, default_value = "0.95")]
+        confidence: f64,
+    },
+    /// Add a variant to an experiment
+    AddVariant {
+        /// Experiment name or ID
+        experiment: String,
+        /// Variant name
+        name: String,
+        /// Mark as control group
+        #[arg(long)]
+        control: bool,
+        /// Weight for traffic distribution (1-100)
+        #[arg(short, long, default_value = "50")]
+        weight: i32,
+        /// Optional description
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Configuration JSON
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// List experiments
+    List {
+        /// Filter by status (draft, running, paused, completed, cancelled)
+        #[arg(short, long)]
+        status: Option<String>,
+        /// Maximum results
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
+    /// Show experiment details and results
+    Show {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Start an experiment
+    Start {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Pause an experiment
+    Pause {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Complete an experiment
+    Complete {
+        /// Experiment name or ID
+        experiment: String,
+        /// Declare winner variant (optional, auto-calculated if omitted)
+        #[arg(long)]
+        winner: Option<String>,
+    },
+    /// Cancel an experiment
+    Cancel {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Delete an experiment
+    Delete {
+        /// Experiment name or ID
+        experiment: String,
+        /// Skip confirmation
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
@@ -1696,6 +1810,84 @@ async fn main() -> Result<()> {
                 let deleted = db.cleanup_old_success_patterns(days).await?;
                 println!("Deleted {} old success patterns", deleted);
             }
+            LearnAction::Effectiveness {
+                min_usage,
+                include_disabled,
+                ineffective_only,
+                summary,
+            } => {
+                if summary {
+                    // Show summary statistics
+                    let stats = db.get_effectiveness_summary().await?;
+                    println!("Instruction Effectiveness Summary");
+                    println!("{}", "=".repeat(40));
+                    println!("Total instructions:    {}", stats.total_instructions);
+                    println!("Enabled:               {}", stats.enabled_count);
+                    println!("Used (at least once):  {}", stats.used_count);
+                    println!("Total usage count:     {}", stats.total_usage);
+                    println!("Avg success rate:      {:.1}%", stats.avg_success_rate * 100.0);
+                    println!("Avg penalty score:     {:.2}", stats.avg_penalty_score);
+                    println!("Ineffective (< 50%):   {}", stats.ineffective_count);
+                } else if ineffective_only {
+                    // Show only ineffective instructions
+                    let instructions = db.list_ineffective_instructions(0.5, min_usage).await?;
+                    if instructions.is_empty() {
+                        println!("No ineffective instructions found (min usage: {})", min_usage);
+                        return Ok(());
+                    }
+
+                    println!("Ineffective Instructions (< 50% success rate)");
+                    println!("{}", "=".repeat(100));
+                    println!(
+                        "{:<6} {:<30} {:<10} {:<8} {:<10} {:<10} {:<10}",
+                        "ID", "NAME", "SOURCE", "ENABLED", "USAGE", "SUCCESS%", "PENALTY"
+                    );
+                    println!("{}", "-".repeat(100));
+
+                    for instr in instructions {
+                        println!(
+                            "{:<6} {:<30} {:<10} {:<8} {:<10} {:<10.1}% {:<10.2}",
+                            instr.instruction_id,
+                            truncate_str(&instr.name, 28),
+                            &instr.instruction_source,
+                            if instr.enabled { "yes" } else { "no" },
+                            instr.usage_count,
+                            instr.success_rate * 100.0,
+                            instr.penalty_score,
+                        );
+                    }
+                } else {
+                    // Show all instructions with effectiveness data
+                    let instructions = db.list_instruction_effectiveness(include_disabled, min_usage).await?;
+                    if instructions.is_empty() {
+                        println!("No instructions found (min usage: {})", min_usage);
+                        return Ok(());
+                    }
+
+                    println!("Instruction Effectiveness Analysis");
+                    println!("{}", "=".repeat(110));
+                    println!(
+                        "{:<6} {:<30} {:<10} {:<8} {:<8} {:<10} {:<10} {:<12}",
+                        "ID", "NAME", "SOURCE", "ENABLED", "USAGE", "SUCCESS%", "PENALTY", "LEVEL"
+                    );
+                    println!("{}", "-".repeat(110));
+
+                    for instr in instructions {
+                        let level = instr.effectiveness_level();
+                        println!(
+                            "{:<6} {:<30} {:<10} {:<8} {:<8} {:<10.1}% {:<10.2} {:<12}",
+                            instr.instruction_id,
+                            truncate_str(&instr.name, 28),
+                            &instr.instruction_source,
+                            if instr.enabled { "yes" } else { "no" },
+                            instr.usage_count,
+                            instr.success_rate * 100.0,
+                            instr.penalty_score,
+                            level,
+                        );
+                    }
+                }
+            }
         },
 
         Commands::History { action } => match action {
@@ -2511,6 +2703,264 @@ async fn main() -> Result<()> {
                 handle_feedback_delete(&db, id).await?;
             }
         },
+        Commands::Experiment { action } => match action {
+            ExperimentAction::Create {
+                name,
+                experiment_type,
+                metric,
+                description,
+                hypothesis,
+                agent_type,
+                min_samples,
+                confidence,
+            } => {
+                use std::str::FromStr;
+                let exp_type = orchestrate_core::ExperimentType::from_str(&experiment_type)?;
+                let exp_metric = orchestrate_core::ExperimentMetric::from_str(&metric)?;
+
+                let mut experiment = orchestrate_core::Experiment::new(name.clone(), exp_type, exp_metric)
+                    .with_min_samples(min_samples)
+                    .with_confidence_level(confidence);
+
+                if let Some(desc) = description {
+                    experiment = experiment.with_description(desc);
+                }
+                if let Some(hyp) = hypothesis {
+                    experiment = experiment.with_hypothesis(hyp);
+                }
+                if let Some(agent) = agent_type {
+                    experiment = experiment.with_agent_type(agent);
+                }
+
+                let id = db.create_experiment(&experiment).await?;
+                println!("Created experiment '{}' with ID {}", name, id);
+                println!("Add variants with: orchestrate experiment add-variant {} <name> --control", name);
+            }
+            ExperimentAction::AddVariant {
+                experiment,
+                name,
+                control,
+                weight,
+                description,
+                config,
+            } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+
+                let mut variant = orchestrate_core::ExperimentVariant::new(exp.id, name.clone(), control)
+                    .with_weight(weight);
+
+                if let Some(desc) = description {
+                    variant = variant.with_description(desc);
+                }
+                if let Some(cfg) = config {
+                    let parsed: serde_json::Value = serde_json::from_str(&cfg)
+                        .map_err(|e| anyhow::anyhow!("Invalid JSON config: {}", e))?;
+                    variant = variant.with_config(parsed);
+                }
+
+                let id = db.create_experiment_variant(&variant).await?;
+                let label = if control { " (control)" } else { "" };
+                println!("Added variant '{}'{} with ID {} to experiment '{}'", name, label, id, exp.name);
+            }
+            ExperimentAction::List { status, limit } => {
+                use std::str::FromStr;
+                let status_filter = status
+                    .map(|s| orchestrate_core::ExperimentStatus::from_str(&s))
+                    .transpose()?;
+
+                let experiments = db.list_experiments(status_filter, limit).await?;
+
+                if experiments.is_empty() {
+                    println!("No experiments found");
+                    return Ok(());
+                }
+
+                println!(
+                    "{:<6} {:<30} {:<10} {:<10} {:<12} {:<12}",
+                    "ID", "NAME", "TYPE", "STATUS", "METRIC", "SAMPLES"
+                );
+                println!("{}", "-".repeat(80));
+
+                for exp in experiments {
+                    let variants = db.get_experiment_variants(exp.id).await?;
+                    let results = db.get_experiment_results(exp.id).await?;
+                    let total_samples: i64 = results.iter().map(|r| r.sample_count).sum();
+
+                    println!(
+                        "{:<6} {:<30} {:<10} {:<10} {:<12} {:<12}",
+                        exp.id,
+                        truncate_str(&exp.name, 28),
+                        exp.experiment_type.as_str(),
+                        exp.status.as_str(),
+                        exp.metric.as_str(),
+                        format!("{}/{}", total_samples, exp.min_samples),
+                    );
+                }
+            }
+            ExperimentAction::Show { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                let variants = db.get_experiment_variants(exp.id).await?;
+                let results = db.get_experiment_results(exp.id).await?;
+
+                println!("Experiment: {}", exp.name);
+                println!("{}", "=".repeat(50));
+                println!("ID:          {}", exp.id);
+                println!("Type:        {}", exp.experiment_type);
+                println!("Metric:      {}", exp.metric);
+                println!("Status:      {}", exp.status);
+                if let Some(desc) = &exp.description {
+                    println!("Description: {}", desc);
+                }
+                if let Some(hyp) = &exp.hypothesis {
+                    println!("Hypothesis:  {}", hyp);
+                }
+                if let Some(agent) = &exp.agent_type {
+                    println!("Agent Type:  {}", agent);
+                }
+                println!("Min Samples: {}", exp.min_samples);
+                println!("Confidence:  {:.0}%", exp.confidence_level * 100.0);
+                println!("Created:     {}", exp.created_at.format("%Y-%m-%d %H:%M"));
+                if let Some(started) = exp.started_at {
+                    println!("Started:     {}", started.format("%Y-%m-%d %H:%M"));
+                }
+                if let Some(completed) = exp.completed_at {
+                    println!("Completed:   {}", completed.format("%Y-%m-%d %H:%M"));
+                }
+
+                println!("\nVariants:");
+                println!("{}", "-".repeat(70));
+                println!(
+                    "{:<6} {:<20} {:<10} {:<8} {:<10} {:<10} {:<10}",
+                    "ID", "NAME", "CONTROL", "WEIGHT", "SAMPLES", "MEAN", "STD DEV"
+                );
+                println!("{}", "-".repeat(70));
+
+                for variant in &variants {
+                    let result = results.iter().find(|r| r.variant_id == variant.id);
+                    let (samples, mean, std_dev) = result
+                        .map(|r| (r.sample_count, r.mean, r.std_dev))
+                        .unwrap_or((0, 0.0, 0.0));
+
+                    println!(
+                        "{:<6} {:<20} {:<10} {:<8} {:<10} {:<10.3} {:<10.3}",
+                        variant.id,
+                        truncate_str(&variant.name, 18),
+                        if variant.is_control { "yes" } else { "no" },
+                        format!("{}%", variant.weight),
+                        samples,
+                        mean,
+                        std_dev,
+                    );
+                }
+
+                // Calculate statistical significance if we have control and treatment
+                let control = results.iter().find(|r| r.is_control);
+                let treatments: Vec<_> = results.iter().filter(|r| !r.is_control).collect();
+
+                if let Some(ctrl) = control {
+                    println!("\nStatistical Analysis:");
+                    println!("{}", "-".repeat(50));
+
+                    for treatment in treatments {
+                        let (is_sig, p_value) = orchestrate_core::ExperimentResults::calculate_significance(
+                            ctrl,
+                            treatment,
+                            exp.confidence_level,
+                        );
+                        let improvement = orchestrate_core::ExperimentResults::calculate_improvement(
+                            ctrl.mean,
+                            treatment.mean,
+                        );
+
+                        println!("\n{} vs {} (control):", treatment.variant_name, ctrl.variant_name);
+                        println!("  Improvement: {:+.1}%", improvement);
+                        println!("  p-value:     {:.4}", p_value);
+                        println!(
+                            "  Significant: {} ({}% confidence)",
+                            if is_sig { "YES" } else { "NO" },
+                            (exp.confidence_level * 100.0) as i32
+                        );
+                    }
+                }
+
+                if let Some(winner_id) = exp.winner_variant_id {
+                    if let Some(winner) = variants.iter().find(|v| v.id == winner_id) {
+                        println!("\nWinner: {}", winner.name);
+                    }
+                }
+            }
+            ExperimentAction::Start { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                if !exp.can_start() {
+                    anyhow::bail!("Experiment is not in draft status");
+                }
+                let variants = db.get_experiment_variants(exp.id).await?;
+                if variants.len() < 2 {
+                    anyhow::bail!("Experiment needs at least 2 variants before starting");
+                }
+                if !variants.iter().any(|v| v.is_control) {
+                    anyhow::bail!("Experiment needs at least one control variant");
+                }
+
+                db.update_experiment_status(exp.id, orchestrate_core::ExperimentStatus::Running)
+                    .await?;
+                println!("Started experiment '{}'", exp.name);
+            }
+            ExperimentAction::Pause { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                if !exp.is_running() {
+                    anyhow::bail!("Experiment is not running");
+                }
+                db.update_experiment_status(exp.id, orchestrate_core::ExperimentStatus::Paused)
+                    .await?;
+                println!("Paused experiment '{}'", exp.name);
+            }
+            ExperimentAction::Complete { experiment, winner } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                let results = db.get_experiment_results(exp.id).await?;
+
+                let winner_variant = if let Some(winner_name) = winner {
+                    results
+                        .iter()
+                        .find(|r| r.variant_name == winner_name)
+                        .ok_or_else(|| anyhow::anyhow!("Variant '{}' not found", winner_name))?
+                } else {
+                    // Auto-select winner based on highest mean
+                    results
+                        .iter()
+                        .max_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap())
+                        .ok_or_else(|| anyhow::anyhow!("No results to determine winner"))?
+                };
+
+                db.set_experiment_winner(exp.id, winner_variant.variant_id).await?;
+                println!(
+                    "Completed experiment '{}' with winner: {}",
+                    exp.name, winner_variant.variant_name
+                );
+            }
+            ExperimentAction::Cancel { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                db.update_experiment_status(exp.id, orchestrate_core::ExperimentStatus::Cancelled)
+                    .await?;
+                println!("Cancelled experiment '{}'", exp.name);
+            }
+            ExperimentAction::Delete { experiment, force } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+
+                if !force && exp.is_running() {
+                    anyhow::bail!(
+                        "Experiment '{}' is still running. Use --force to delete anyway.",
+                        exp.name
+                    );
+                }
+
+                if db.delete_experiment(exp.id).await? {
+                    println!("Deleted experiment '{}'", exp.name);
+                } else {
+                    println!("Experiment not found");
+                }
+            }
+        },
     }
 
     Ok(())
@@ -2533,6 +2983,25 @@ async fn get_instruction_by_id_or_name(
     }
 
     anyhow::bail!("Instruction not found: {}", id_or_name)
+}
+
+async fn get_experiment_by_id_or_name(
+    db: &Database,
+    id_or_name: &str,
+) -> Result<orchestrate_core::Experiment> {
+    // Try parsing as ID first
+    if let Ok(id) = id_or_name.parse::<i64>() {
+        if let Some(exp) = db.get_experiment(id).await? {
+            return Ok(exp);
+        }
+    }
+
+    // Try as name
+    if let Some(exp) = db.get_experiment_by_name(id_or_name).await? {
+        return Ok(exp);
+    }
+
+    anyhow::bail!("Experiment not found: {}", id_or_name)
 }
 
 fn parse_agent_type(s: &str) -> Result<AgentType> {
@@ -4348,5 +4817,16 @@ async fn handle_feedback_delete(db: &Database, id: i64) -> Result<()> {
         println!("Feedback {} not found", id);
     }
     Ok(())
+}
+
+/// Truncate a string to max length, adding "..." if truncated
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len <= 3 {
+        s.chars().take(max_len).collect()
+    } else {
+        format!("{}...", &s[..max_len - 3])
+    }
 }
 

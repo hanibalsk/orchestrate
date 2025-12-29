@@ -21,6 +21,7 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 pub mod epic;
 pub mod error;
+pub mod experiment;
 pub mod feedback;
 pub mod instruction;
 pub mod learning;
@@ -40,7 +41,10 @@ pub mod webhook_config;
 pub mod worktree;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
-pub use database::{AgentStats, DailyTokenUsage, Database, TokenStats};
+pub use database::{
+    AgentStats, DailyTokenUsage, Database, EffectivenessAnalysisRow, EffectivenessSummary,
+    TokenStats,
+};
 pub use epic::{BmadPhase, Epic, EpicStatus, Story, StoryStatus};
 pub use error::{Error, Result};
 pub use message::{Message, MessageRole};
@@ -50,9 +54,9 @@ pub use worktree::{create_pr_worktree, Worktree, WorktreeStatus};
 
 // Re-export instruction types
 pub use instruction::{
-    CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
-    LearningConfig, LearningPattern, PatternStatus, PatternType, SuccessPattern,
-    SuccessPatternType,
+    CustomInstruction, EffectivenessAnalysis, InstructionEffectiveness, InstructionScope,
+    InstructionSource, LearningConfig, LearningPattern, PatternStatus, PatternType,
+    SuccessPattern, SuccessPatternType,
 };
 
 // Re-export learning types
@@ -60,6 +64,12 @@ pub use learning::{CleanupResult, LearningEngine, SuccessRecommendations};
 
 // Re-export feedback types
 pub use feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
+
+// Re-export experiment types
+pub use experiment::{
+    Experiment, ExperimentAssignment, ExperimentMetric, ExperimentObservation, ExperimentResults,
+    ExperimentStatus, ExperimentType, ExperimentVariant, VariantResults,
+};
 
 // Re-export network types
 pub use network::{

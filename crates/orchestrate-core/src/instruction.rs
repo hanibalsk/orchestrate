@@ -254,6 +254,127 @@ impl InstructionEffectiveness {
     pub fn is_eligible_for_deletion(&self) -> bool {
         self.penalty_score >= 1.0 && self.usage_count >= 10 && self.success_rate < 0.3
     }
+
+    /// Calculate weighted effectiveness score
+    /// Uses the formula: 0.7 * recent + 0.2 * historical + 0.1 * feedback
+    pub fn calculate_weighted_effectiveness(
+        &self,
+        recent_success_rate: f64,
+        feedback_score: f64,
+    ) -> f64 {
+        const RECENT_WEIGHT: f64 = 0.7;
+        const HISTORICAL_WEIGHT: f64 = 0.2;
+        const FEEDBACK_WEIGHT: f64 = 0.1;
+
+        RECENT_WEIGHT * recent_success_rate
+            + HISTORICAL_WEIGHT * self.success_rate
+            + FEEDBACK_WEIGHT * ((feedback_score + 1.0) / 2.0) // Normalize -1..1 to 0..1
+    }
+
+    /// Check if instruction is ineffective based on multiple criteria
+    pub fn is_ineffective(&self) -> bool {
+        // Low success rate with sufficient usage
+        let low_success = self.usage_count >= 5 && self.success_rate < 0.4;
+
+        // High penalty score
+        let high_penalty = self.penalty_score >= 0.5;
+
+        // No recent successes (if we have any usage)
+        let no_recent_success = self.usage_count >= 3
+            && self.last_success_at.is_none()
+            && self.last_failure_at.is_some();
+
+        low_success || high_penalty || no_recent_success
+    }
+
+    /// Get effectiveness level as a string
+    pub fn effectiveness_level(&self) -> &'static str {
+        if self.usage_count < 3 {
+            "insufficient_data"
+        } else if self.success_rate >= 0.8 {
+            "excellent"
+        } else if self.success_rate >= 0.6 {
+            "good"
+        } else if self.success_rate >= 0.4 {
+            "moderate"
+        } else {
+            "poor"
+        }
+    }
+}
+
+/// Detailed effectiveness analysis for an instruction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectivenessAnalysis {
+    /// Instruction ID
+    pub instruction_id: i64,
+    /// Instruction name
+    pub instruction_name: String,
+    /// Overall effectiveness score (0.0-1.0)
+    pub overall_score: f64,
+    /// Recent success rate (last 7 days)
+    pub recent_success_rate: f64,
+    /// Historical success rate (all time)
+    pub historical_success_rate: f64,
+    /// Feedback score (-1.0 to 1.0)
+    pub feedback_score: f64,
+    /// Total usage count
+    pub usage_count: i64,
+    /// Recent usage count (last 7 days)
+    pub recent_usage_count: i64,
+    /// Effectiveness level
+    pub level: String,
+    /// Whether the instruction is considered ineffective
+    pub is_ineffective: bool,
+    /// Improvement suggestions
+    pub suggestions: Vec<String>,
+}
+
+impl EffectivenessAnalysis {
+    /// Generate improvement suggestions based on the analysis
+    pub fn generate_suggestions(&mut self) {
+        self.suggestions.clear();
+
+        if self.usage_count < 5 {
+            self.suggestions
+                .push("Needs more usage data for reliable analysis".to_string());
+            return;
+        }
+
+        if self.recent_success_rate < self.historical_success_rate * 0.8 {
+            self.suggestions.push(
+                "Recent performance declining - review if instruction is still relevant"
+                    .to_string(),
+            );
+        }
+
+        if self.feedback_score < -0.3 {
+            self.suggestions
+                .push("Negative user feedback - consider revising instruction content".to_string());
+        }
+
+        if self.historical_success_rate < 0.5 {
+            self.suggestions.push(
+                "Low overall success rate - instruction may be too vague or incorrect".to_string(),
+            );
+        }
+
+        if self.recent_usage_count == 0 && self.usage_count > 10 {
+            self.suggestions.push(
+                "No recent usage - instruction may be outdated or redundant".to_string(),
+            );
+        }
+
+        if self.is_ineffective {
+            self.suggestions
+                .push("Consider disabling or revising this instruction".to_string());
+        }
+
+        if self.suggestions.is_empty() && self.overall_score >= 0.7 {
+            self.suggestions
+                .push("Performing well - no changes recommended".to_string());
+        }
+    }
 }
 
 /// Penalty constants

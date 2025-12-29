@@ -6,6 +6,10 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
+use crate::experiment::{
+    Experiment, ExperimentMetric, ExperimentStatus, ExperimentType, ExperimentVariant,
+    VariantResults,
+};
 use crate::feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
 use crate::instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
@@ -1929,6 +1933,580 @@ impl Database {
             .await?;
 
         Ok(result.rows_affected() as usize)
+    }
+
+    // ==================== Effectiveness Analysis Operations ====================
+
+    /// Get recent success rate for an instruction (last N days)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_recent_instruction_success_rate(
+        &self,
+        instruction_id: i64,
+        days: i64,
+    ) -> Result<Option<f64>> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        // Check success_patterns for recent outcomes with this instruction
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            SELECT
+                COUNT(CASE WHEN sp.outcome = 'success' THEN 1 END) as successes,
+                COUNT(*) as total
+            FROM success_patterns sp
+            WHERE sp.instruction_ids LIKE '%' || ? || '%'
+            AND sp.detected_at > ?
+            "#,
+        )
+        .bind(instruction_id)
+        .bind(&cutoff_str)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(successes, total)| {
+            if total > 0 {
+                successes as f64 / total as f64
+            } else {
+                // Fall back to overall effectiveness
+                0.5 // Default neutral if no recent data
+            }
+        }))
+    }
+
+    /// Get feedback score for an instruction (-1.0 to 1.0)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_instruction_feedback_score(&self, instruction_id: i64) -> Result<f64> {
+        // Get feedback for agents that used this instruction
+        let row = sqlx::query_as::<_, (i64, i64, i64)>(
+            r#"
+            SELECT
+                COUNT(CASE WHEN f.rating = 'positive' THEN 1 END) as positive,
+                COUNT(CASE WHEN f.rating = 'negative' THEN 1 END) as negative,
+                COUNT(CASE WHEN f.rating = 'neutral' THEN 1 END) as neutral
+            FROM feedback f
+            WHERE f.agent_id IN (
+                SELECT DISTINCT a.id FROM agents a
+                JOIN sessions s ON a.session_id = s.id
+                WHERE s.instructions_used LIKE '%' || ? || '%'
+            )
+            "#,
+        )
+        .bind(instruction_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map_or(0.0, |(pos, neg, neu)| {
+            let total = pos + neg + neu;
+            if total > 0 {
+                // Score from -1 (all negative) to +1 (all positive)
+                (pos as f64 - neg as f64) / total as f64
+            } else {
+                0.0
+            }
+        }))
+    }
+
+    /// Get comprehensive effectiveness analysis for an instruction
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_instruction_effectiveness_analysis(
+        &self,
+        instruction_id: i64,
+    ) -> Result<Option<EffectivenessAnalysisRow>> {
+        let row = sqlx::query_as::<_, EffectivenessAnalysisRow>(
+            r#"
+            SELECT
+                ci.id as instruction_id,
+                ci.name,
+                ci.source as instruction_source,
+                ci.enabled,
+                COALESCE(ie.usage_count, 0) as usage_count,
+                COALESCE(ie.success_count, 0) as success_count,
+                COALESCE(ie.failure_count, 0) as failure_count,
+                COALESCE(ie.penalty_score, 0.0) as penalty_score,
+                COALESCE(ie.avg_completion_time, 0.0) as avg_completion_time,
+                CASE WHEN COALESCE(ie.usage_count, 0) > 0
+                    THEN CAST(ie.success_count AS REAL) / ie.usage_count
+                    ELSE 0.0
+                END as success_rate,
+                ie.last_success_at,
+                ie.last_failure_at,
+                ie.updated_at
+            FROM custom_instructions ci
+            LEFT JOIN instruction_effectiveness ie ON ci.id = ie.instruction_id
+            WHERE ci.id = ?
+            "#,
+        )
+        .bind(instruction_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    /// List all instructions with their effectiveness analysis
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_instruction_effectiveness(
+        &self,
+        include_disabled: bool,
+        min_usage: i64,
+    ) -> Result<Vec<EffectivenessAnalysisRow>> {
+        let query = if include_disabled {
+            r#"
+            SELECT
+                ci.id as instruction_id,
+                ci.name,
+                ci.source as instruction_source,
+                ci.enabled,
+                COALESCE(ie.usage_count, 0) as usage_count,
+                COALESCE(ie.success_count, 0) as success_count,
+                COALESCE(ie.failure_count, 0) as failure_count,
+                COALESCE(ie.penalty_score, 0.0) as penalty_score,
+                COALESCE(ie.avg_completion_time, 0.0) as avg_completion_time,
+                CASE WHEN COALESCE(ie.usage_count, 0) > 0
+                    THEN CAST(ie.success_count AS REAL) / ie.usage_count
+                    ELSE 0.0
+                END as success_rate,
+                ie.last_success_at,
+                ie.last_failure_at,
+                ie.updated_at
+            FROM custom_instructions ci
+            LEFT JOIN instruction_effectiveness ie ON ci.id = ie.instruction_id
+            WHERE COALESCE(ie.usage_count, 0) >= ?
+            ORDER BY success_rate ASC, penalty_score DESC
+            "#
+        } else {
+            r#"
+            SELECT
+                ci.id as instruction_id,
+                ci.name,
+                ci.source as instruction_source,
+                ci.enabled,
+                COALESCE(ie.usage_count, 0) as usage_count,
+                COALESCE(ie.success_count, 0) as success_count,
+                COALESCE(ie.failure_count, 0) as failure_count,
+                COALESCE(ie.penalty_score, 0.0) as penalty_score,
+                COALESCE(ie.avg_completion_time, 0.0) as avg_completion_time,
+                CASE WHEN COALESCE(ie.usage_count, 0) > 0
+                    THEN CAST(ie.success_count AS REAL) / ie.usage_count
+                    ELSE 0.0
+                END as success_rate,
+                ie.last_success_at,
+                ie.last_failure_at,
+                ie.updated_at
+            FROM custom_instructions ci
+            LEFT JOIN instruction_effectiveness ie ON ci.id = ie.instruction_id
+            WHERE ci.enabled = 1 AND COALESCE(ie.usage_count, 0) >= ?
+            ORDER BY success_rate ASC, penalty_score DESC
+            "#
+        };
+
+        let rows = sqlx::query_as::<_, EffectivenessAnalysisRow>(query)
+            .bind(min_usage)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows)
+    }
+
+    /// List ineffective instructions (low success rate + high penalty)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_ineffective_instructions(
+        &self,
+        success_rate_threshold: f64,
+        min_usage: i64,
+    ) -> Result<Vec<EffectivenessAnalysisRow>> {
+        let rows = sqlx::query_as::<_, EffectivenessAnalysisRow>(
+            r#"
+            SELECT
+                ci.id as instruction_id,
+                ci.name,
+                ci.source as instruction_source,
+                ci.enabled,
+                COALESCE(ie.usage_count, 0) as usage_count,
+                COALESCE(ie.success_count, 0) as success_count,
+                COALESCE(ie.failure_count, 0) as failure_count,
+                COALESCE(ie.penalty_score, 0.0) as penalty_score,
+                COALESCE(ie.avg_completion_time, 0.0) as avg_completion_time,
+                CASE WHEN COALESCE(ie.usage_count, 0) > 0
+                    THEN CAST(ie.success_count AS REAL) / ie.usage_count
+                    ELSE 0.0
+                END as success_rate,
+                ie.last_success_at,
+                ie.last_failure_at,
+                ie.updated_at
+            FROM custom_instructions ci
+            LEFT JOIN instruction_effectiveness ie ON ci.id = ie.instruction_id
+            WHERE COALESCE(ie.usage_count, 0) >= ?
+            AND (
+                CASE WHEN COALESCE(ie.usage_count, 0) > 0
+                    THEN CAST(ie.success_count AS REAL) / ie.usage_count
+                    ELSE 0.0
+                END
+            ) < ?
+            ORDER BY success_rate ASC, penalty_score DESC
+            "#,
+        )
+        .bind(min_usage)
+        .bind(success_rate_threshold)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Get effectiveness summary stats
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_effectiveness_summary(&self) -> Result<EffectivenessSummary> {
+        let row = sqlx::query_as::<_, EffectivenessSummaryRow>(
+            r#"
+            SELECT
+                COUNT(*) as total_instructions,
+                COUNT(CASE WHEN ci.enabled = 1 THEN 1 END) as enabled_count,
+                COUNT(CASE WHEN ie.usage_count > 0 THEN 1 END) as used_count,
+                COALESCE(AVG(CASE WHEN ie.usage_count > 0
+                    THEN CAST(ie.success_count AS REAL) / ie.usage_count
+                    ELSE NULL END), 0) as avg_success_rate,
+                COALESCE(AVG(ie.penalty_score), 0) as avg_penalty_score,
+                COALESCE(SUM(ie.usage_count), 0) as total_usage,
+                COUNT(CASE WHEN ie.usage_count >= 5 AND
+                    CAST(ie.success_count AS REAL) / NULLIF(ie.usage_count, 0) < 0.5 THEN 1 END) as ineffective_count
+            FROM custom_instructions ci
+            LEFT JOIN instruction_effectiveness ie ON ci.id = ie.instruction_id
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(EffectivenessSummary {
+            total_instructions: row.total_instructions,
+            enabled_count: row.enabled_count,
+            used_count: row.used_count,
+            avg_success_rate: row.avg_success_rate,
+            avg_penalty_score: row.avg_penalty_score,
+            total_usage: row.total_usage,
+            ineffective_count: row.ineffective_count,
+        })
+    }
+
+    // ==================== Experiment Operations ====================
+
+    /// Create a new experiment
+    #[tracing::instrument(skip(self, experiment), level = "debug", fields(name = %experiment.name))]
+    pub async fn create_experiment(&self, experiment: &Experiment) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO experiments (name, description, hypothesis, experiment_type, metric, agent_type, status, min_samples, confidence_level, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&experiment.name)
+        .bind(&experiment.description)
+        .bind(&experiment.hypothesis)
+        .bind(experiment.experiment_type.as_str())
+        .bind(experiment.metric.as_str())
+        .bind(&experiment.agent_type)
+        .bind(experiment.status.as_str())
+        .bind(experiment.min_samples)
+        .bind(experiment.confidence_level)
+        .bind(experiment.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get an experiment by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_experiment(&self, id: i64) -> Result<Option<Experiment>> {
+        let row = sqlx::query_as::<_, ExperimentRow>("SELECT * FROM experiments WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get an experiment by name
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_experiment_by_name(&self, name: &str) -> Result<Option<Experiment>> {
+        let row = sqlx::query_as::<_, ExperimentRow>("SELECT * FROM experiments WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List experiments with optional status filter
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_experiments(
+        &self,
+        status: Option<ExperimentStatus>,
+        limit: i64,
+    ) -> Result<Vec<Experiment>> {
+        let rows = if let Some(status) = status {
+            sqlx::query_as::<_, ExperimentRow>(
+                "SELECT * FROM experiments WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+            )
+            .bind(status.as_str())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ExperimentRow>(
+                "SELECT * FROM experiments ORDER BY created_at DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update experiment status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_experiment_status(
+        &self,
+        id: i64,
+        status: ExperimentStatus,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let (started_update, completed_update) = match status {
+            ExperimentStatus::Running => (", started_at = ?", ""),
+            ExperimentStatus::Completed | ExperimentStatus::Cancelled => ("", ", completed_at = ?"),
+            _ => ("", ""),
+        };
+
+        let query = format!(
+            "UPDATE experiments SET status = ?{}{} WHERE id = ?",
+            started_update, completed_update
+        );
+
+        let mut q = sqlx::query(&query).bind(status.as_str());
+
+        if !started_update.is_empty() || !completed_update.is_empty() {
+            q = q.bind(&now);
+        }
+
+        q.bind(id).execute(&self.pool).await?;
+
+        Ok(())
+    }
+
+    /// Set experiment winner
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn set_experiment_winner(&self, experiment_id: i64, variant_id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE experiments SET winner_variant_id = ?, status = 'completed', completed_at = ? WHERE id = ?",
+        )
+        .bind(variant_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(experiment_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Create an experiment variant
+    #[tracing::instrument(skip(self, variant), level = "debug", fields(name = %variant.name))]
+    pub async fn create_experiment_variant(&self, variant: &ExperimentVariant) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO experiment_variants (experiment_id, name, description, is_control, weight, config, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(variant.experiment_id)
+        .bind(&variant.name)
+        .bind(&variant.description)
+        .bind(variant.is_control)
+        .bind(variant.weight)
+        .bind(variant.config.to_string())
+        .bind(variant.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get variants for an experiment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_experiment_variants(&self, experiment_id: i64) -> Result<Vec<ExperimentVariant>> {
+        let rows = sqlx::query_as::<_, ExperimentVariantRow>(
+            "SELECT * FROM experiment_variants WHERE experiment_id = ? ORDER BY is_control DESC, id",
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Assign an agent to a variant (random weighted selection)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn assign_agent_to_experiment(
+        &self,
+        experiment_id: i64,
+        agent_id: Uuid,
+    ) -> Result<Option<ExperimentVariant>> {
+        // Check if already assigned
+        let existing = sqlx::query_scalar::<_, i64>(
+            "SELECT variant_id FROM experiment_assignments WHERE experiment_id = ? AND agent_id = ?",
+        )
+        .bind(experiment_id)
+        .bind(agent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(variant_id) = existing {
+            // Return existing assignment
+            let row = sqlx::query_as::<_, ExperimentVariantRow>(
+                "SELECT * FROM experiment_variants WHERE id = ?",
+            )
+            .bind(variant_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            return row.map(|r| r.try_into()).transpose();
+        }
+
+        // Get variants and their weights
+        let variants = self.get_experiment_variants(experiment_id).await?;
+        if variants.is_empty() {
+            return Ok(None);
+        }
+
+        // Random weighted selection
+        let total_weight: i32 = variants.iter().map(|v| v.weight).sum();
+        let mut random_value = (rand::random::<f64>() * total_weight as f64) as i32;
+
+        let mut selected_variant = &variants[0];
+        for variant in &variants {
+            random_value -= variant.weight;
+            if random_value <= 0 {
+                selected_variant = variant;
+                break;
+            }
+        }
+
+        // Create assignment
+        sqlx::query(
+            "INSERT INTO experiment_assignments (experiment_id, variant_id, agent_id, assigned_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(experiment_id)
+        .bind(selected_variant.id)
+        .bind(agent_id.to_string())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Some(selected_variant.clone()))
+    }
+
+    /// Record an observation for an experiment assignment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn record_experiment_observation(
+        &self,
+        experiment_id: i64,
+        agent_id: Uuid,
+        metric_name: &str,
+        metric_value: f64,
+    ) -> Result<()> {
+        // Get assignment ID
+        let assignment_id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM experiment_assignments WHERE experiment_id = ? AND agent_id = ?",
+        )
+        .bind(experiment_id)
+        .bind(agent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(assignment_id) = assignment_id else {
+            return Err(crate::Error::Other(format!(
+                "No experiment assignment found for agent {}",
+                agent_id
+            )));
+        };
+
+        sqlx::query(
+            "INSERT INTO experiment_observations (assignment_id, metric_name, metric_value, recorded_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(assignment_id)
+        .bind(metric_name)
+        .bind(metric_value)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get aggregated results for an experiment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_experiment_results(&self, experiment_id: i64) -> Result<Vec<VariantResults>> {
+        let rows = sqlx::query_as::<_, VariantResultsRow>(
+            r#"
+            SELECT
+                v.id as variant_id,
+                v.name as variant_name,
+                v.is_control,
+                COUNT(o.id) as sample_count,
+                COALESCE(AVG(o.metric_value), 0) as mean,
+                COALESCE(
+                    SQRT(AVG(o.metric_value * o.metric_value) - AVG(o.metric_value) * AVG(o.metric_value)),
+                    0
+                ) as std_dev,
+                COALESCE(MIN(o.metric_value), 0) as min_value,
+                COALESCE(MAX(o.metric_value), 0) as max_value,
+                SUM(CASE WHEN o.metric_value >= 1.0 THEN 1 ELSE 0 END) as success_count
+            FROM experiment_variants v
+            LEFT JOIN experiment_assignments a ON v.id = a.variant_id
+            LEFT JOIN experiment_observations o ON a.id = o.assignment_id
+            WHERE v.experiment_id = ?
+            GROUP BY v.id, v.name, v.is_control
+            ORDER BY v.is_control DESC, v.id
+            "#,
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    /// Get count of running experiments for an agent type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_running_experiments_for_agent_type(
+        &self,
+        agent_type: &str,
+    ) -> Result<Vec<Experiment>> {
+        let rows = sqlx::query_as::<_, ExperimentRow>(
+            r#"
+            SELECT * FROM experiments
+            WHERE status = 'running'
+            AND (agent_type = ? OR agent_type IS NULL)
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(agent_type)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Delete an experiment and all related data
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_experiment(&self, id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM experiments WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     // ==================== Token Tracking Operations ====================
@@ -4274,4 +4852,193 @@ struct FeedbackStatsByTypeRow {
     positive: i64,
     negative: i64,
     neutral: i64,
+}
+
+// ==================== Effectiveness Analysis Row Structs ====================
+
+/// Row for effectiveness analysis queries
+#[derive(sqlx::FromRow, Debug, Clone)]
+pub struct EffectivenessAnalysisRow {
+    pub instruction_id: i64,
+    pub name: String,
+    pub instruction_source: String,
+    pub enabled: bool,
+    pub usage_count: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub penalty_score: f64,
+    pub avg_completion_time: f64,
+    pub success_rate: f64,
+    pub last_success_at: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl EffectivenessAnalysisRow {
+    /// Get the effectiveness level as a string
+    pub fn effectiveness_level(&self) -> &'static str {
+        if self.usage_count < 5 {
+            "insufficient_data"
+        } else if self.success_rate >= 0.8 {
+            "high"
+        } else if self.success_rate >= 0.5 {
+            "medium"
+        } else if self.success_rate >= 0.3 {
+            "low"
+        } else {
+            "very_low"
+        }
+    }
+
+    /// Check if this instruction is considered ineffective
+    pub fn is_ineffective(&self) -> bool {
+        self.usage_count >= 5 && self.success_rate < 0.5
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct EffectivenessSummaryRow {
+    total_instructions: i64,
+    enabled_count: i64,
+    used_count: i64,
+    avg_success_rate: f64,
+    avg_penalty_score: f64,
+    total_usage: i64,
+    ineffective_count: i64,
+}
+
+/// Summary of instruction effectiveness across the system
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EffectivenessSummary {
+    pub total_instructions: i64,
+    pub enabled_count: i64,
+    pub used_count: i64,
+    pub avg_success_rate: f64,
+    pub avg_penalty_score: f64,
+    pub total_usage: i64,
+    pub ineffective_count: i64,
+}
+
+// ==================== Experiment Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct ExperimentRow {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    hypothesis: Option<String>,
+    experiment_type: String,
+    metric: String,
+    agent_type: Option<String>,
+    status: String,
+    min_samples: i64,
+    confidence_level: f64,
+    created_at: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    winner_variant_id: Option<i64>,
+}
+
+impl TryFrom<ExperimentRow> for Experiment {
+    type Error = crate::Error;
+
+    fn try_from(row: ExperimentRow) -> Result<Self> {
+        use std::str::FromStr;
+        Ok(Experiment {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            hypothesis: row.hypothesis,
+            experiment_type: ExperimentType::from_str(&row.experiment_type)?,
+            metric: ExperimentMetric::from_str(&row.metric)?,
+            agent_type: row.agent_type,
+            status: ExperimentStatus::from_str(&row.status)?,
+            min_samples: row.min_samples,
+            confidence_level: row.confidence_level,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            started_at: row
+                .started_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            winner_variant_id: row.winner_variant_id,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ExperimentVariantRow {
+    id: i64,
+    experiment_id: i64,
+    name: String,
+    description: Option<String>,
+    is_control: bool,
+    weight: i32,
+    config: String,
+    created_at: String,
+}
+
+impl TryFrom<ExperimentVariantRow> for ExperimentVariant {
+    type Error = crate::Error;
+
+    fn try_from(row: ExperimentVariantRow) -> Result<Self> {
+        Ok(ExperimentVariant {
+            id: row.id,
+            experiment_id: row.experiment_id,
+            name: row.name,
+            description: row.description,
+            is_control: row.is_control,
+            weight: row.weight,
+            config: serde_json::from_str(&row.config)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct VariantResultsRow {
+    variant_id: i64,
+    variant_name: String,
+    is_control: bool,
+    sample_count: i64,
+    mean: f64,
+    std_dev: f64,
+    min_value: f64,
+    max_value: f64,
+    success_count: Option<i64>,
+}
+
+impl From<VariantResultsRow> for VariantResults {
+    fn from(row: VariantResultsRow) -> Self {
+        let success_rate = if row.sample_count > 0 {
+            row.success_count.map(|c| c as f64 / row.sample_count as f64)
+        } else {
+            None
+        };
+
+        VariantResults {
+            variant_id: row.variant_id,
+            variant_name: row.variant_name,
+            is_control: row.is_control,
+            sample_count: row.sample_count,
+            mean: row.mean,
+            std_dev: row.std_dev,
+            min_value: row.min_value,
+            max_value: row.max_value,
+            success_count: row.success_count,
+            success_rate,
+        }
+    }
 }
