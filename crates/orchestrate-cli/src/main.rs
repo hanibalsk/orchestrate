@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use orchestrate_claude::{AgentLoop, ClaudeCliClient, ClaudeClient};
 use orchestrate_core::{
     Agent, AgentState, AgentType, CustomInstruction, Database, Epic, EpicStatus,
-    LearningEngine, PatternStatus, ShellState, Story, StoryStatus, Worktree,
+    LearningEngine, PatternStatus, Schedule, ScheduleRun, ShellState, Story, StoryStatus, Worktree,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,6 +140,11 @@ enum Commands {
     Tokens {
         #[command(subcommand)]
         action: TokensAction,
+    },
+    /// Schedule management
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
     },
 }
 
@@ -476,6 +481,60 @@ enum TokensAction {
         /// Number of days to analyze
         #[arg(short, long, default_value = "30")]
         days: i32,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Add a new schedule
+    Add {
+        /// Schedule name
+        #[arg(short, long)]
+        name: String,
+        /// Cron expression
+        #[arg(short, long)]
+        cron: String,
+        /// Agent type
+        #[arg(short, long)]
+        agent: String,
+        /// Task description
+        #[arg(short, long)]
+        task: String,
+    },
+    /// List all schedules
+    List,
+    /// Show schedule details
+    Show {
+        /// Schedule name
+        name: String,
+    },
+    /// Pause a schedule
+    Pause {
+        /// Schedule name
+        name: String,
+    },
+    /// Resume a schedule
+    Resume {
+        /// Schedule name
+        name: String,
+    },
+    /// Delete a schedule
+    Delete {
+        /// Schedule name
+        name: String,
+    },
+    /// Run a schedule immediately
+    RunNow {
+        /// Schedule name
+        name: String,
+    },
+    /// Show schedule execution history
+    History {
+        /// Schedule name
+        name: String,
+        /// Number of runs to show
+        #[arg(short, long, default_value = "10")]
+        limit: i64,
     },
 }
 
@@ -1695,6 +1754,198 @@ async fn main() -> Result<()> {
                     format!("${:.4}", total_cost / usage.len() as f64)
                 );
                 println!("╚══════════════════════════════════════════════════════════════╝");
+            }
+        },
+
+        Commands::Schedule { action } => match action {
+            ScheduleAction::Add {
+                name,
+                cron,
+                agent,
+                task,
+            } => {
+                // Create and validate schedule
+                let mut schedule = Schedule::new(name.clone(), cron.clone(), agent.clone(), task.clone());
+
+                // Validate cron expression
+                if let Err(e) = schedule.validate_cron() {
+                    anyhow::bail!("Invalid cron expression: {}", e);
+                }
+
+                // Check if schedule with this name already exists
+                if db.get_schedule_by_name(&name).await?.is_some() {
+                    anyhow::bail!("Schedule '{}' already exists", name);
+                }
+
+                // Calculate next run
+                schedule.update_next_run()?;
+
+                // Insert into database
+                let id = db.insert_schedule(&schedule).await?;
+
+                println!("Schedule '{}' added successfully (ID: {})", name, id);
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+            }
+
+            ScheduleAction::List => {
+                let schedules = db.list_schedules(false).await?;
+
+                if schedules.is_empty() {
+                    println!("No schedules found");
+                    return Ok(());
+                }
+
+                println!("{:<20} {:<15} {:<20} {:<10} {:<25}", "NAME", "CRON", "AGENT", "STATUS", "NEXT RUN");
+                println!("{}", "-".repeat(100));
+
+                for schedule in schedules {
+                    let status = if schedule.enabled { "enabled" } else { "disabled" };
+                    let next_run = schedule.next_run
+                        .map(|nr| nr.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "-".to_string());
+
+                    println!(
+                        "{:<20} {:<15} {:<20} {:<10} {:<25}",
+                        schedule.name,
+                        schedule.cron_expression,
+                        schedule.agent_type,
+                        status,
+                        next_run
+                    );
+                }
+            }
+
+            ScheduleAction::Show { name } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                println!("Schedule: {}", schedule.name);
+                println!("Cron: {}", schedule.cron_expression);
+                println!("Agent: {}", schedule.agent_type);
+                println!("Task: {}", schedule.task);
+                println!("Enabled: {}", schedule.enabled);
+                println!("Created: {}", schedule.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+
+                if let Some(last_run) = schedule.last_run {
+                    println!("Last run: {}", last_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+
+                // Show recent runs
+                let runs = db.get_schedule_runs(schedule.id, 5).await?;
+                if !runs.is_empty() {
+                    println!("\nRecent executions:");
+                    for run in runs {
+                        let status = format!("{:?}", run.status);
+                        let duration = run.completed_at
+                            .map(|c| format!("{:.1}s", c.signed_duration_since(run.started_at).num_milliseconds() as f64 / 1000.0))
+                            .unwrap_or_else(|| "-".to_string());
+                        println!("  {} - {} ({})",
+                            run.started_at.format("%Y-%m-%d %H:%M:%S"),
+                            status,
+                            duration
+                        );
+                    }
+                }
+            }
+
+            ScheduleAction::Pause { name } => {
+                let mut schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                schedule.enabled = false;
+                db.update_schedule(&schedule).await?;
+
+                println!("Schedule '{}' paused", name);
+            }
+
+            ScheduleAction::Resume { name } => {
+                let mut schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                schedule.enabled = true;
+                // Recalculate next run when resuming
+                schedule.update_next_run()?;
+                db.update_schedule(&schedule).await?;
+
+                println!("Schedule '{}' resumed", name);
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+            }
+
+            ScheduleAction::Delete { name } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                let deleted = db.delete_schedule(schedule.id).await?;
+
+                if deleted {
+                    println!("Schedule '{}' deleted", name);
+                } else {
+                    println!("Failed to delete schedule '{}'", name);
+                }
+            }
+
+            ScheduleAction::RunNow { name } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                // Create a schedule run record
+                let mut run = ScheduleRun::new(schedule.id);
+                let run_id = db.insert_schedule_run(&run).await?;
+
+                // Spawn the agent
+                let agent_type = parse_agent_type(&schedule.agent_type)?;
+                let agent = Agent::new(agent_type, schedule.task.clone());
+                db.insert_agent(&agent).await?;
+
+                // Update run record with agent ID
+                run.mark_completed(agent.id.to_string());
+                db.update_schedule_run(&run).await?;
+
+                println!("Triggered schedule '{}' (run ID: {}, agent ID: {})", name, run_id, agent.id);
+            }
+
+            ScheduleAction::History { name, limit } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                let runs = db.get_schedule_runs(schedule.id, limit).await?;
+
+                if runs.is_empty() {
+                    println!("No execution history for schedule '{}'", name);
+                    return Ok(());
+                }
+
+                println!("Execution history for '{}' (last {} runs)", name, limit);
+                println!("{:<20} {:<15} {:<38} {:<10}", "STARTED", "STATUS", "AGENT", "DURATION");
+                println!("{}", "-".repeat(90));
+
+                for run in runs {
+                    let status = format!("{:?}", run.status);
+                    let agent_id = run.agent_id.as_deref().unwrap_or("-");
+                    let duration = run.completed_at
+                        .map(|c| format!("{:.1}s", c.signed_duration_since(run.started_at).num_milliseconds() as f64 / 1000.0))
+                        .unwrap_or_else(|| "-".to_string());
+
+                    println!(
+                        "{:<20} {:<15} {:<38} {:<10}",
+                        run.started_at.format("%Y-%m-%d %H:%M:%S"),
+                        status,
+                        agent_id,
+                        duration
+                    );
+
+                    if let Some(error) = &run.error_message {
+                        println!("  Error: {}", error);
+                    }
+                }
             }
         },
     }

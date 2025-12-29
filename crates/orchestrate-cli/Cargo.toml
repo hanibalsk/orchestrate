@@ -28,3 +28,8 @@ chrono.workspace = true
 shellexpand.workspace = true
 axum.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.0"
+tempfile = "3.8"
