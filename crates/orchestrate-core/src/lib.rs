@@ -30,6 +30,7 @@ pub mod release_management;
 pub mod post_deploy_verification;
 pub mod pre_deploy_validation;
 pub mod error;
+pub mod feature_flags;
 pub mod feedback;
 pub mod instruction;
 pub mod learning;
@@ -154,4 +155,9 @@ pub use deployment_rollback::{
 pub use release_management::{
     BumpType, Changelog, ChangelogEntry, Commit, CommitType, ReleaseAsset, ReleaseManager,
     ReleasePreparation, ReleaseRequest, Version,
+};
+
+// Re-export feature flags types
+pub use feature_flags::{
+    CreateFeatureFlag, FeatureFlag, FlagStatus, UpdateFeatureFlag,
 };

@@ -4,10 +4,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_claude::{AgentLoop, ClaudeCliClient, ClaudeClient};
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CreateEnvironment, CustomInstruction, Database,
-    DeploymentRollback, Epic, EpicStatus, EnvironmentType, LearningEngine, PatternStatus,
-    PreDeployValidator, RollbackRequest, Schedule, ScheduleRun, ShellState, Story, StoryStatus,
-    ValidationStatus, Worktree,
+    Agent, AgentState, AgentType, CreateEnvironment, CreateFeatureFlag, CustomInstruction, Database,
+    DeploymentRollback, Epic, EpicStatus, EnvironmentType, FlagStatus,
+    LearningEngine, PatternStatus, PreDeployValidator, RollbackRequest, Schedule, ScheduleRun,
+    ShellState, Story, StoryStatus, ValidationStatus, Worktree,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -178,6 +178,11 @@ enum Commands {
     Deploy {
         #[command(subcommand)]
         action: DeployAction,
+    },
+    /// Feature flags management
+    Flags {
+        #[command(subcommand)]
+        action: FlagsAction,
     },
     /// Release management
     Release {
@@ -1029,6 +1034,86 @@ enum ReleaseAction {
         /// Output format (markdown, json)
         #[arg(long, default_value = "markdown")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlagsAction {
+    /// List feature flags
+    List {
+        /// Filter by environment
+        #[arg(short, long)]
+        environment: Option<String>,
+        /// Output format (table, json)
+        #[arg(short = 'f', long, default_value = "table")]
+        format: String,
+    },
+    /// Create a new feature flag
+    Create {
+        /// Flag key (unique identifier)
+        #[arg(short, long)]
+        key: String,
+        /// Human-readable name
+        #[arg(short, long)]
+        name: String,
+        /// Description
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Initial status (enabled, disabled, conditional)
+        #[arg(short, long, default_value = "disabled")]
+        status: String,
+        /// Rollout percentage (0-100)
+        #[arg(short, long, default_value = "100")]
+        rollout: i32,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Get feature flag details
+    Show {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+        /// Output format (table, json)
+        #[arg(short = 'f', long, default_value = "table")]
+        format: String,
+    },
+    /// Enable a feature flag
+    Enable {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Disable a feature flag
+    Disable {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Set rollout percentage for gradual rollout
+    Rollout {
+        /// Flag key
+        key: String,
+        /// Rollout percentage (0-100)
+        #[arg(short, long)]
+        percentage: i32,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Delete a feature flag
+    Delete {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
     },
 }
 
@@ -2826,6 +2911,37 @@ async fn main() -> Result<()> {
                     &format,
                 )
                 .await?;
+            }
+        },
+
+        Commands::Flags { action } => match action {
+            FlagsAction::List { environment, format } => {
+                handle_flags_list(&db, environment.as_deref(), &format).await?;
+            }
+            FlagsAction::Create {
+                key,
+                name,
+                description,
+                status,
+                rollout,
+                environment,
+            } => {
+                handle_flags_create(&db, &key, &name, description.as_deref(), &status, rollout, environment.as_deref()).await?;
+            }
+            FlagsAction::Show { key, environment, format } => {
+                handle_flags_show(&db, &key, environment.as_deref(), &format).await?;
+            }
+            FlagsAction::Enable { key, environment } => {
+                handle_flags_enable(&db, &key, environment.as_deref()).await?;
+            }
+            FlagsAction::Disable { key, environment } => {
+                handle_flags_disable(&db, &key, environment.as_deref()).await?;
+            }
+            FlagsAction::Rollout { key, percentage, environment } => {
+                handle_flags_rollout(&db, &key, percentage, environment.as_deref()).await?;
+            }
+            FlagsAction::Delete { key, environment } => {
+                handle_flags_delete(&db, &key, environment.as_deref()).await?;
             }
         },
 
@@ -5656,6 +5772,153 @@ async fn handle_release_notes(
 
     println!();
     println!("Total commits: {}", commits.len());
+
+    Ok(())
+}
+
+// ==================== Feature Flags Handlers ====================
+
+async fn handle_flags_list(db: &Database, environment: Option<&str>, format: &str) -> Result<()> {
+    let flags = db.list_feature_flags(environment).await?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&flags)?);
+        }
+        _ => {
+            // Table format
+            if flags.is_empty() {
+                println!("No feature flags found");
+                return Ok(());
+            }
+
+            println!("\nFeature Flags{}:\n",
+                environment.map(|e| format!(" (Environment: {})", e)).unwrap_or_default());
+            println!("{:<20} {:<30} {:<12} {:<10} {:<15}",
+                "KEY", "NAME", "STATUS", "ROLLOUT %", "ENVIRONMENT");
+            println!("{}", "-".repeat(90));
+
+            for flag in flags {
+                println!("{:<20} {:<30} {:<12} {:<10} {:<15}",
+                    flag.key,
+                    flag.name.chars().take(28).collect::<String>(),
+                    flag.status.to_string(),
+                    flag.rollout_percentage,
+                    flag.environment.as_deref().unwrap_or("global"));
+            }
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_flags_create(
+    db: &Database,
+    key: &str,
+    name: &str,
+    description: Option<&str>,
+    status: &str,
+    rollout: i32,
+    environment: Option<&str>,
+) -> Result<()> {
+    let flag_status: FlagStatus = status.parse()?;
+
+    let flag = CreateFeatureFlag {
+        key: key.to_string(),
+        name: name.to_string(),
+        description: description.map(|s| s.to_string()),
+        status: flag_status,
+        rollout_percentage: Some(rollout),
+        environment: environment.map(|s| s.to_string()),
+        metadata: None,
+    };
+
+    let created = db.create_feature_flag(flag).await?;
+
+    println!("\nFeature flag created successfully!");
+    println!("  Key: {}", created.key);
+    println!("  Name: {}", created.name);
+    println!("  Status: {}", created.status);
+    println!("  Rollout: {}%", created.rollout_percentage);
+    println!("  Environment: {}", created.environment.as_deref().unwrap_or("global"));
+    if let Some(desc) = &created.description {
+        println!("  Description: {}", desc);
+    }
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_show(db: &Database, key: &str, environment: Option<&str>, format: &str) -> Result<()> {
+    let flag = db.get_feature_flag(key, environment).await?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&flag)?);
+        }
+        _ => {
+            println!("\nFeature Flag Details:");
+            println!("  Key: {}", flag.key);
+            println!("  Name: {}", flag.name);
+            if let Some(desc) = &flag.description {
+                println!("  Description: {}", desc);
+            }
+            println!("  Status: {}", flag.status);
+            println!("  Rollout: {}%", flag.rollout_percentage);
+            println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+            if let Some(metadata) = &flag.metadata {
+                println!("  Metadata: {}", metadata);
+            }
+            println!("  Created: {}", flag.created_at.as_deref().unwrap_or("unknown"));
+            println!("  Updated: {}", flag.updated_at.as_deref().unwrap_or("unknown"));
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_flags_enable(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
+    let flag = db.enable_feature_flag(key, environment).await?;
+
+    println!("\nFeature flag '{}' enabled successfully!", key);
+    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+    println!("  Status: {}", flag.status);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_disable(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
+    let flag = db.disable_feature_flag(key, environment).await?;
+
+    println!("\nFeature flag '{}' disabled successfully!", key);
+    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+    println!("  Status: {}", flag.status);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_rollout(db: &Database, key: &str, percentage: i32, environment: Option<&str>) -> Result<()> {
+    let flag = db.set_feature_flag_rollout(key, environment, percentage).await?;
+
+    println!("\nFeature flag '{}' rollout updated successfully!", key);
+    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+    println!("  Status: {}", flag.status);
+    println!("  Rollout: {}%", flag.rollout_percentage);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_delete(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
+    db.delete_feature_flag(key, environment).await?;
+
+    println!("\nFeature flag '{}' deleted successfully!", key);
+    println!("  Environment: {}", environment.unwrap_or("global"));
+    println!();
 
     Ok(())
 }

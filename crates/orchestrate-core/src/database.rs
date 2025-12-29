@@ -168,6 +168,12 @@ impl Database {
         ))
         .execute(&self.pool)
         .await?;
+        // Feature flags migration
+        sqlx::query(include_str!(
+            "../../../migrations/017_feature_flags.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2922,6 +2928,315 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    // ==================== Feature Flags Operations ====================
+
+    /// Create a new feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_feature_flag(
+        &self,
+        flag: crate::CreateFeatureFlag,
+    ) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        use sqlx::Row;
+
+        // Validate rollout percentage
+        let rollout_percentage = flag.rollout_percentage.unwrap_or(100);
+        if !(0..=100).contains(&rollout_percentage) {
+            return Err(crate::Error::Other(
+                "Rollout percentage must be between 0 and 100".to_string(),
+            ));
+        }
+
+        let status_str = flag.status.to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO feature_flags (key, name, description, status, rollout_percentage, environment, metadata)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(&flag.key)
+        .bind(&flag.name)
+        .bind(&flag.description)
+        .bind(&status_str)
+        .bind(rollout_percentage)
+        .bind(&flag.environment)
+        .bind(&flag.metadata)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_feature_flag(&flag.key, flag.environment.as_deref()).await
+    }
+
+    /// Get a feature flag by key and optional environment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feature_flag(
+        &self,
+        key: &str,
+        environment: Option<&str>,
+    ) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            r#"
+            SELECT id, key, name, description, status, rollout_percentage, environment, metadata, created_at, updated_at
+            FROM feature_flags
+            WHERE key = ?1 AND (environment = ?2 OR (?2 IS NULL AND environment IS NULL))
+            ORDER BY environment DESC NULLS LAST
+            LIMIT 1
+            "#,
+        )
+        .bind(key)
+        .bind(environment)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let id: i64 = r.get("id");
+                let key: String = r.get("key");
+                let name: String = r.get("name");
+                let description: Option<String> = r.get("description");
+                let status: String = r.get("status");
+                let rollout_percentage: i32 = r.get("rollout_percentage");
+                let environment: Option<String> = r.get("environment");
+                let metadata: Option<String> = r.get("metadata");
+                let created_at: String = r.get("created_at");
+                let updated_at: String = r.get("updated_at");
+
+                Ok(crate::FeatureFlag {
+                    id: Some(id),
+                    key,
+                    name,
+                    description,
+                    status: status.parse().unwrap_or(FlagStatus::Disabled),
+                    rollout_percentage,
+                    environment,
+                    metadata,
+                    created_at: Some(created_at),
+                    updated_at: Some(updated_at),
+                })
+            }
+            None => Err(crate::Error::Other(format!(
+                "Feature flag '{}' not found{}",
+                key,
+                environment
+                    .map(|e| format!(" for environment '{}'", e))
+                    .unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// List all feature flags, optionally filtered by environment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_feature_flags(&self, environment: Option<&str>) -> Result<Vec<crate::FeatureFlag>> {
+        use crate::FlagStatus;
+        use sqlx::Row;
+
+        let rows = if let Some(env) = environment {
+            sqlx::query(
+                r#"
+                SELECT id, key, name, description, status, rollout_percentage, environment, metadata, created_at, updated_at
+                FROM feature_flags
+                WHERE environment = ?1 OR environment IS NULL
+                ORDER BY key, environment DESC NULLS LAST
+                "#,
+            )
+            .bind(env)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, key, name, description, status, rollout_percentage, environment, metadata, created_at, updated_at
+                FROM feature_flags
+                ORDER BY key, environment DESC NULLS LAST
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let id: i64 = r.get("id");
+                let key: String = r.get("key");
+                let name: String = r.get("name");
+                let description: Option<String> = r.get("description");
+                let status: String = r.get("status");
+                let rollout_percentage: i32 = r.get("rollout_percentage");
+                let environment: Option<String> = r.get("environment");
+                let metadata: Option<String> = r.get("metadata");
+                let created_at: String = r.get("created_at");
+                let updated_at: String = r.get("updated_at");
+
+                crate::FeatureFlag {
+                    id: Some(id),
+                    key,
+                    name,
+                    description,
+                    status: status.parse().unwrap_or(FlagStatus::Disabled),
+                    rollout_percentage,
+                    environment,
+                    metadata,
+                    created_at: Some(created_at),
+                    updated_at: Some(updated_at),
+                }
+            })
+            .collect())
+    }
+
+    /// Update a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_feature_flag(
+        &self,
+        key: &str,
+        environment: Option<&str>,
+        update: crate::UpdateFeatureFlag,
+    ) -> Result<crate::FeatureFlag> {
+        // Validate rollout percentage if provided
+        if let Some(percentage) = update.rollout_percentage {
+            if !(0..=100).contains(&percentage) {
+                return Err(crate::Error::Other(
+                    "Rollout percentage must be between 0 and 100".to_string(),
+                ));
+            }
+        }
+
+        // Check if flag exists
+        self.get_feature_flag(key, environment).await?;
+
+        // Build update query dynamically
+        if let Some(status) = &update.status {
+            let status_str = status.to_string();
+            sqlx::query(
+                r#"
+                UPDATE feature_flags
+                SET status = ?1, updated_at = datetime('now')
+                WHERE key = ?2 AND (environment = ?3 OR (?3 IS NULL AND environment IS NULL))
+                "#,
+            )
+            .bind(&status_str)
+            .bind(key)
+            .bind(environment)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        if let Some(percentage) = update.rollout_percentage {
+            sqlx::query(
+                r#"
+                UPDATE feature_flags
+                SET rollout_percentage = ?1, updated_at = datetime('now')
+                WHERE key = ?2 AND (environment = ?3 OR (?3 IS NULL AND environment IS NULL))
+                "#,
+            )
+            .bind(percentage)
+            .bind(key)
+            .bind(environment)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        if let Some(metadata) = &update.metadata {
+            sqlx::query(
+                r#"
+                UPDATE feature_flags
+                SET metadata = ?1, updated_at = datetime('now')
+                WHERE key = ?2 AND (environment = ?3 OR (?3 IS NULL AND environment IS NULL))
+                "#,
+            )
+            .bind(metadata)
+            .bind(key)
+            .bind(environment)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        self.get_feature_flag(key, environment).await
+    }
+
+    /// Enable a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn enable_feature_flag(&self, key: &str, environment: Option<&str>) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        self.update_feature_flag(
+            key,
+            environment,
+            crate::UpdateFeatureFlag {
+                status: Some(FlagStatus::Enabled),
+                rollout_percentage: None,
+                metadata: None,
+            },
+        )
+        .await
+    }
+
+    /// Disable a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn disable_feature_flag(&self, key: &str, environment: Option<&str>) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        self.update_feature_flag(
+            key,
+            environment,
+            crate::UpdateFeatureFlag {
+                status: Some(FlagStatus::Disabled),
+                rollout_percentage: None,
+                metadata: None,
+            },
+        )
+        .await
+    }
+
+    /// Delete a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_feature_flag(&self, key: &str, environment: Option<&str>) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM feature_flags
+            WHERE key = ?1 AND (environment = ?2 OR (?2 IS NULL AND environment IS NULL))
+            "#,
+        )
+        .bind(key)
+        .bind(environment)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(crate::Error::Other(format!(
+                "Feature flag '{}' not found{}",
+                key,
+                environment
+                    .map(|e| format!(" for environment '{}'", e))
+                    .unwrap_or_default()
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Set rollout percentage for gradual rollout
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn set_feature_flag_rollout(
+        &self,
+        key: &str,
+        environment: Option<&str>,
+        percentage: i32,
+    ) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        self.update_feature_flag(
+            key,
+            environment,
+            crate::UpdateFeatureFlag {
+                status: Some(FlagStatus::Conditional),
+                rollout_percentage: Some(percentage),
+                metadata: None,
+            },
+        )
+        .await
     }
 
     // ==================== Token Tracking Operations ====================
