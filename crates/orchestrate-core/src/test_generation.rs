@@ -96,6 +96,79 @@ pub enum TestCategory {
     ErrorCondition,
 }
 
+/// Type of test to generate
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestType {
+    /// Unit tests for individual functions
+    Unit,
+    /// Integration tests for cross-module interactions
+    Integration,
+}
+
+/// Represents a module boundary in the codebase
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleInfo {
+    /// Module name/path
+    pub name: String,
+    /// Public interfaces (functions, structs, traits)
+    pub public_interfaces: Vec<InterfaceInfo>,
+    /// Dependencies on other modules
+    pub dependencies: Vec<String>,
+    /// Source file path
+    pub source_path: PathBuf,
+}
+
+/// Represents a public interface (function, struct, trait, etc.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceInfo {
+    /// Interface name
+    pub name: String,
+    /// Interface type (function, struct, trait, class, etc.)
+    pub interface_type: InterfaceType,
+    /// Whether this is async
+    pub is_async: bool,
+    /// Dependencies this interface uses
+    pub uses: Vec<String>,
+}
+
+/// Type of interface
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceType {
+    Function,
+    Struct,
+    Trait,
+    Class,
+    Module,
+}
+
+/// Result of integration test generation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationTestResult {
+    /// Module that was analyzed
+    pub module: ModuleInfo,
+    /// Generated test cases
+    pub test_cases: Vec<TestCase>,
+    /// Suggested test file location
+    pub test_file_path: PathBuf,
+    /// Test fixtures needed
+    pub fixtures: Vec<TestFixture>,
+}
+
+/// Test fixture for integration tests
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestFixture {
+    /// Fixture name
+    pub name: String,
+    /// Setup code
+    pub setup_code: String,
+    /// Teardown code
+    pub teardown_code: String,
+    /// Whether this fixture needs async support
+    pub is_async: bool,
+}
+
 /// Result of test generation for a file
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestGenerationResult {
@@ -149,6 +222,687 @@ impl TestGenerationService {
             test_cases,
             test_file_path,
         })
+    }
+
+    /// Generate integration tests for a module
+    pub async fn generate_integration_tests(
+        &self,
+        module_path: &Path,
+    ) -> Result<IntegrationTestResult> {
+        // Detect language
+        let language = Language::from_path(module_path)?;
+
+        // Read module source
+        let source_code = tokio::fs::read_to_string(module_path)
+            .await
+            .map_err(|e| Error::Other(format!("Failed to read module: {}", e)))?;
+
+        // Analyze module to extract boundaries and interfaces
+        let module_info = self.analyze_module(&source_code, module_path, language)?;
+
+        // Generate integration test cases for cross-module interactions
+        let test_cases = self.generate_integration_test_cases(&module_info, language)?;
+
+        // Generate test fixtures (setup/teardown)
+        let fixtures = self.generate_test_fixtures(&module_info, language)?;
+
+        // Determine integration test file location
+        let test_file_path = self.determine_integration_test_location(module_path, language)?;
+
+        Ok(IntegrationTestResult {
+            module: module_info,
+            test_cases,
+            test_file_path,
+            fixtures,
+        })
+    }
+
+    /// Analyze module to identify boundaries and interfaces
+    fn analyze_module(
+        &self,
+        source_code: &str,
+        module_path: &Path,
+        language: Language,
+    ) -> Result<ModuleInfo> {
+        match language {
+            Language::Rust => self.analyze_rust_module(source_code, module_path),
+            Language::TypeScript => self.analyze_typescript_module(source_code, module_path),
+            Language::Python => self.analyze_python_module(source_code, module_path),
+        }
+    }
+
+    /// Analyze Rust module for public interfaces
+    fn analyze_rust_module(
+        &self,
+        source_code: &str,
+        module_path: &Path,
+    ) -> Result<ModuleInfo> {
+        let mut public_interfaces = Vec::new();
+        let mut dependencies = Vec::new();
+        let lines: Vec<&str> = source_code.lines().collect();
+
+        // Extract module name from path
+        let module_name = module_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Find public functions
+        for line in &lines {
+            let trimmed = line.trim();
+
+            // Look for pub fn
+            if trimmed.starts_with("pub fn ") || trimmed.starts_with("pub async fn ") {
+                let is_async = trimmed.contains("async fn");
+                if let Some(fn_pos) = trimmed.find("fn ") {
+                    let after_fn = &trimmed[fn_pos + 3..];
+                    if let Some(paren_pos) = after_fn.find('(') {
+                        let name = after_fn[..paren_pos].trim().to_string();
+                        public_interfaces.push(InterfaceInfo {
+                            name,
+                            interface_type: InterfaceType::Function,
+                            is_async,
+                            uses: Vec::new(),
+                        });
+                    }
+                }
+            }
+
+            // Look for pub struct
+            if trimmed.starts_with("pub struct ") {
+                if let Some(struct_pos) = trimmed.find("struct ") {
+                    let after_struct = &trimmed[struct_pos + 7..];
+                    let name = after_struct
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(&['<', '{', '('][..])
+                        .to_string();
+                    if !name.is_empty() {
+                        public_interfaces.push(InterfaceInfo {
+                            name,
+                            interface_type: InterfaceType::Struct,
+                            is_async: false,
+                            uses: Vec::new(),
+                        });
+                    }
+                }
+            }
+
+            // Look for pub trait
+            if trimmed.starts_with("pub trait ") {
+                if let Some(trait_pos) = trimmed.find("trait ") {
+                    let after_trait = &trimmed[trait_pos + 6..];
+                    let name = after_trait
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(&['<', '{'][..])
+                        .to_string();
+                    if !name.is_empty() {
+                        public_interfaces.push(InterfaceInfo {
+                            name,
+                            interface_type: InterfaceType::Trait,
+                            is_async: false,
+                            uses: Vec::new(),
+                        });
+                    }
+                }
+            }
+
+            // Extract use statements as dependencies
+            if trimmed.starts_with("use ") && !trimmed.contains("super::") {
+                if let Some(use_pos) = trimmed.find("use ") {
+                    let after_use = &trimmed[use_pos + 4..];
+                    let dep = after_use
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !dep.is_empty() && !dependencies.contains(&dep) {
+                        dependencies.push(dep);
+                    }
+                }
+            }
+        }
+
+        Ok(ModuleInfo {
+            name: module_name,
+            public_interfaces,
+            dependencies,
+            source_path: module_path.to_path_buf(),
+        })
+    }
+
+    /// Analyze TypeScript module
+    fn analyze_typescript_module(
+        &self,
+        source_code: &str,
+        module_path: &Path,
+    ) -> Result<ModuleInfo> {
+        let mut public_interfaces = Vec::new();
+        let mut dependencies = Vec::new();
+        let lines: Vec<&str> = source_code.lines().collect();
+
+        let module_name = module_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        for line in &lines {
+            let trimmed = line.trim();
+
+            // Look for exported functions
+            if trimmed.starts_with("export function ") || trimmed.starts_with("export async function ") {
+                let is_async = trimmed.contains("async");
+                if let Some(name) = self.extract_typescript_function_name(trimmed).ok() {
+                    public_interfaces.push(InterfaceInfo {
+                        name,
+                        interface_type: InterfaceType::Function,
+                        is_async,
+                        uses: Vec::new(),
+                    });
+                }
+            }
+
+            // Look for exported classes
+            if trimmed.starts_with("export class ") {
+                if let Some(class_pos) = trimmed.find("class ") {
+                    let after_class = &trimmed[class_pos + 6..];
+                    let name = after_class
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(&['<', '{'][..])
+                        .to_string();
+                    if !name.is_empty() {
+                        public_interfaces.push(InterfaceInfo {
+                            name,
+                            interface_type: InterfaceType::Class,
+                            is_async: false,
+                            uses: Vec::new(),
+                        });
+                    }
+                }
+            }
+
+            // Extract imports as dependencies
+            if trimmed.starts_with("import ") {
+                if let Some(from_pos) = trimmed.find(" from ") {
+                    let dep = trimmed[from_pos + 6..]
+                        .trim()
+                        .trim_matches(&['\'', '"', ';'][..])
+                        .to_string();
+                    if !dep.is_empty() && !dependencies.contains(&dep) {
+                        dependencies.push(dep);
+                    }
+                }
+            }
+        }
+
+        Ok(ModuleInfo {
+            name: module_name,
+            public_interfaces,
+            dependencies,
+            source_path: module_path.to_path_buf(),
+        })
+    }
+
+    /// Analyze Python module
+    fn analyze_python_module(
+        &self,
+        source_code: &str,
+        module_path: &Path,
+    ) -> Result<ModuleInfo> {
+        let mut public_interfaces = Vec::new();
+        let mut dependencies = Vec::new();
+        let lines: Vec<&str> = source_code.lines().collect();
+
+        let module_name = module_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        for line in &lines {
+            let trimmed = line.trim();
+
+            // Python doesn't have explicit public markers, but by convention
+            // functions/classes not starting with _ are public
+            if (trimmed.starts_with("def ") || trimmed.starts_with("async def "))
+                && !trimmed.contains("def _")
+                && !trimmed.contains("def __")
+            {
+                let is_async = trimmed.starts_with("async def");
+                let after_def = if is_async {
+                    &trimmed[10..]
+                } else {
+                    &trimmed[4..]
+                };
+
+                if let Some(paren_pos) = after_def.find('(') {
+                    let name = after_def[..paren_pos].trim().to_string();
+                    public_interfaces.push(InterfaceInfo {
+                        name,
+                        interface_type: InterfaceType::Function,
+                        is_async,
+                        uses: Vec::new(),
+                    });
+                }
+            }
+
+            // Look for class definitions
+            if trimmed.starts_with("class ") && !trimmed.contains("class _") {
+                if let Some(class_pos) = trimmed.find("class ") {
+                    let after_class = &trimmed[class_pos + 6..];
+                    let name = after_class
+                        .split(&['(', ':'][..])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !name.is_empty() {
+                        public_interfaces.push(InterfaceInfo {
+                            name,
+                            interface_type: InterfaceType::Class,
+                            is_async: false,
+                            uses: Vec::new(),
+                        });
+                    }
+                }
+            }
+
+            // Extract imports as dependencies
+            if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
+                let dep = if trimmed.starts_with("import ") {
+                    trimmed[7..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    trimmed[5..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                };
+                if !dep.is_empty() && !dependencies.contains(&dep) {
+                    dependencies.push(dep);
+                }
+            }
+        }
+
+        Ok(ModuleInfo {
+            name: module_name,
+            public_interfaces,
+            dependencies,
+            source_path: module_path.to_path_buf(),
+        })
+    }
+
+    /// Generate integration test cases for module interactions
+    fn generate_integration_test_cases(
+        &self,
+        module: &ModuleInfo,
+        language: Language,
+    ) -> Result<Vec<TestCase>> {
+        let mut test_cases = Vec::new();
+
+        // Generate tests for each public interface that has dependencies
+        for interface in &module.public_interfaces {
+            if interface.interface_type == InterfaceType::Function {
+                test_cases.push(self.generate_integration_test_for_interface(
+                    interface,
+                    module,
+                    language,
+                )?);
+            }
+        }
+
+        // If module has dependencies, generate cross-module interaction tests
+        if !module.dependencies.is_empty() {
+            test_cases.push(self.generate_cross_module_test(module, language)?);
+        }
+
+        Ok(test_cases)
+    }
+
+    /// Generate integration test for a specific interface
+    fn generate_integration_test_for_interface(
+        &self,
+        interface: &InterfaceInfo,
+        module: &ModuleInfo,
+        language: Language,
+    ) -> Result<TestCase> {
+        let test_name = format!("test_{}_integration", interface.name);
+        let code = match language {
+            Language::Rust => self.generate_rust_integration_test(interface, module),
+            Language::TypeScript => self.generate_typescript_integration_test(interface, module),
+            Language::Python => self.generate_python_integration_test(interface, module),
+        };
+
+        Ok(TestCase {
+            name: test_name,
+            category: TestCategory::HappyPath,
+            code,
+        })
+    }
+
+    /// Generate Rust integration test code
+    fn generate_rust_integration_test(
+        &self,
+        interface: &InterfaceInfo,
+        module: &ModuleInfo,
+    ) -> String {
+        let async_marker = if interface.is_async {
+            "#[tokio::test]\nasync "
+        } else {
+            "#[test]\n"
+        };
+        let await_suffix = if interface.is_async { ".await" } else { "" };
+
+        format!(
+            r#"{}fn test_{}_integration() {{
+    // Arrange - Set up test fixtures and dependencies
+    let test_data = setup_test_data();
+
+    // Act - Call the function with cross-module dependencies
+    let result = {}::{}(test_data){};
+
+    // Assert - Verify cross-module interaction
+    assert!(result.is_ok(), "Integration should succeed");
+
+    // Cleanup
+    teardown_test_data();
+}}"#,
+            async_marker, interface.name, module.name, interface.name, await_suffix
+        )
+    }
+
+    /// Generate TypeScript integration test code
+    fn generate_typescript_integration_test(
+        &self,
+        interface: &InterfaceInfo,
+        _module: &ModuleInfo,
+    ) -> String {
+        let async_marker = if interface.is_async { "async " } else { "" };
+        let await_prefix = if interface.is_async { "await " } else { "" };
+
+        format!(
+            r#"test('test_{}_integration', {}() => {{
+  // Arrange - Set up test fixtures
+  const testData = setupTestData();
+
+  // Act - Call function with dependencies
+  const result = {}{}({{}});
+
+  // Assert - Verify integration
+  expect(result).toBeDefined();
+
+  // Cleanup
+  teardownTestData();
+}});"#,
+            interface.name, async_marker, await_prefix, interface.name
+        )
+    }
+
+    /// Generate Python integration test code
+    fn generate_python_integration_test(
+        &self,
+        interface: &InterfaceInfo,
+        _module: &ModuleInfo,
+    ) -> String {
+        let async_marker = if interface.is_async { "async " } else { "" };
+        let await_prefix = if interface.is_async { "await " } else { "" };
+
+        format!(
+            r#"{}def test_{}_integration():
+    # Arrange - Set up fixtures
+    test_data = setup_test_data()
+
+    # Act - Call function with dependencies
+    result = {}{}(test_data)
+
+    # Assert - Verify integration
+    assert result is not None
+
+    # Cleanup
+    teardown_test_data()
+"#,
+            async_marker, interface.name, await_prefix, interface.name
+        )
+    }
+
+    /// Generate cross-module interaction test
+    fn generate_cross_module_test(
+        &self,
+        module: &ModuleInfo,
+        language: Language,
+    ) -> Result<TestCase> {
+        let test_name = format!("test_{}_cross_module_interaction", module.name);
+        let code = match language {
+            Language::Rust => format!(
+                r#"#[test]
+fn test_{}_cross_module_interaction() {{
+    // Arrange - Set up multiple module dependencies
+    let module_a = setup_module_a();
+    let module_b = setup_module_b();
+
+    // Act - Test interaction between modules
+    let result = {}::process(module_a, module_b);
+
+    // Assert - Verify modules work together correctly
+    assert!(result.is_ok());
+}}"#,
+                module.name, module.name
+            ),
+            Language::TypeScript => format!(
+                r#"test('test_{}_cross_module_interaction', () => {{
+  // Arrange
+  const moduleA = setupModuleA();
+  const moduleB = setupModuleB();
+
+  // Act
+  const result = process(moduleA, moduleB);
+
+  // Assert
+  expect(result).toBeDefined();
+}});"#,
+                module.name
+            ),
+            Language::Python => format!(
+                r#"def test_{}_cross_module_interaction():
+    # Arrange
+    module_a = setup_module_a()
+    module_b = setup_module_b()
+
+    # Act
+    result = process(module_a, module_b)
+
+    # Assert
+    assert result is not None
+"#,
+                module.name
+            ),
+        };
+
+        Ok(TestCase {
+            name: test_name,
+            category: TestCategory::HappyPath,
+            code,
+        })
+    }
+
+    /// Generate test fixtures for integration tests
+    fn generate_test_fixtures(
+        &self,
+        module: &ModuleInfo,
+        language: Language,
+    ) -> Result<Vec<TestFixture>> {
+        let mut fixtures = Vec::new();
+
+        // Generate main setup/teardown fixture
+        let main_fixture = match language {
+            Language::Rust => TestFixture {
+                name: "test_data".to_string(),
+                setup_code: format!(
+                    r#"fn setup_test_data() -> TestData {{
+    TestData {{
+        // Initialize test data for {}
+    }}
+}}"#,
+                    module.name
+                ),
+                teardown_code: r#"fn teardown_test_data() {
+    // Clean up test data
+}"#
+                .to_string(),
+                is_async: false,
+            },
+            Language::TypeScript => TestFixture {
+                name: "testData".to_string(),
+                setup_code: format!(
+                    r#"function setupTestData() {{
+  return {{
+    // Initialize test data for {}
+  }};
+}}"#,
+                    module.name
+                ),
+                teardown_code: r#"function teardownTestData() {
+  // Clean up test data
+}"#
+                .to_string(),
+                is_async: false,
+            },
+            Language::Python => TestFixture {
+                name: "test_data".to_string(),
+                setup_code: format!(
+                    r#"def setup_test_data():
+    return {{
+        # Initialize test data for {}
+    }}"#,
+                    module.name
+                ),
+                teardown_code: r#"def teardown_test_data():
+    # Clean up test data
+    pass
+"#
+                .to_string(),
+                is_async: false,
+            },
+        };
+
+        fixtures.push(main_fixture);
+
+        // If module has database dependencies, add database fixture
+        if module.dependencies.iter().any(|d| {
+            d.contains("database")
+                || d.contains("db")
+                || d.contains("sql")
+                || d.contains("Database")
+        }) {
+            fixtures.push(self.generate_database_fixture(language)?);
+        }
+
+        Ok(fixtures)
+    }
+
+    /// Generate database fixture
+    fn generate_database_fixture(&self, language: Language) -> Result<TestFixture> {
+        match language {
+            Language::Rust => Ok(TestFixture {
+                name: "test_database".to_string(),
+                setup_code: r#"async fn setup_test_database() -> Database {
+    let db = Database::connect(":memory:").await.unwrap();
+    db.migrate().await.unwrap();
+    db
+}"#
+                .to_string(),
+                teardown_code: r#"async fn teardown_test_database(db: Database) {
+    db.close().await.unwrap();
+}"#
+                .to_string(),
+                is_async: true,
+            }),
+            Language::TypeScript => Ok(TestFixture {
+                name: "testDatabase".to_string(),
+                setup_code: r#"async function setupTestDatabase() {
+  const db = await Database.connect(':memory:');
+  await db.migrate();
+  return db;
+}"#
+                .to_string(),
+                teardown_code: r#"async function teardownTestDatabase(db) {
+  await db.close();
+}"#
+                .to_string(),
+                is_async: true,
+            }),
+            Language::Python => Ok(TestFixture {
+                name: "test_database".to_string(),
+                setup_code: r#"async def setup_test_database():
+    db = await Database.connect(':memory:')
+    await db.migrate()
+    return db
+"#
+                .to_string(),
+                teardown_code: r#"async def teardown_test_database(db):
+    await db.close()
+"#
+                .to_string(),
+                is_async: true,
+            }),
+        }
+    }
+
+    /// Determine integration test file location
+    fn determine_integration_test_location(
+        &self,
+        module_path: &Path,
+        language: Language,
+    ) -> Result<PathBuf> {
+        let module_name = module_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::Other("Invalid module name".to_string()))?;
+
+        match language {
+            Language::Rust => {
+                // For Rust, integration tests go in tests/ directory
+                let project_root = module_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .ok_or_else(|| Error::Other("No project root found".to_string()))?;
+                Ok(project_root
+                    .join("tests")
+                    .join(format!("{}_integration_test.rs", module_name)))
+            }
+            Language::TypeScript => {
+                // For TypeScript, put in __tests__/integration/
+                let parent = module_path
+                    .parent()
+                    .ok_or_else(|| Error::Other("No parent directory".to_string()))?;
+                Ok(parent
+                    .join("__tests__")
+                    .join("integration")
+                    .join(format!("{}.integration.test.ts", module_name)))
+            }
+            Language::Python => {
+                // For Python, put in tests/integration/
+                let parent = module_path
+                    .parent()
+                    .ok_or_else(|| Error::Other("No parent directory".to_string()))?;
+                Ok(parent
+                    .join("tests")
+                    .join("integration")
+                    .join(format!("test_{}_integration.py", module_name)))
+            }
+        }
     }
 
     /// Extract function signatures from source code
@@ -1015,5 +1769,340 @@ pub fn subtract(a: i32, b: i32) -> i32 {
 
         // Each function should have 3 test cases (happy path, edge case, error)
         assert_eq!(result.test_cases.len(), 6);
+    }
+
+    // Integration test generation tests
+
+    #[tokio::test]
+    async fn test_analyze_rust_module_identifies_public_functions() {
+        let service = TestGenerationService::new();
+        let source = r#"
+use std::collections::HashMap;
+use crate::database::Database;
+
+pub fn process_data(input: String) -> Result<String> {
+    Ok(input)
+}
+
+pub async fn save_to_database(data: &str) -> Result<()> {
+    // implementation
+    Ok(())
+}
+
+pub struct DataProcessor {
+    cache: HashMap<String, String>,
+}
+
+pub trait Processor {
+    fn process(&self) -> Result<()>;
+}
+"#;
+        let module_path = Path::new("/project/src/processor.rs");
+        let module_info = service.analyze_rust_module(source, module_path).unwrap();
+
+        assert_eq!(module_info.name, "processor");
+        assert_eq!(module_info.public_interfaces.len(), 4);
+
+        // Check for public functions
+        let function_names: Vec<_> = module_info
+            .public_interfaces
+            .iter()
+            .filter(|i| i.interface_type == InterfaceType::Function)
+            .map(|i| i.name.as_str())
+            .collect();
+        assert!(function_names.contains(&"process_data"));
+        assert!(function_names.contains(&"save_to_database"));
+
+        // Check for async function
+        let async_fn = module_info
+            .public_interfaces
+            .iter()
+            .find(|i| i.name == "save_to_database")
+            .unwrap();
+        assert!(async_fn.is_async);
+
+        // Check dependencies
+        assert!(module_info.dependencies.iter().any(|d| d.contains("Database")));
+    }
+
+    #[tokio::test]
+    async fn test_analyze_typescript_module_identifies_exports() {
+        let service = TestGenerationService::new();
+        let source = r#"
+import { Database } from './database';
+import { Logger } from './logger';
+
+export async function processData(input: string): Promise<string> {
+    return input;
+}
+
+export class DataProcessor {
+    private cache: Map<string, string>;
+
+    process(data: string): string {
+        return data;
+    }
+}
+"#;
+        let module_path = Path::new("/project/src/processor.ts");
+        let module_info = service
+            .analyze_typescript_module(source, module_path)
+            .unwrap();
+
+        assert_eq!(module_info.name, "processor");
+        assert_eq!(module_info.public_interfaces.len(), 2);
+
+        // Check for exported function
+        let function = module_info
+            .public_interfaces
+            .iter()
+            .find(|i| i.interface_type == InterfaceType::Function)
+            .unwrap();
+        assert_eq!(function.name, "processData");
+        assert!(function.is_async);
+
+        // Check for exported class
+        let class = module_info
+            .public_interfaces
+            .iter()
+            .find(|i| i.interface_type == InterfaceType::Class)
+            .unwrap();
+        assert_eq!(class.name, "DataProcessor");
+
+        // Check dependencies
+        assert_eq!(module_info.dependencies.len(), 2);
+        assert!(module_info.dependencies.contains(&"./database".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_analyze_python_module_identifies_public_items() {
+        let service = TestGenerationService::new();
+        let source = r#"
+import sqlite3
+from typing import Optional
+
+def process_data(input_str: str) -> str:
+    return input_str
+
+async def save_to_database(data: str) -> None:
+    pass
+
+class DataProcessor:
+    def __init__(self):
+        self.cache = {}
+
+def _private_helper():
+    pass
+"#;
+        let module_path = Path::new("/project/src/processor.py");
+        let module_info = service.analyze_python_module(source, module_path).unwrap();
+
+        assert_eq!(module_info.name, "processor");
+        assert_eq!(module_info.public_interfaces.len(), 3); // 2 functions + 1 class
+
+        // Check that private function is not included
+        let names: Vec<_> = module_info
+            .public_interfaces
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert!(!names.contains(&"_private_helper"));
+        assert!(names.contains(&"process_data"));
+        assert!(names.contains(&"save_to_database"));
+
+        // Check dependencies
+        assert!(module_info.dependencies.contains(&"sqlite3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_generate_integration_tests_for_rust_module() {
+        let service = TestGenerationService::new();
+
+        // Create a temporary module file
+        let temp_dir = tempfile::tempdir().unwrap();
+        let module_file = temp_dir.path().join("processor.rs");
+
+        tokio::fs::write(
+            &module_file,
+            r#"
+use crate::database::Database;
+
+pub async fn save_data(data: String) -> Result<()> {
+    let db = Database::new();
+    db.save(&data).await
+}
+
+pub fn process(input: &str) -> String {
+    input.to_uppercase()
+}
+"#,
+        )
+        .await
+        .unwrap();
+
+        let result = service
+            .generate_integration_tests(&module_file)
+            .await
+            .unwrap();
+
+        assert_eq!(result.module.name, "processor");
+        assert!(!result.test_cases.is_empty());
+
+        // Should generate tests for public functions
+        assert!(result.test_cases.iter().any(|t| t.name.contains("save_data")));
+        assert!(result.test_cases.iter().any(|t| t.name.contains("process")));
+
+        // Should include fixtures
+        assert!(!result.fixtures.is_empty());
+        assert!(result.fixtures.iter().any(|f| f.name == "test_data"));
+
+        // Should have database fixture since module depends on Database
+        assert!(result.fixtures.iter().any(|f| f.name == "test_database"));
+
+        // Check test file path
+        assert!(result
+            .test_file_path
+            .to_string_lossy()
+            .contains("processor_integration_test.rs"));
+    }
+
+    #[test]
+    fn test_generate_rust_integration_test_code() {
+        let service = TestGenerationService::new();
+        let interface = InterfaceInfo {
+            name: "save_data".to_string(),
+            interface_type: InterfaceType::Function,
+            is_async: true,
+            uses: vec!["Database".to_string()],
+        };
+        let module = ModuleInfo {
+            name: "storage".to_string(),
+            public_interfaces: vec![interface.clone()],
+            dependencies: vec!["crate::database::Database".to_string()],
+            source_path: PathBuf::from("/project/src/storage.rs"),
+        };
+
+        let code = service.generate_rust_integration_test(&interface, &module);
+
+        assert!(code.contains("#[tokio::test]"));
+        assert!(code.contains("async fn test_save_data_integration()"));
+        assert!(code.contains(".await"));
+        assert!(code.contains("setup_test_data"));
+        assert!(code.contains("teardown_test_data"));
+        assert!(code.contains("storage::save_data"));
+    }
+
+    #[test]
+    fn test_generate_typescript_integration_test_code() {
+        let service = TestGenerationService::new();
+        let interface = InterfaceInfo {
+            name: "saveData".to_string(),
+            interface_type: InterfaceType::Function,
+            is_async: true,
+            uses: vec!["Database".to_string()],
+        };
+        let module = ModuleInfo {
+            name: "storage".to_string(),
+            public_interfaces: vec![interface.clone()],
+            dependencies: vec!["./database".to_string()],
+            source_path: PathBuf::from("/project/src/storage.ts"),
+        };
+
+        let code = service.generate_typescript_integration_test(&interface, &module);
+
+        assert!(code.contains("test('test_saveData_integration'"));
+        assert!(code.contains("async () =>"));
+        assert!(code.contains("await "));
+        assert!(code.contains("setupTestData"));
+        assert!(code.contains("teardownTestData"));
+    }
+
+    #[test]
+    fn test_generate_test_fixtures_includes_database_fixture() {
+        let service = TestGenerationService::new();
+        let module = ModuleInfo {
+            name: "storage".to_string(),
+            public_interfaces: vec![],
+            dependencies: vec!["crate::database::Database".to_string()],
+            source_path: PathBuf::from("/project/src/storage.rs"),
+        };
+
+        let fixtures = service
+            .generate_test_fixtures(&module, Language::Rust)
+            .unwrap();
+
+        assert!(fixtures.len() >= 2); // test_data + test_database
+        assert!(fixtures.iter().any(|f| f.name == "test_data"));
+        assert!(fixtures.iter().any(|f| f.name == "test_database"));
+
+        // Database fixture should be async
+        let db_fixture = fixtures.iter().find(|f| f.name == "test_database").unwrap();
+        assert!(db_fixture.is_async);
+        assert!(db_fixture.setup_code.contains("async fn"));
+        assert!(db_fixture.setup_code.contains("Database::connect"));
+    }
+
+    #[test]
+    fn test_generate_cross_module_test() {
+        let service = TestGenerationService::new();
+        let module = ModuleInfo {
+            name: "processor".to_string(),
+            public_interfaces: vec![],
+            dependencies: vec!["crate::storage".to_string(), "crate::logger".to_string()],
+            source_path: PathBuf::from("/project/src/processor.rs"),
+        };
+
+        let test_case = service
+            .generate_cross_module_test(&module, Language::Rust)
+            .unwrap();
+
+        assert_eq!(test_case.name, "test_processor_cross_module_interaction");
+        assert_eq!(test_case.category, TestCategory::HappyPath);
+        assert!(test_case.code.contains("#[test]"));
+        assert!(test_case
+            .code
+            .contains("test_processor_cross_module_interaction"));
+        assert!(test_case.code.contains("setup_module"));
+    }
+
+    #[test]
+    fn test_determine_integration_test_location_rust() {
+        let service = TestGenerationService::new();
+        let module_path = Path::new("/project/src/storage/mod.rs");
+        let test_location = service
+            .determine_integration_test_location(module_path, Language::Rust)
+            .unwrap();
+
+        assert!(test_location
+            .to_string_lossy()
+            .contains("tests/mod_integration_test.rs"));
+    }
+
+    #[test]
+    fn test_determine_integration_test_location_typescript() {
+        let service = TestGenerationService::new();
+        let module_path = Path::new("/project/src/storage.ts");
+        let test_location = service
+            .determine_integration_test_location(module_path, Language::TypeScript)
+            .unwrap();
+
+        assert_eq!(
+            test_location,
+            Path::new("/project/src/__tests__/integration/storage.integration.test.ts")
+        );
+    }
+
+    #[test]
+    fn test_determine_integration_test_location_python() {
+        let service = TestGenerationService::new();
+        let module_path = Path::new("/project/src/storage.py");
+        let test_location = service
+            .determine_integration_test_location(module_path, Language::Python)
+            .unwrap();
+
+        assert_eq!(
+            test_location,
+            Path::new("/project/src/tests/integration/test_storage_integration.py")
+        );
     }
 }

@@ -106,6 +106,11 @@ enum Commands {
         #[command(subcommand)]
         action: StoryAction,
     },
+    /// Test generation and management
+    Test {
+        #[command(subcommand)]
+        action: TestAction,
+    },
     /// Start web interface
     Web {
         #[arg(short, long, default_value = "8080")]
@@ -145,11 +150,6 @@ enum Commands {
     Webhook {
         #[command(subcommand)]
         action: WebhookAction,
-    },
-    /// Test generation and management
-    Test {
-        #[command(subcommand)]
-        action: TestAction,
     },
 }
 
@@ -3033,9 +3033,9 @@ async fn handle_test_generate(
     use orchestrate_core::TestGenerationService;
 
     // Validate test type
-    if test_type != "unit" {
+    if test_type != "unit" && test_type != "integration" {
         anyhow::bail!(
-            "Only 'unit' test type is currently supported. Got: {}",
+            "Supported test types: 'unit', 'integration'. Got: {}",
             test_type
         );
     }
@@ -3056,55 +3056,133 @@ async fn handle_test_generate(
     // Create test generation service
     let service = TestGenerationService::new();
 
-    // Generate tests
-    info!("Analyzing source file: {}", target.display());
-    let result = service.generate_tests(target).await?;
+    if test_type == "unit" {
+        // Generate unit tests
+        info!("Analyzing source file: {}", target.display());
+        let result = service.generate_tests(target).await?;
 
-    println!("📊 Analysis Results:");
-    println!("   Language:  {:?}", result.language);
-    println!("   Functions: {}", result.functions.len());
-    println!("   Test Cases: {}", result.test_cases.len());
-    println!();
+        println!("📊 Analysis Results:");
+        println!("   Language:  {:?}", result.language);
+        println!("   Functions: {}", result.functions.len());
+        println!("   Test Cases: {}", result.test_cases.len());
+        println!();
 
-    if result.functions.is_empty() {
-        warn!("No testable functions found in {}", target.display());
-        return Ok(());
-    }
-
-    // Display found functions
-    println!("📝 Functions Found:");
-    for func in &result.functions {
-        let async_marker = if func.is_async { " (async)" } else { "" };
-        println!("   - {}{}", func.name, async_marker);
-    }
-    println!();
-
-    // Format test output
-    let test_code = service.format_test_output(&result)?;
-
-    // Determine output location
-    let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
-
-    if write {
-        // Write to file
-        if let Some(parent) = output_path.parent() {
-            if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
-                info!("Creating directory: {}", parent.display());
-                tokio::fs::create_dir_all(parent).await?;
-            }
+        if result.functions.is_empty() {
+            warn!("No testable functions found in {}", target.display());
+            return Ok(());
         }
 
-        tokio::fs::write(output_path, &test_code).await?;
-        println!("✅ Tests written to: {}", output_path.display());
-    } else {
-        // Print to stdout
-        println!("Generated Test Code:");
-        println!("═══════════════════════════════════════════════════════════════");
-        println!("{}", test_code);
-        println!("═══════════════════════════════════════════════════════════════");
+        // Display found functions
+        println!("📝 Functions Found:");
+        for func in &result.functions {
+            let async_marker = if func.is_async { " (async)" } else { "" };
+            println!("   - {}{}", func.name, async_marker);
+        }
         println!();
-        println!("💡 Tip: Add --write to save tests to file");
-        println!("   Default location: {}", result.test_file_path.display());
+
+        // Format test output
+        let test_code = service.format_test_output(&result)?;
+
+        // Determine output location
+        let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
+
+        if write {
+            // Write to file
+            if let Some(parent) = output_path.parent() {
+                if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
+                    info!("Creating directory: {}", parent.display());
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+            }
+
+            tokio::fs::write(output_path, &test_code).await?;
+            println!("✅ Tests written to: {}", output_path.display());
+        } else {
+            // Print to stdout
+            println!("Generated Test Code:");
+            println!("═══════════════════════════════════════════════════════════════");
+            println!("{}", test_code);
+            println!("═══════════════════════════════════════════════════════════════");
+            println!();
+            println!("💡 Tip: Add --write to save tests to file");
+            println!("   Default location: {}", result.test_file_path.display());
+        }
+    } else {
+        // Generate integration tests
+        info!("Analyzing module: {}", target.display());
+        let result = service.generate_integration_tests(target).await?;
+
+        println!("📊 Module Analysis:");
+        println!("   Module:     {}", result.module.name);
+        println!("   Interfaces: {}", result.module.public_interfaces.len());
+        println!("   Dependencies: {}", result.module.dependencies.len());
+        println!("   Test Cases: {}", result.test_cases.len());
+        println!("   Fixtures:   {}", result.fixtures.len());
+        println!();
+
+        // Display public interfaces
+        if !result.module.public_interfaces.is_empty() {
+            println!("📝 Public Interfaces:");
+            for interface in &result.module.public_interfaces {
+                let async_marker = if interface.is_async { " (async)" } else { "" };
+                println!("   - {} ({:?}){}",
+                    interface.name,
+                    interface.interface_type,
+                    async_marker
+                );
+            }
+            println!();
+        }
+
+        // Display dependencies
+        if !result.module.dependencies.is_empty() {
+            println!("📦 Dependencies:");
+            for dep in &result.module.dependencies {
+                println!("   - {}", dep);
+            }
+            println!();
+        }
+
+        // Determine output location
+        let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
+
+        // Build complete test code with fixtures
+        let mut test_code = String::new();
+        test_code.push_str("// Test Fixtures\n\n");
+        for fixture in &result.fixtures {
+            test_code.push_str(&fixture.setup_code);
+            test_code.push_str("\n\n");
+            test_code.push_str(&fixture.teardown_code);
+            test_code.push_str("\n\n");
+        }
+
+        test_code.push_str("// Integration Tests\n\n");
+        for test_case in &result.test_cases {
+            test_code.push_str(&test_case.code);
+            test_code.push_str("\n\n");
+        }
+
+        if write {
+            // Write to file
+            if let Some(parent) = output_path.parent() {
+                if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
+                    info!("Creating directory: {}", parent.display());
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+            }
+
+            tokio::fs::write(output_path, &test_code).await?;
+            println!("✅ Integration tests written to: {}", output_path.display());
+        } else {
+            // Print to stdout
+            println!("Generated Integration Test Code:");
+            println!("═══════════════════════════════════════════════════════════════");
+            println!("{}", test_code);
+            println!("═══════════════════════════════════════════════════════════════");
+            println!();
+            println!("💡 Tip: Add --write to save tests to file");
+            println!("   Default location: {}", result.test_file_path.display());
+        }
     }
 
     Ok(())
