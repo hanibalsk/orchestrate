@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use crate::{CronSchedule, Error};
 
 /// A scheduled agent execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +43,38 @@ impl Schedule {
             next_run: None,
             created_at: Utc::now(),
         }
+    }
+
+    /// Calculate the next run time based on the cron expression
+    ///
+    /// This will validate the cron expression and calculate the next execution time
+    /// from the current time (or from last_run if provided).
+    ///
+    /// # Returns
+    /// The next scheduled execution time, or an error if the cron expression is invalid
+    pub fn calculate_next_run(&self) -> Result<DateTime<Utc>, Error> {
+        let cron = CronSchedule::new(&self.cron_expression)?;
+        let from = self.last_run.unwrap_or_else(Utc::now);
+        cron.next_after(&from)
+    }
+
+    /// Update the next_run field based on the cron expression
+    ///
+    /// This is a convenience method that calculates and sets the next_run field.
+    ///
+    /// # Returns
+    /// Ok(()) if successful, or an error if the cron expression is invalid
+    pub fn update_next_run(&mut self) -> Result<(), Error> {
+        self.next_run = Some(self.calculate_next_run()?);
+        Ok(())
+    }
+
+    /// Validate the cron expression without calculating next run
+    ///
+    /// # Returns
+    /// Ok(()) if the cron expression is valid, or an error otherwise
+    pub fn validate_cron(&self) -> Result<(), Error> {
+        CronSchedule::validate(&self.cron_expression)
     }
 }
 
@@ -142,5 +175,88 @@ mod tests {
             ScheduleRunStatus::Failed
         );
         assert!("invalid".parse::<ScheduleRunStatus>().is_err());
+    }
+
+    #[test]
+    fn test_schedule_validate_cron() {
+        let schedule = Schedule::new(
+            "test".to_string(),
+            "0 2 * * *".to_string(),
+            "TestAgent".to_string(),
+            "Test task".to_string(),
+        );
+
+        assert!(schedule.validate_cron().is_ok());
+    }
+
+    #[test]
+    fn test_schedule_validate_cron_invalid() {
+        let schedule = Schedule::new(
+            "test".to_string(),
+            "invalid cron".to_string(),
+            "TestAgent".to_string(),
+            "Test task".to_string(),
+        );
+
+        assert!(schedule.validate_cron().is_err());
+    }
+
+    #[test]
+    fn test_schedule_calculate_next_run() {
+        let schedule = Schedule::new(
+            "hourly-test".to_string(),
+            "@hourly".to_string(),
+            "TestAgent".to_string(),
+            "Test task".to_string(),
+        );
+
+        let next_run = schedule.calculate_next_run().unwrap();
+        let now = Utc::now();
+
+        // Next run should be within the next hour
+        let duration = next_run.signed_duration_since(now);
+        assert!(duration.num_seconds() > 0);
+        assert!(duration.num_seconds() <= 3600);
+    }
+
+    #[test]
+    fn test_schedule_update_next_run() {
+        let mut schedule = Schedule::new(
+            "daily-test".to_string(),
+            "@daily".to_string(),
+            "TestAgent".to_string(),
+            "Test task".to_string(),
+        );
+
+        assert!(schedule.next_run.is_none());
+
+        schedule.update_next_run().unwrap();
+
+        assert!(schedule.next_run.is_some());
+        let next_run = schedule.next_run.unwrap();
+        let now = Utc::now();
+
+        // Next run should be in the future
+        assert!(next_run > now);
+    }
+
+    #[test]
+    fn test_schedule_calculate_next_run_with_last_run() {
+        use chrono::TimeZone;
+
+        let mut schedule = Schedule::new(
+            "test".to_string(),
+            "0 0 * * *".to_string(), // Daily at midnight
+            "TestAgent".to_string(),
+            "Test task".to_string(),
+        );
+
+        // Set last_run to a specific time
+        schedule.last_run = Some(Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap());
+
+        let next_run = schedule.calculate_next_run().unwrap();
+
+        // Next run should be Jan 16 at midnight
+        assert_eq!(next_run, Utc.with_ymd_and_hms(2025, 1, 16, 0, 0, 0).unwrap());
     }
 }

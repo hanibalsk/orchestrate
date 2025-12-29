@@ -8,6 +8,7 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod cron;
 pub mod database;
 pub mod epic;
 pub mod error;
@@ -53,3 +54,6 @@ pub use shell_state::{QueueEntry, ShellState, ShepherdLock};
 
 // Re-export schedule types
 pub use schedule::{Schedule, ScheduleRun, ScheduleRunStatus};
+
+// Re-export cron types
+pub use cron::CronSchedule;
