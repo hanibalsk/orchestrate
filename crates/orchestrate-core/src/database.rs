@@ -10,6 +10,7 @@ use crate::instruction::{
     LearningPattern, PatternStatus, PatternType,
 };
 use crate::network::{AgentId, StepOutput, StepOutputType};
+use crate::schedule::{Schedule, ScheduleRun, ScheduleRunStatus};
 use crate::webhook::{WebhookEvent, WebhookEventStatus};
 use crate::{
     Agent, AgentState, AgentType, Epic, EpicStatus, MergeStrategy, Message, MessageRole, PrStatus,
@@ -118,6 +119,9 @@ impl Database {
             .await;
         // Webhook events migration
         sqlx::query(include_str!("../../../migrations/006_webhook_events.sql"))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(include_str!("../../../migrations/007_schedules.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1753,6 +1757,209 @@ impl Database {
         Ok(row.into())
     }
 
+    // ==================== Schedule Operations ====================
+
+    /// Insert a new schedule
+    #[tracing::instrument(skip(self, schedule), level = "debug", fields(name = %schedule.name))]
+    pub async fn insert_schedule(&self, schedule: &Schedule) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO schedules (name, cron_expression, agent_type, task, enabled, last_run, next_run, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&schedule.name)
+        .bind(&schedule.cron_expression)
+        .bind(&schedule.agent_type)
+        .bind(&schedule.task)
+        .bind(schedule.enabled)
+        .bind(schedule.last_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.next_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get a schedule by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_schedule(&self, id: i64) -> Result<Option<Schedule>> {
+        let row = sqlx::query_as::<_, ScheduleRow>("SELECT * FROM schedules WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get a schedule by name
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_schedule_by_name(&self, name: &str) -> Result<Option<Schedule>> {
+        let row = sqlx::query_as::<_, ScheduleRow>("SELECT * FROM schedules WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List all schedules with optional enabled filter
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_schedules(&self, enabled_only: bool) -> Result<Vec<Schedule>> {
+        let rows = if enabled_only {
+            sqlx::query_as::<_, ScheduleRow>(
+                "SELECT * FROM schedules WHERE enabled = 1 ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ScheduleRow>("SELECT * FROM schedules ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update a schedule
+    #[tracing::instrument(skip(self, schedule), level = "debug", fields(id = schedule.id))]
+    pub async fn update_schedule(&self, schedule: &Schedule) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE schedules SET
+                name = ?, cron_expression = ?, agent_type = ?, task = ?,
+                enabled = ?, last_run = ?, next_run = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&schedule.name)
+        .bind(&schedule.cron_expression)
+        .bind(&schedule.agent_type)
+        .bind(&schedule.task)
+        .bind(schedule.enabled)
+        .bind(schedule.last_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.next_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a schedule
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_schedule(&self, id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM schedules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Get schedules that are due for execution
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_due_schedules(&self) -> Result<Vec<Schedule>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT * FROM schedules WHERE enabled = 1 AND next_run <= ? ORDER BY next_run ASC",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Try to acquire a lock for schedule execution
+    ///
+    /// Returns true if lock was acquired, false if schedule is already locked.
+    /// Locks expire after 5 minutes to prevent deadlocks.
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn try_lock_schedule(&self, schedule_id: i64) -> Result<bool> {
+        let now = chrono::Utc::now();
+        let lock_expiry = now - chrono::Duration::minutes(5);
+
+        // Try to acquire lock using UPDATE with WHERE clause
+        // This will only update if the schedule is not locked or lock has expired
+        let result = sqlx::query(
+            r#"
+            UPDATE schedules
+            SET locked_at = ?
+            WHERE id = ?
+            AND (locked_at IS NULL OR locked_at < ?)
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(schedule_id)
+        .bind(lock_expiry.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release a schedule lock
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn unlock_schedule(&self, schedule_id: i64) -> Result<()> {
+        sqlx::query("UPDATE schedules SET locked_at = NULL WHERE id = ?")
+            .bind(schedule_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Insert a schedule run record
+    #[tracing::instrument(skip(self, run), level = "debug", fields(schedule_id = run.schedule_id))]
+    pub async fn insert_schedule_run(&self, run: &ScheduleRun) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO schedule_runs (schedule_id, agent_id, started_at, completed_at, status, error_message)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.schedule_id)
+        .bind(&run.agent_id)
+        .bind(run.started_at.to_rfc3339())
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.status.as_str())
+        .bind(&run.error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Update a schedule run
+    #[tracing::instrument(skip(self, run), level = "debug", fields(id = run.id))]
+    pub async fn update_schedule_run(&self, run: &ScheduleRun) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE schedule_runs SET
+                agent_id = ?, completed_at = ?, status = ?, error_message = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&run.agent_id)
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.status.as_str())
+        .bind(&run.error_message)
+        .bind(run.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get schedule runs for a schedule
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_schedule_runs(&self, schedule_id: i64, limit: i64) -> Result<Vec<ScheduleRun>> {
+        let rows = sqlx::query_as::<_, ScheduleRunRow>(
+            "SELECT * FROM schedule_runs WHERE schedule_id = ? ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(schedule_id)
     // ==================== Webhook Event Operations ====================
 
     /// Insert a new webhook event (idempotent by delivery_id)
@@ -2594,6 +2801,31 @@ impl TryFrom<PatternRow> for LearningPattern {
 }
 
 #[derive(sqlx::FromRow)]
+struct ScheduleRow {
+    id: i64,
+    name: String,
+    cron_expression: String,
+    agent_type: String,
+    task: String,
+    enabled: bool,
+    last_run: Option<String>,
+    next_run: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ScheduleRow> for Schedule {
+    type Error = crate::Error;
+
+    fn try_from(row: ScheduleRow) -> Result<Self> {
+        Ok(Schedule {
+            id: row.id,
+            name: row.name,
+            cron_expression: row.cron_expression,
+            agent_type: row.agent_type,
+            task: row.task,
+            enabled: row.enabled,
+            last_run: row
+                .last_run
 struct WebhookEventRow {
     id: i64,
     delivery_id: String,
@@ -2631,6 +2863,8 @@ impl TryFrom<WebhookEventRow> for WebhookEvent {
                 .transpose()
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .map(Into::into),
+            next_run: row
+                .next_run
             received_at: chrono::DateTime::parse_from_rfc3339(&row.received_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
@@ -2643,6 +2877,42 @@ impl TryFrom<WebhookEventRow> for WebhookEvent {
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ScheduleRunRow {
+    id: i64,
+    schedule_id: i64,
+    agent_id: Option<String>,
+    started_at: String,
+    completed_at: Option<String>,
+    status: String,
+    error_message: Option<String>,
+}
+
+impl TryFrom<ScheduleRunRow> for ScheduleRun {
+    type Error = crate::Error;
+
+    fn try_from(row: ScheduleRunRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(ScheduleRun {
+            id: row.id,
+            schedule_id: row.schedule_id,
+            agent_id: row.agent_id,
+            started_at: chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            status: ScheduleRunStatus::from_str(&row.status)?,
+            error_message: row.error_message,
             updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),

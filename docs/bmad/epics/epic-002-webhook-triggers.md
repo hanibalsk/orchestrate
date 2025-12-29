@@ -156,6 +156,7 @@ Spawn regression-tester on main branch pushes.
 - TODO: Actual agent execution (spawn process) - will be handled by agent runtime
 - TODO: Test suite execution and issue creation - will be implemented in agent logic
 
+
 ### Story 7: Issue Created Event Handler
 
 Spawn issue-triager for new issues.

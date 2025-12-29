@@ -110,3 +110,44 @@ export type WsMessage =
   | WsAgentStateMessage
   | WsAgentMessage
   | WsSystemStatusMessage;
+
+// Schedule types
+export interface Schedule {
+  id: number;
+  name: string;
+  cron_expression: string;
+  agent_type: string;
+  task: string;
+  enabled: boolean;
+  last_run: string | null;
+  next_run: string | null;
+  created_at: string;
+}
+
+export interface CreateScheduleRequest {
+  name: string;
+  cron_expression: string;
+  agent_type: string;
+  task: string;
+  enabled?: boolean;
+}
+
+export interface UpdateScheduleRequest {
+  name?: string;
+  cron_expression?: string;
+  agent_type?: string;
+  task?: string;
+  enabled?: boolean;
+}
+
+export type ScheduleRunStatus = 'running' | 'completed' | 'failed';
+
+export interface ScheduleRun {
+  id: number;
+  schedule_id: number;
+  agent_id: string | null;
+  started_at: string;
+  completed_at: string | null;
+  status: ScheduleRunStatus;
+  error_message: string | null;
+}

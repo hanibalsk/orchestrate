@@ -3,6 +3,7 @@ import { Navbar } from './components/layout/Navbar';
 import { Dashboard } from './pages/Dashboard';
 import { AgentList } from './pages/AgentList';
 import { AgentDetail } from './pages/AgentDetail';
+import { ScheduleList } from './pages/ScheduleList';
 
 function App() {
   return (
@@ -14,6 +15,7 @@ function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/agents" element={<AgentList />} />
             <Route path="/agents/:id" element={<AgentDetail />} />
+            <Route path="/schedules" element={<ScheduleList />} />
           </Routes>
         </main>
       </div>
