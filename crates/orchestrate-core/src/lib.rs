@@ -15,7 +15,9 @@ pub mod instruction;
 pub mod learning;
 pub mod message;
 pub mod network;
+pub mod pipeline;
 pub mod pr;
+pub mod schedule;
 pub mod session;
 pub mod shell_state;
 pub mod worktree;
@@ -48,3 +50,6 @@ pub use network::{
 
 // Re-export shell state types
 pub use shell_state::{QueueEntry, ShellState, ShepherdLock};
+
+// Re-export schedule types
+pub use schedule::{Schedule, ScheduleRun, ScheduleRunStatus};
