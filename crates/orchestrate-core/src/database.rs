@@ -162,6 +162,12 @@ impl Database {
         ))
         .execute(&self.pool)
         .await?;
+        // Deployment rollback migration
+        sqlx::query(include_str!(
+            "../../../migrations/016_deployment_rollbacks.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2664,6 +2670,258 @@ impl Database {
             started_at,
             completed_at,
         }))
+    }
+
+    // ==================== Deployment Rollback Operations ====================
+
+    /// Create a new deployment rollback event
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_deployment_rollback_event(
+        &self,
+        deployment_id: i64,
+        target_version: &str,
+        rollback_type: &crate::deployment_rollback::RollbackType,
+    ) -> Result<crate::deployment_rollback::RollbackEvent> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rollback_type_str = rollback_type.to_string();
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO deployment_rollback_events (
+                deployment_id, target_version, rollback_type, status, started_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(deployment_id)
+        .bind(target_version)
+        .bind(&rollback_type_str)
+        .bind("pending")
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        self.get_deployment_rollback_event(id).await
+    }
+
+    /// Update deployment rollback event status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_deployment_rollback_status(
+        &self,
+        rollback_id: i64,
+        status: crate::deployment_rollback::RollbackStatus,
+        error_message: Option<&str>,
+    ) -> Result<crate::deployment_rollback::RollbackEvent> {
+        let completed_at = if matches!(
+            status,
+            crate::deployment_rollback::RollbackStatus::Completed
+                | crate::deployment_rollback::RollbackStatus::Failed
+        ) {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE deployment_rollback_events
+            SET status = ?, error_message = ?, completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(error_message)
+        .bind(&completed_at)
+        .bind(rollback_id)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_deployment_rollback_event(rollback_id).await
+    }
+
+    /// Get a deployment rollback event by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment_rollback_event(
+        &self,
+        rollback_id: i64,
+    ) -> Result<crate::deployment_rollback::RollbackEvent> {
+        use crate::deployment_rollback::{RollbackEvent, RollbackStatus, RollbackType};
+
+        #[derive(sqlx::FromRow)]
+        struct RollbackRow {
+            id: i64,
+            deployment_id: i64,
+            target_version: String,
+            rollback_type: String,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            notification_sent: i64,
+        }
+
+        let row: RollbackRow = sqlx::query_as(
+            "SELECT id, deployment_id, target_version, rollback_type, status, error_message,
+                    started_at, completed_at, notification_sent
+             FROM deployment_rollback_events
+             WHERE id = ?",
+        )
+        .bind(rollback_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            crate::Error::Other(format!("Deployment rollback event {} not found", rollback_id))
+        })?;
+
+        let rollback_type = match row.rollback_type.as_str() {
+            "previous" => RollbackType::Previous,
+            "specific" => RollbackType::Specific,
+            "blue_green_switch" => RollbackType::BlueGreenSwitch,
+            "automatic" => RollbackType::Automatic,
+            _ => RollbackType::Previous,
+        };
+
+        let status = match row.status.as_str() {
+            "pending" => RollbackStatus::Pending,
+            "in_progress" => RollbackStatus::InProgress,
+            "completed" => RollbackStatus::Completed,
+            "failed" => RollbackStatus::Failed,
+            _ => RollbackStatus::Pending,
+        };
+
+        let started_at = chrono::DateTime::parse_from_rfc3339(&row.started_at)
+            .map_err(|e| crate::Error::Other(format!("Failed to parse started_at: {}", e)))?
+            .into();
+
+        let completed_at = row
+            .completed_at
+            .as_ref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.into())
+                    .map_err(|e| crate::Error::Other(format!("Failed to parse completed_at: {}", e)))
+            })
+            .transpose()?;
+
+        Ok(RollbackEvent {
+            id: row.id,
+            deployment_id: row.deployment_id,
+            target_version: row.target_version,
+            rollback_type,
+            status,
+            error_message: row.error_message,
+            started_at,
+            completed_at,
+            notification_sent: row.notification_sent != 0,
+        })
+    }
+
+    /// List deployment rollback events for a deployment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_deployment_rollback_events(
+        &self,
+        environment_name: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<crate::deployment_rollback::RollbackEvent>> {
+        use crate::deployment_rollback::{RollbackEvent, RollbackStatus, RollbackType};
+
+        #[derive(sqlx::FromRow)]
+        struct RollbackRow {
+            id: i64,
+            deployment_id: i64,
+            target_version: String,
+            rollback_type: String,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            notification_sent: i64,
+        }
+
+        let limit = limit.unwrap_or(100);
+        let rows: Vec<RollbackRow> = sqlx::query_as(
+            r#"
+            SELECT dre.id, dre.deployment_id, dre.target_version, dre.rollback_type,
+                   dre.status, dre.error_message, dre.started_at, dre.completed_at,
+                   dre.notification_sent
+            FROM deployment_rollback_events dre
+            INNER JOIN deployments d ON dre.deployment_id = d.id
+            WHERE d.environment_name = ?
+            ORDER BY dre.started_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(environment_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut rollbacks = Vec::new();
+        for row in rows {
+            let rollback_type = match row.rollback_type.as_str() {
+                "previous" => RollbackType::Previous,
+                "specific" => RollbackType::Specific,
+                "blue_green_switch" => RollbackType::BlueGreenSwitch,
+                "automatic" => RollbackType::Automatic,
+                _ => RollbackType::Previous,
+            };
+
+            let status = match row.status.as_str() {
+                "pending" => RollbackStatus::Pending,
+                "in_progress" => RollbackStatus::InProgress,
+                "completed" => RollbackStatus::Completed,
+                "failed" => RollbackStatus::Failed,
+                _ => RollbackStatus::Pending,
+            };
+
+            let started_at = chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                .map_err(|e| crate::Error::Other(format!("Failed to parse started_at: {}", e)))?
+                .into();
+
+            let completed_at = row
+                .completed_at
+                .as_ref()
+                .map(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|dt| dt.into())
+                        .map_err(|e| {
+                            crate::Error::Other(format!("Failed to parse completed_at: {}", e))
+                        })
+                })
+                .transpose()?;
+
+            rollbacks.push(RollbackEvent {
+                id: row.id,
+                deployment_id: row.deployment_id,
+                target_version: row.target_version,
+                rollback_type,
+                status,
+                error_message: row.error_message,
+                started_at,
+                completed_at,
+                notification_sent: row.notification_sent != 0,
+            });
+        }
+
+        Ok(rollbacks)
+    }
+
+    /// Mark rollback notification as sent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn mark_deployment_rollback_notification_sent(
+        &self,
+        rollback_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE deployment_rollback_events SET notification_sent = 1 WHERE id = ?",
+        )
+        .bind(rollback_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     // ==================== Token Tracking Operations ====================

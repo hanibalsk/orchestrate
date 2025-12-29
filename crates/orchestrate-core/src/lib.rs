@@ -22,6 +22,7 @@ mod database_pipeline_tests;
 #[cfg(test)]
 mod database_environment_tests;
 pub mod deployment_executor;
+pub mod deployment_rollback;
 pub mod deployment_strategy;
 pub mod environment;
 pub mod epic;
@@ -140,4 +141,10 @@ pub use deployment_executor::{
 pub use post_deploy_verification::{
     PostDeployVerifier, VerificationCheck, VerificationCheckStatus, VerificationCheckType,
     VerificationResult,
+};
+
+// Re-export deployment rollback types
+pub use deployment_rollback::{
+    DeploymentRollback, RollbackEvent as DeploymentRollbackEvent, RollbackNotification,
+    RollbackRequest, RollbackStatus as DeploymentRollbackStatus, RollbackType,
 };

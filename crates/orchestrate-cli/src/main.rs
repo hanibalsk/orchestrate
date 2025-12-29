@@ -5,8 +5,9 @@ use clap::{Parser, Subcommand};
 use orchestrate_claude::{AgentLoop, ClaudeCliClient, ClaudeClient};
 use orchestrate_core::{
     Agent, AgentState, AgentType, CreateEnvironment, CustomInstruction, Database,
-    Epic, EpicStatus, EnvironmentType, LearningEngine, PatternStatus, PreDeployValidator,
-    Schedule, ScheduleRun, ShellState, Story, StoryStatus, ValidationStatus, Worktree,
+    DeploymentRollback, Epic, EpicStatus, EnvironmentType, LearningEngine, PatternStatus,
+    PreDeployValidator, RollbackRequest, Schedule, ScheduleRun, ShellState, Story, StoryStatus,
+    ValidationStatus, Worktree,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -880,6 +881,24 @@ enum DeployAction {
         /// Version to validate (optional)
         #[arg(long)]
         version: Option<String>,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Rollback deployment to a previous version
+    Rollback {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Specific version to rollback to (defaults to previous successful)
+        #[arg(long)]
+        version: Option<String>,
+        /// Skip pre-deployment validation
+        #[arg(long)]
+        skip_validation: bool,
+        /// Force rollback even if current deployment is successful
+        #[arg(long)]
+        force: bool,
         /// Output format (table, json)
         #[arg(long, default_value = "table")]
         format: String,
@@ -2633,6 +2652,23 @@ async fn main() -> Result<()> {
                 format,
             } => {
                 handle_deploy_validate(&db, &env, version.as_deref(), &format).await?;
+            }
+            DeployAction::Rollback {
+                env,
+                version,
+                skip_validation,
+                force,
+                format,
+            } => {
+                handle_deploy_rollback(
+                    &db,
+                    &env,
+                    version.as_deref(),
+                    skip_validation,
+                    force,
+                    &format,
+                )
+                .await?;
             }
         },
     }
@@ -4699,6 +4735,77 @@ async fn handle_deploy_validate(
     }
 
     println!("All checks passed. Environment is ready for deployment.");
+    Ok(())
+}
+
+async fn handle_deploy_rollback(
+    db: &Database,
+    env: &str,
+    version: Option<&str>,
+    skip_validation: bool,
+    force: bool,
+    format: &str,
+) -> Result<()> {
+    let rollback_service = DeploymentRollback::new(Arc::new(db.clone()));
+
+    let request = RollbackRequest {
+        environment: env.to_string(),
+        target_version: version.map(|v| v.to_string()),
+        skip_validation,
+        force,
+    };
+
+    println!("Initiating rollback for environment '{}'...", env);
+    if let Some(v) = version {
+        println!("Target version: {}", v);
+    } else {
+        println!("Target: Previous successful deployment");
+    }
+    println!();
+
+    let rollback_event = rollback_service.rollback(request).await?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&rollback_event)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Rollback completed successfully!");
+    println!();
+    println!("Rollback Details:");
+    println!("  ID: {}", rollback_event.id);
+    println!("  Type: {}", rollback_event.rollback_type);
+    println!("  Target Version: {}", rollback_event.target_version);
+    println!("  Status: {}", rollback_event.status);
+    println!(
+        "  Started At: {}",
+        rollback_event.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    if let Some(completed_at) = rollback_event.completed_at {
+        println!(
+            "  Completed At: {}",
+            completed_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        let duration = (completed_at - rollback_event.started_at).num_seconds();
+        println!("  Duration: {}s", duration);
+    }
+    println!(
+        "  Notification Sent: {}",
+        if rollback_event.notification_sent {
+            "Yes"
+        } else {
+            "No"
+        }
+    );
+
+    if let Some(error) = &rollback_event.error_message {
+        println!("  Error: {}", error);
+    }
+
+    println!();
+    println!("Environment '{}' has been rolled back to version '{}'", env, rollback_event.target_version);
+
     Ok(())
 }
 
