@@ -230,6 +230,54 @@ pub struct TestGenerationResult {
     pub test_file_path: PathBuf,
 }
 
+/// Type of property that can be tested
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyType {
+    /// Roundtrip: parse(serialize(x)) == x or decode(encode(x)) == x
+    Roundtrip,
+    /// Idempotency: f(f(x)) == f(x)
+    Idempotency,
+    /// Commutativity: f(a, b) == f(b, a)
+    Commutativity,
+    /// Associativity: f(f(a, b), c) == f(a, f(b, c))
+    Associativity,
+    /// Identity: f(x, identity) == x
+    Identity,
+    /// Inverse: f(g(x)) == x where g is inverse of f
+    Inverse,
+}
+
+/// Property-based test case definition
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyTestCase {
+    /// Property being tested
+    pub property: PropertyType,
+    /// Function being tested
+    pub function_name: String,
+    /// Related function (for roundtrip, inverse, etc.)
+    pub related_function: Option<String>,
+    /// Generated test code
+    pub code: String,
+    /// Test name
+    pub name: String,
+}
+
+/// Result of property-based test generation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PropertyTestResult {
+    /// Source file analyzed
+    pub source_file: PathBuf,
+    /// Language detected
+    pub language: Language,
+    /// Functions analyzed
+    pub functions: Vec<FunctionSignature>,
+    /// Property test cases generated
+    pub property_tests: Vec<PropertyTestCase>,
+    /// Test file path
+    pub test_file_path: PathBuf,
+}
+
 /// Service for generating unit tests
 pub struct TestGenerationService;
 
@@ -1972,6 +2020,615 @@ mod tests {{
 
         Ok(output)
     }
+
+    /// Generate property-based tests for a function or file
+    pub async fn generate_property_tests(
+        &self,
+        file_path: &Path,
+        target_function: Option<&str>,
+    ) -> Result<PropertyTestResult> {
+        // Detect language
+        let language = Language::from_path(file_path)?;
+
+        // Read source code
+        let source_code = tokio::fs::read_to_string(file_path)
+            .await
+            .map_err(|e| Error::Other(format!("Failed to read file: {}", e)))?;
+
+        // Extract function signatures
+        let functions = self.extract_functions(&source_code, language)?;
+
+        // Filter to target function if specified
+        let functions_to_test = if let Some(target) = target_function {
+            functions
+                .iter()
+                .filter(|f| f.name == target)
+                .cloned()
+                .collect()
+        } else {
+            functions.clone()
+        };
+
+        // Identify suitable functions and generate property tests
+        let property_tests = self.identify_and_generate_property_tests(
+            &functions_to_test,
+            &functions,
+            language,
+        )?;
+
+        // Determine test file location
+        let test_file_path = self.determine_property_test_location(file_path, language)?;
+
+        Ok(PropertyTestResult {
+            source_file: file_path.to_path_buf(),
+            language,
+            functions: functions_to_test,
+            property_tests,
+            test_file_path,
+        })
+    }
+
+    /// Identify suitable functions for property testing and generate tests
+    fn identify_and_generate_property_tests(
+        &self,
+        target_functions: &[FunctionSignature],
+        all_functions: &[FunctionSignature],
+        language: Language,
+    ) -> Result<Vec<PropertyTestCase>> {
+        let mut property_tests = Vec::new();
+
+        for function in target_functions {
+            // Check for roundtrip property (serialize/deserialize, encode/decode, parse/format)
+            if let Some(related) = self.find_roundtrip_pair(&function.name, all_functions) {
+                property_tests.push(self.generate_roundtrip_test(
+                    function,
+                    &related,
+                    language,
+                )?);
+            }
+
+            // Check for idempotency (functions that should produce same result when applied twice)
+            if self.is_idempotent_candidate(function) {
+                property_tests.push(self.generate_idempotency_test(function, language)?);
+            }
+
+            // Check for commutativity (binary operations where order doesn't matter)
+            if self.is_commutative_candidate(function) {
+                property_tests.push(self.generate_commutativity_test(function, language)?);
+            }
+
+            // Check for inverse property
+            if let Some(inverse) = self.find_inverse_function(&function.name, all_functions) {
+                property_tests.push(self.generate_inverse_test(
+                    function,
+                    &inverse,
+                    language,
+                )?);
+            }
+        }
+
+        Ok(property_tests)
+    }
+
+    /// Find roundtrip pair (e.g., serialize/deserialize, encode/decode)
+    fn find_roundtrip_pair(
+        &self,
+        function_name: &str,
+        all_functions: &[FunctionSignature],
+    ) -> Option<FunctionSignature> {
+        let lower_name = function_name.to_lowercase();
+
+        // Common roundtrip patterns
+        let patterns = [
+            ("serialize", "deserialize"),
+            ("encode", "decode"),
+            ("parse", "format"),
+            ("parse", "serialize"),
+            ("to_string", "from_string"),
+            ("to_json", "from_json"),
+            ("compress", "decompress"),
+            ("encrypt", "decrypt"),
+        ];
+
+        for (first, second) in patterns {
+            if lower_name.contains(first) {
+                let complement = lower_name.replace(first, second);
+                if let Some(pair) = all_functions.iter().find(|f| f.name.to_lowercase() == complement) {
+                    return Some(pair.clone());
+                }
+            } else if lower_name.contains(second) {
+                let complement = lower_name.replace(second, first);
+                if let Some(pair) = all_functions.iter().find(|f| f.name.to_lowercase() == complement) {
+                    return Some(pair.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if function is a candidate for idempotency testing
+    fn is_idempotent_candidate(&self, function: &FunctionSignature) -> bool {
+        let lower_name = function.name.to_lowercase();
+
+        // Functions that typically should be idempotent
+        let idempotent_keywords = [
+            "normalize",
+            "sanitize",
+            "clean",
+            "trim",
+            "sort",
+            "unique",
+            "dedupe",
+            "format",
+        ];
+
+        idempotent_keywords.iter().any(|keyword| lower_name.contains(keyword))
+            && function.return_type.is_some()
+    }
+
+    /// Check if function is a candidate for commutativity testing
+    fn is_commutative_candidate(&self, function: &FunctionSignature) -> bool {
+        // Binary operations with same-type parameters
+        if function.parameters.len() != 2 {
+            return false;
+        }
+
+        let lower_name = function.name.to_lowercase();
+
+        // Common commutative operations
+        let commutative_ops = ["add", "multiply", "max", "min", "gcd", "lcm", "union", "intersection"];
+
+        commutative_ops.iter().any(|op| lower_name.contains(op))
+    }
+
+    /// Find inverse function (e.g., add/subtract, increment/decrement)
+    fn find_inverse_function(
+        &self,
+        function_name: &str,
+        all_functions: &[FunctionSignature],
+    ) -> Option<FunctionSignature> {
+        let lower_name = function_name.to_lowercase();
+
+        let inverse_pairs = [
+            ("add", "subtract"),
+            ("increment", "decrement"),
+            ("push", "pop"),
+            ("insert", "remove"),
+        ];
+
+        for (first, second) in inverse_pairs {
+            if lower_name.contains(first) {
+                let inverse_name = lower_name.replace(first, second);
+                if let Some(inverse) = all_functions.iter().find(|f| f.name.to_lowercase() == inverse_name) {
+                    return Some(inverse.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Generate roundtrip property test
+    fn generate_roundtrip_test(
+        &self,
+        function: &FunctionSignature,
+        related: &FunctionSignature,
+        language: Language,
+    ) -> Result<PropertyTestCase> {
+        let test_name = format!("{}_roundtrip", function.name);
+
+        let code = match language {
+            Language::Rust => self.generate_rust_roundtrip_test(function, related),
+            Language::TypeScript => self.generate_typescript_roundtrip_test(function, related),
+            Language::Python => self.generate_python_roundtrip_test(function, related),
+        };
+
+        Ok(PropertyTestCase {
+            property: PropertyType::Roundtrip,
+            function_name: function.name.clone(),
+            related_function: Some(related.name.clone()),
+            code,
+            name: test_name,
+        })
+    }
+
+    /// Generate Rust roundtrip property test
+    fn generate_rust_roundtrip_test(
+        &self,
+        function: &FunctionSignature,
+        related: &FunctionSignature,
+    ) -> String {
+        format!(
+            r#"proptest! {{
+    #[test]
+    fn {}_roundtrip(input: String) {{
+        let result = {}(&input);
+        if let Ok(value) = result {{
+            let serialized = {}(&value);
+            let reparsed = {}(&serialized).unwrap();
+            assert_eq!(value, reparsed);
+        }}
+    }}
+}}"#,
+            function.name, function.name, related.name, function.name
+        )
+    }
+
+    /// Generate TypeScript roundtrip property test using fast-check
+    fn generate_typescript_roundtrip_test(
+        &self,
+        function: &FunctionSignature,
+        related: &FunctionSignature,
+    ) -> String {
+        format!(
+            r#"import {{ test }} from 'vitest';
+import fc from 'fast-check';
+
+test('{}_roundtrip', () => {{
+    fc.assert(
+        fc.property(fc.string(), (input) => {{
+            const result = {}(input);
+            if (result !== null && result !== undefined) {{
+                const serialized = {}(result);
+                const reparsed = {}(serialized);
+                expect(reparsed).toEqual(result);
+            }}
+        }})
+    );
+}});"#,
+            function.name, function.name, related.name, function.name
+        )
+    }
+
+    /// Generate Python roundtrip property test using hypothesis
+    fn generate_python_roundtrip_test(
+        &self,
+        function: &FunctionSignature,
+        related: &FunctionSignature,
+    ) -> String {
+        format!(
+            r#"from hypothesis import given
+from hypothesis import strategies as st
+
+@given(st.text())
+def test_{}_roundtrip(input_str):
+    result = {}(input_str)
+    if result is not None:
+        serialized = {}(result)
+        reparsed = {}(serialized)
+        assert reparsed == result"#,
+            function.name, function.name, related.name, function.name
+        )
+    }
+
+    /// Generate idempotency property test
+    fn generate_idempotency_test(
+        &self,
+        function: &FunctionSignature,
+        language: Language,
+    ) -> Result<PropertyTestCase> {
+        let test_name = format!("{}_idempotent", function.name);
+
+        let code = match language {
+            Language::Rust => self.generate_rust_idempotency_test(function),
+            Language::TypeScript => self.generate_typescript_idempotency_test(function),
+            Language::Python => self.generate_python_idempotency_test(function),
+        };
+
+        Ok(PropertyTestCase {
+            property: PropertyType::Idempotency,
+            function_name: function.name.clone(),
+            related_function: None,
+            code,
+            name: test_name,
+        })
+    }
+
+    /// Generate Rust idempotency test
+    fn generate_rust_idempotency_test(&self, function: &FunctionSignature) -> String {
+        format!(
+            r#"proptest! {{
+    #[test]
+    fn {}_idempotent(input: String) {{
+        let once = {}(&input);
+        let twice = {}(&once);
+        assert_eq!(once, twice);
+    }}
+}}"#,
+            function.name, function.name, function.name
+        )
+    }
+
+    /// Generate TypeScript idempotency test
+    fn generate_typescript_idempotency_test(&self, function: &FunctionSignature) -> String {
+        format!(
+            r#"import {{ test }} from 'vitest';
+import fc from 'fast-check';
+
+test('{}_idempotent', () => {{
+    fc.assert(
+        fc.property(fc.string(), (input) => {{
+            const once = {}(input);
+            const twice = {}(once);
+            expect(twice).toEqual(once);
+        }})
+    );
+}});"#,
+            function.name, function.name, function.name
+        )
+    }
+
+    /// Generate Python idempotency test
+    fn generate_python_idempotency_test(&self, function: &FunctionSignature) -> String {
+        format!(
+            r#"from hypothesis import given
+from hypothesis import strategies as st
+
+@given(st.text())
+def test_{}_idempotent(input_str):
+    once = {}(input_str)
+    twice = {}(once)
+    assert twice == once"#,
+            function.name, function.name, function.name
+        )
+    }
+
+    /// Generate commutativity property test
+    fn generate_commutativity_test(
+        &self,
+        function: &FunctionSignature,
+        language: Language,
+    ) -> Result<PropertyTestCase> {
+        let test_name = format!("{}_commutative", function.name);
+
+        let code = match language {
+            Language::Rust => self.generate_rust_commutativity_test(function),
+            Language::TypeScript => self.generate_typescript_commutativity_test(function),
+            Language::Python => self.generate_python_commutativity_test(function),
+        };
+
+        Ok(PropertyTestCase {
+            property: PropertyType::Commutativity,
+            function_name: function.name.clone(),
+            related_function: None,
+            code,
+            name: test_name,
+        })
+    }
+
+    /// Generate Rust commutativity test
+    fn generate_rust_commutativity_test(&self, function: &FunctionSignature) -> String {
+        format!(
+            r#"proptest! {{
+    #[test]
+    fn {}_commutative(a: i32, b: i32) {{
+        let result1 = {}(a, b);
+        let result2 = {}(b, a);
+        assert_eq!(result1, result2);
+    }}
+}}"#,
+            function.name, function.name, function.name
+        )
+    }
+
+    /// Generate TypeScript commutativity test
+    fn generate_typescript_commutativity_test(&self, function: &FunctionSignature) -> String {
+        format!(
+            r#"import {{ test }} from 'vitest';
+import fc from 'fast-check';
+
+test('{}_commutative', () => {{
+    fc.assert(
+        fc.property(fc.integer(), fc.integer(), (a, b) => {{
+            const result1 = {}(a, b);
+            const result2 = {}(b, a);
+            expect(result2).toEqual(result1);
+        }})
+    );
+}});"#,
+            function.name, function.name, function.name
+        )
+    }
+
+    /// Generate Python commutativity test
+    fn generate_python_commutativity_test(&self, function: &FunctionSignature) -> String {
+        format!(
+            r#"from hypothesis import given
+from hypothesis import strategies as st
+
+@given(st.integers(), st.integers())
+def test_{}_commutative(a, b):
+    result1 = {}(a, b)
+    result2 = {}(b, a)
+    assert result2 == result1"#,
+            function.name, function.name, function.name
+        )
+    }
+
+    /// Generate inverse property test
+    fn generate_inverse_test(
+        &self,
+        function: &FunctionSignature,
+        inverse: &FunctionSignature,
+        language: Language,
+    ) -> Result<PropertyTestCase> {
+        let test_name = format!("{}_{}_inverse", function.name, inverse.name);
+
+        let code = match language {
+            Language::Rust => self.generate_rust_inverse_test(function, inverse),
+            Language::TypeScript => self.generate_typescript_inverse_test(function, inverse),
+            Language::Python => self.generate_python_inverse_test(function, inverse),
+        };
+
+        Ok(PropertyTestCase {
+            property: PropertyType::Inverse,
+            function_name: function.name.clone(),
+            related_function: Some(inverse.name.clone()),
+            code,
+            name: test_name,
+        })
+    }
+
+    /// Generate Rust inverse test
+    fn generate_rust_inverse_test(
+        &self,
+        function: &FunctionSignature,
+        inverse: &FunctionSignature,
+    ) -> String {
+        format!(
+            r#"proptest! {{
+    #[test]
+    fn {}_{}_inverse(x: i32, y: i32) {{
+        let result = {}(x, y);
+        let back = {}(result, y);
+        assert_eq!(back, x);
+    }}
+}}"#,
+            function.name, inverse.name, function.name, inverse.name
+        )
+    }
+
+    /// Generate TypeScript inverse test
+    fn generate_typescript_inverse_test(
+        &self,
+        function: &FunctionSignature,
+        inverse: &FunctionSignature,
+    ) -> String {
+        format!(
+            r#"import {{ test }} from 'vitest';
+import fc from 'fast-check';
+
+test('{}_{}_inverse', () => {{
+    fc.assert(
+        fc.property(fc.integer(), fc.integer(), (x, y) => {{
+            const result = {}(x, y);
+            const back = {}(result, y);
+            expect(back).toEqual(x);
+        }})
+    );
+}});"#,
+            function.name, inverse.name, function.name, inverse.name
+        )
+    }
+
+    /// Generate Python inverse test
+    fn generate_python_inverse_test(
+        &self,
+        function: &FunctionSignature,
+        inverse: &FunctionSignature,
+    ) -> String {
+        format!(
+            r#"from hypothesis import given
+from hypothesis import strategies as st
+
+@given(st.integers(), st.integers())
+def test_{}_{}_inverse(x, y):
+    result = {}(x, y)
+    back = {}(result, y)
+    assert back == x"#,
+            function.name, inverse.name, function.name, inverse.name
+        )
+    }
+
+    /// Determine property test file location
+    fn determine_property_test_location(
+        &self,
+        source_file: &Path,
+        language: Language,
+    ) -> Result<PathBuf> {
+        match language {
+            Language::Rust => {
+                // Place alongside source with _proptest suffix
+                let mut path = source_file.to_path_buf();
+                let stem = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| Error::Other("Invalid file name".to_string()))?;
+                path.set_file_name(format!("{}_proptest.rs", stem));
+                Ok(path)
+            }
+            Language::TypeScript => {
+                // Place in __tests__ directory
+                let file_name = source_file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| Error::Other("Invalid file name".to_string()))?;
+                Ok(PathBuf::from(format!("__tests__/{}.property.test.ts", file_name)))
+            }
+            Language::Python => {
+                // Place alongside with test_ prefix
+                let file_name = source_file
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| Error::Other("Invalid file name".to_string()))?;
+                let parent = source_file.parent().unwrap_or_else(|| Path::new("."));
+                Ok(parent.join(format!("test_property_{}", file_name)))
+            }
+        }
+    }
+
+    /// Format property test output
+    pub fn format_property_test_output(&self, result: &PropertyTestResult) -> Result<String> {
+        match result.language {
+            Language::Rust => self.format_rust_property_tests(result),
+            Language::TypeScript => self.format_typescript_property_tests(result),
+            Language::Python => self.format_python_property_tests(result),
+        }
+    }
+
+    /// Format Rust property tests
+    fn format_rust_property_tests(&self, result: &PropertyTestResult) -> Result<String> {
+        let mut output = String::from(
+            r#"//! Property-based tests
+//! Generated by orchestrate test generator
+
+use proptest::prelude::*;
+
+"#,
+        );
+
+        for test in &result.property_tests {
+            output.push_str(&test.code);
+            output.push_str("\n\n");
+        }
+
+        Ok(output)
+    }
+
+    /// Format TypeScript property tests
+    fn format_typescript_property_tests(&self, result: &PropertyTestResult) -> Result<String> {
+        let mut output = String::from(
+            r#"// Property-based tests
+// Generated by orchestrate test generator
+
+"#,
+        );
+
+        for test in &result.property_tests {
+            output.push_str(&test.code);
+            output.push_str("\n\n");
+        }
+
+        Ok(output)
+    }
+
+    /// Format Python property tests
+    fn format_python_property_tests(&self, result: &PropertyTestResult) -> Result<String> {
+        let mut output = String::from(
+            r#"""Property-based tests
+Generated by orchestrate test generator
+"""
+
+"#,
+        );
+
+        for test in &result.property_tests {
+            output.push_str(&test.code);
+            output.push_str("\n\n");
+        }
+
+        Ok(output)
+    }
 }
 
 impl Default for TestGenerationService {
@@ -2956,5 +3613,605 @@ Some description here.
         assert!(output.contains("mod tests {"));
         assert!(output.contains("// Story ID: epic-005.4"));
         assert!(output.contains("fn test_generate()"));
+    }
+
+    // Property-based test generation tests
+    #[test]
+    fn test_find_roundtrip_pair_serialize_deserialize() {
+        let service = TestGenerationService::new();
+        let functions = vec![
+            FunctionSignature {
+                name: "serialize".to_string(),
+                parameters: vec![],
+                return_type: Some("String".to_string()),
+                is_async: false,
+                line_number: 1,
+            },
+            FunctionSignature {
+                name: "deserialize".to_string(),
+                parameters: vec![],
+                return_type: Some("Value".to_string()),
+                is_async: false,
+                line_number: 5,
+            },
+        ];
+
+        let pair = service.find_roundtrip_pair("serialize", &functions);
+        assert!(pair.is_some());
+        assert_eq!(pair.unwrap().name, "deserialize");
+    }
+
+    #[test]
+    fn test_find_roundtrip_pair_encode_decode() {
+        let service = TestGenerationService::new();
+        let functions = vec![
+            FunctionSignature {
+                name: "encode".to_string(),
+                parameters: vec![],
+                return_type: Some("String".to_string()),
+                is_async: false,
+                line_number: 1,
+            },
+            FunctionSignature {
+                name: "decode".to_string(),
+                parameters: vec![],
+                return_type: Some("Value".to_string()),
+                is_async: false,
+                line_number: 5,
+            },
+        ];
+
+        let pair = service.find_roundtrip_pair("encode", &functions);
+        assert!(pair.is_some());
+        assert_eq!(pair.unwrap().name, "decode");
+    }
+
+    #[test]
+    fn test_find_roundtrip_pair_no_match() {
+        let service = TestGenerationService::new();
+        let functions = vec![
+            FunctionSignature {
+                name: "serialize".to_string(),
+                parameters: vec![],
+                return_type: Some("String".to_string()),
+                is_async: false,
+                line_number: 1,
+            },
+        ];
+
+        let pair = service.find_roundtrip_pair("serialize", &functions);
+        assert!(pair.is_none());
+    }
+
+    #[test]
+    fn test_is_idempotent_candidate_normalize() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "normalize_string".to_string(),
+            parameters: vec![],
+            return_type: Some("String".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        assert!(service.is_idempotent_candidate(&function));
+    }
+
+    #[test]
+    fn test_is_idempotent_candidate_trim() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "trim".to_string(),
+            parameters: vec![],
+            return_type: Some("String".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        assert!(service.is_idempotent_candidate(&function));
+    }
+
+    #[test]
+    fn test_is_idempotent_candidate_no_return() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "normalize".to_string(),
+            parameters: vec![],
+            return_type: None,
+            is_async: false,
+            line_number: 1,
+        };
+
+        assert!(!service.is_idempotent_candidate(&function));
+    }
+
+    #[test]
+    fn test_is_commutative_candidate_add() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "add".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "a".to_string(),
+                    type_hint: Some("i32".to_string()),
+                },
+                Parameter {
+                    name: "b".to_string(),
+                    type_hint: Some("i32".to_string()),
+                },
+            ],
+            return_type: Some("i32".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        assert!(service.is_commutative_candidate(&function));
+    }
+
+    #[test]
+    fn test_is_commutative_candidate_multiply() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "multiply".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "a".to_string(),
+                    type_hint: Some("i32".to_string()),
+                },
+                Parameter {
+                    name: "b".to_string(),
+                    type_hint: Some("i32".to_string()),
+                },
+            ],
+            return_type: Some("i32".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        assert!(service.is_commutative_candidate(&function));
+    }
+
+    #[test]
+    fn test_is_commutative_candidate_wrong_param_count() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "add".to_string(),
+            parameters: vec![
+                Parameter {
+                    name: "a".to_string(),
+                    type_hint: Some("i32".to_string()),
+                },
+            ],
+            return_type: Some("i32".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        assert!(!service.is_commutative_candidate(&function));
+    }
+
+    #[test]
+    fn test_find_inverse_function_add_subtract() {
+        let service = TestGenerationService::new();
+        let functions = vec![
+            FunctionSignature {
+                name: "add".to_string(),
+                parameters: vec![],
+                return_type: Some("i32".to_string()),
+                is_async: false,
+                line_number: 1,
+            },
+            FunctionSignature {
+                name: "subtract".to_string(),
+                parameters: vec![],
+                return_type: Some("i32".to_string()),
+                is_async: false,
+                line_number: 5,
+            },
+        ];
+
+        let inverse = service.find_inverse_function("add", &functions);
+        assert!(inverse.is_some());
+        assert_eq!(inverse.unwrap().name, "subtract");
+    }
+
+    #[test]
+    fn test_generate_rust_roundtrip_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "parse".to_string(),
+            parameters: vec![],
+            return_type: Some("Value".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+        let related = FunctionSignature {
+            name: "serialize".to_string(),
+            parameters: vec![],
+            return_type: Some("String".to_string()),
+            is_async: false,
+            line_number: 5,
+        };
+
+        let code = service.generate_rust_roundtrip_test(&function, &related);
+        assert!(code.contains("proptest!"));
+        assert!(code.contains("fn parse_roundtrip"));
+        assert!(code.contains("parse(&input)"));
+        assert!(code.contains("serialize(&value)"));
+        assert!(code.contains("assert_eq!(value, reparsed)"));
+    }
+
+    #[test]
+    fn test_generate_typescript_roundtrip_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "parse".to_string(),
+            parameters: vec![],
+            return_type: Some("Value".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+        let related = FunctionSignature {
+            name: "serialize".to_string(),
+            parameters: vec![],
+            return_type: Some("String".to_string()),
+            is_async: false,
+            line_number: 5,
+        };
+
+        let code = service.generate_typescript_roundtrip_test(&function, &related);
+        assert!(code.contains("import fc from 'fast-check'"));
+        assert!(code.contains("test('parse_roundtrip'"));
+        assert!(code.contains("fc.property(fc.string()"));
+        assert!(code.contains("parse(input)"));
+        assert!(code.contains("serialize(result)"));
+    }
+
+    #[test]
+    fn test_generate_python_roundtrip_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "parse".to_string(),
+            parameters: vec![],
+            return_type: Some("Value".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+        let related = FunctionSignature {
+            name: "serialize".to_string(),
+            parameters: vec![],
+            return_type: Some("String".to_string()),
+            is_async: false,
+            line_number: 5,
+        };
+
+        let code = service.generate_python_roundtrip_test(&function, &related);
+        assert!(code.contains("from hypothesis import given"));
+        assert!(code.contains("@given(st.text())"));
+        assert!(code.contains("def test_parse_roundtrip"));
+        assert!(code.contains("parse(input_str)"));
+        assert!(code.contains("serialize(result)"));
+    }
+
+    #[test]
+    fn test_generate_rust_idempotency_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "normalize".to_string(),
+            parameters: vec![],
+            return_type: Some("String".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        let code = service.generate_rust_idempotency_test(&function);
+        assert!(code.contains("proptest!"));
+        assert!(code.contains("fn normalize_idempotent"));
+        assert!(code.contains("normalize(&input)"));
+        assert!(code.contains("normalize(&once)"));
+        assert!(code.contains("assert_eq!(once, twice)"));
+    }
+
+    #[test]
+    fn test_generate_rust_commutativity_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "add".to_string(),
+            parameters: vec![],
+            return_type: Some("i32".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        let code = service.generate_rust_commutativity_test(&function);
+        assert!(code.contains("proptest!"));
+        assert!(code.contains("fn add_commutative"));
+        assert!(code.contains("add(a, b)"));
+        assert!(code.contains("add(b, a)"));
+        assert!(code.contains("assert_eq!(result1, result2)"));
+    }
+
+    #[test]
+    fn test_generate_rust_inverse_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "add".to_string(),
+            parameters: vec![],
+            return_type: Some("i32".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+        let inverse = FunctionSignature {
+            name: "subtract".to_string(),
+            parameters: vec![],
+            return_type: Some("i32".to_string()),
+            is_async: false,
+            line_number: 5,
+        };
+
+        let code = service.generate_rust_inverse_test(&function, &inverse);
+        assert!(code.contains("proptest!"));
+        assert!(code.contains("fn add_subtract_inverse"));
+        assert!(code.contains("add(x, y)"));
+        assert!(code.contains("subtract(result, y)"));
+        assert!(code.contains("assert_eq!(back, x)"));
+    }
+
+    #[test]
+    fn test_determine_property_test_location_rust() {
+        let service = TestGenerationService::new();
+        let source = Path::new("src/parser.rs");
+
+        let path = service
+            .determine_property_test_location(source, Language::Rust)
+            .unwrap();
+        assert_eq!(path, PathBuf::from("src/parser_proptest.rs"));
+    }
+
+    #[test]
+    fn test_determine_property_test_location_typescript() {
+        let service = TestGenerationService::new();
+        let source = Path::new("src/parser.ts");
+
+        let path = service
+            .determine_property_test_location(source, Language::TypeScript)
+            .unwrap();
+        assert_eq!(path, PathBuf::from("__tests__/parser.property.test.ts"));
+    }
+
+    #[test]
+    fn test_determine_property_test_location_python() {
+        let service = TestGenerationService::new();
+        let source = Path::new("src/parser.py");
+
+        let path = service
+            .determine_property_test_location(source, Language::Python)
+            .unwrap();
+        assert_eq!(path, PathBuf::from("src/test_property_parser.py"));
+    }
+
+    #[test]
+    fn test_format_rust_property_tests() {
+        let service = TestGenerationService::new();
+        let result = PropertyTestResult {
+            source_file: PathBuf::from("src/test.rs"),
+            language: Language::Rust,
+            functions: vec![],
+            property_tests: vec![PropertyTestCase {
+                property: PropertyType::Roundtrip,
+                function_name: "parse".to_string(),
+                related_function: Some("serialize".to_string()),
+                code: "proptest! { }".to_string(),
+                name: "parse_roundtrip".to_string(),
+            }],
+            test_file_path: PathBuf::from("src/test_proptest.rs"),
+        };
+
+        let output = service.format_rust_property_tests(&result).unwrap();
+        assert!(output.contains("Property-based tests"));
+        assert!(output.contains("use proptest::prelude::*"));
+        assert!(output.contains("proptest! { }"));
+    }
+
+    #[test]
+    fn test_format_typescript_property_tests() {
+        let service = TestGenerationService::new();
+        let result = PropertyTestResult {
+            source_file: PathBuf::from("src/test.ts"),
+            language: Language::TypeScript,
+            functions: vec![],
+            property_tests: vec![PropertyTestCase {
+                property: PropertyType::Idempotency,
+                function_name: "normalize".to_string(),
+                related_function: None,
+                code: "test('normalize', () => {})".to_string(),
+                name: "normalize_idempotent".to_string(),
+            }],
+            test_file_path: PathBuf::from("__tests__/test.property.test.ts"),
+        };
+
+        let output = service.format_typescript_property_tests(&result).unwrap();
+        assert!(output.contains("Property-based tests"));
+        assert!(output.contains("test('normalize'"));
+    }
+
+    #[test]
+    fn test_format_python_property_tests() {
+        let service = TestGenerationService::new();
+        let result = PropertyTestResult {
+            source_file: PathBuf::from("src/test.py"),
+            language: Language::Python,
+            functions: vec![],
+            property_tests: vec![PropertyTestCase {
+                property: PropertyType::Commutativity,
+                function_name: "add".to_string(),
+                related_function: None,
+                code: "def test_add(): pass".to_string(),
+                name: "add_commutative".to_string(),
+            }],
+            test_file_path: PathBuf::from("src/test_property_test.py"),
+        };
+
+        let output = service.format_python_property_tests(&result).unwrap();
+        assert!(output.contains("Property-based tests"));
+        assert!(output.contains("def test_add()"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_property_tests_for_file() {
+        use tempfile::Builder;
+        use std::io::Write;
+
+        let service = TestGenerationService::new();
+
+        // Create a temporary Rust file with functions suitable for property testing
+        let mut temp_file = Builder::new()
+            .suffix(".rs")
+            .tempfile()
+            .unwrap();
+        writeln!(
+            temp_file,
+            r#"
+pub fn serialize(value: &Value) -> String {{
+    // implementation
+}}
+
+pub fn deserialize(input: &str) -> Result<Value> {{
+    // implementation
+}}
+
+pub fn normalize(input: &str) -> String {{
+    // implementation
+}}
+
+pub fn add(a: i32, b: i32) -> i32 {{
+    a + b
+}}
+"#
+        )
+        .unwrap();
+
+        let result = service
+            .generate_property_tests(temp_file.path(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.language, Language::Rust);
+        assert!(result.functions.len() >= 4);
+
+        // Should find roundtrip property for serialize/deserialize
+        let has_roundtrip = result
+            .property_tests
+            .iter()
+            .any(|t| t.property == PropertyType::Roundtrip);
+        assert!(has_roundtrip);
+
+        // Should find idempotency for normalize
+        let has_idempotency = result
+            .property_tests
+            .iter()
+            .any(|t| t.property == PropertyType::Idempotency);
+        assert!(has_idempotency);
+
+        // Should find commutativity for add
+        let has_commutativity = result
+            .property_tests
+            .iter()
+            .any(|t| t.property == PropertyType::Commutativity);
+        assert!(has_commutativity);
+    }
+
+    #[tokio::test]
+    async fn test_generate_property_tests_for_specific_function() {
+        use tempfile::Builder;
+        use std::io::Write;
+
+        let service = TestGenerationService::new();
+
+        let mut temp_file = Builder::new()
+            .suffix(".rs")
+            .tempfile()
+            .unwrap();
+        writeln!(
+            temp_file,
+            r#"
+pub fn encode(value: &str) -> String {{
+    // implementation
+}}
+
+pub fn decode(input: &str) -> String {{
+    // implementation
+}}
+
+pub fn other_function() {{
+    // should not be tested
+}}
+"#
+        )
+        .unwrap();
+
+        let result = service
+            .generate_property_tests(temp_file.path(), Some("encode"))
+            .await
+            .unwrap();
+
+        // Should only test the encode function
+        assert_eq!(result.functions.len(), 1);
+        assert_eq!(result.functions[0].name, "encode");
+
+        // Should generate roundtrip test
+        assert_eq!(result.property_tests.len(), 1);
+        assert_eq!(result.property_tests[0].property, PropertyType::Roundtrip);
+    }
+
+    #[test]
+    fn test_identify_and_generate_property_tests() {
+        let service = TestGenerationService::new();
+
+        let target_functions = vec![
+            FunctionSignature {
+                name: "parse".to_string(),
+                parameters: vec![],
+                return_type: Some("Value".to_string()),
+                is_async: false,
+                line_number: 1,
+            },
+            FunctionSignature {
+                name: "trim".to_string(),
+                parameters: vec![],
+                return_type: Some("String".to_string()),
+                is_async: false,
+                line_number: 10,
+            },
+        ];
+
+        let all_functions = vec![
+            target_functions[0].clone(),
+            FunctionSignature {
+                name: "format".to_string(),
+                parameters: vec![],
+                return_type: Some("String".to_string()),
+                is_async: false,
+                line_number: 5,
+            },
+            target_functions[1].clone(),
+        ];
+
+        let property_tests = service
+            .identify_and_generate_property_tests(&target_functions, &all_functions, Language::Rust)
+            .unwrap();
+
+        // Should generate roundtrip for parse/format and idempotency for trim
+        assert!(property_tests.len() >= 2);
+
+        let has_roundtrip = property_tests
+            .iter()
+            .any(|t| t.property == PropertyType::Roundtrip && t.function_name == "parse");
+        assert!(has_roundtrip);
+
+        let has_idempotency = property_tests
+            .iter()
+            .any(|t| t.property == PropertyType::Idempotency && t.function_name == "trim");
+        assert!(has_idempotency);
     }
 }

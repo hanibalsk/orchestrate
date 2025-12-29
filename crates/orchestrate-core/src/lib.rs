@@ -64,7 +64,8 @@ pub use webhook_config::{EventConfig, EventFilter, WebhookConfig};
 pub use test_generation::{
     AcceptanceCriterion, E2ETestPlatform, E2ETestResult, FunctionSignature,
     IntegrationTestResult, InterfaceInfo, InterfaceType, Language, ModuleInfo, Parameter,
-    TestCase, TestCategory, TestFixture, TestGenerationResult, TestGenerationService, TestType,
+    PropertyTestCase, PropertyTestResult, PropertyType, TestCase, TestCategory, TestFixture,
+    TestGenerationResult, TestGenerationService, TestType,
 };
 
 // Re-export coverage types
