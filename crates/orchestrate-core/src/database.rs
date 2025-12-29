@@ -120,6 +120,10 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/006_webhook_events.sql"))
             .execute(&self.pool)
             .await?;
+        // Pipelines migration
+        sqlx::query(include_str!("../../../migrations/007_pipelines.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1951,6 +1955,296 @@ impl Database {
 
         rows.into_iter().map(|r| r.try_into()).collect()
     }
+
+    // ==================== Pipeline Operations ====================
+
+    /// Insert a new pipeline
+    pub async fn insert_pipeline(&self, pipeline: &crate::Pipeline) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pipelines (name, definition, enabled, created_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(&pipeline.name)
+        .bind(&pipeline.definition)
+        .bind(pipeline.enabled as i32)
+        .bind(pipeline.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get pipeline by ID
+    pub async fn get_pipeline(&self, id: i64) -> Result<Option<crate::Pipeline>> {
+        let row = sqlx::query_as::<_, PipelineRow>("SELECT * FROM pipelines WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get pipeline by name
+    pub async fn get_pipeline_by_name(&self, name: &str) -> Result<Option<crate::Pipeline>> {
+        let row = sqlx::query_as::<_, PipelineRow>("SELECT * FROM pipelines WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update pipeline
+    pub async fn update_pipeline(&self, pipeline: &crate::Pipeline) -> Result<()> {
+        let id = pipeline
+            .id
+            .ok_or_else(|| crate::Error::Other("Cannot update pipeline without ID".to_string()))?;
+
+        sqlx::query(
+            r#"
+            UPDATE pipelines SET
+                name = ?,
+                definition = ?,
+                enabled = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&pipeline.name)
+        .bind(&pipeline.definition)
+        .bind(pipeline.enabled as i32)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all pipelines
+    pub async fn list_pipelines(&self) -> Result<Vec<crate::Pipeline>> {
+        let rows = sqlx::query_as::<_, PipelineRow>("SELECT * FROM pipelines ORDER BY name ASC")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List enabled pipelines
+    pub async fn list_enabled_pipelines(&self) -> Result<Vec<crate::Pipeline>> {
+        let rows = sqlx::query_as::<_, PipelineRow>(
+            "SELECT * FROM pipelines WHERE enabled = 1 ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Delete pipeline
+    pub async fn delete_pipeline(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM pipelines WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    // ==================== Pipeline Run Operations ====================
+
+    /// Insert a new pipeline run
+    pub async fn insert_pipeline_run(&self, run: &crate::PipelineRun) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pipeline_runs (
+                pipeline_id, status, trigger_event, started_at, completed_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.pipeline_id)
+        .bind(run.status.as_str())
+        .bind(&run.trigger_event)
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get pipeline run by ID
+    pub async fn get_pipeline_run(&self, id: i64) -> Result<Option<crate::PipelineRun>> {
+        let row = sqlx::query_as::<_, PipelineRunRow>("SELECT * FROM pipeline_runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update pipeline run
+    pub async fn update_pipeline_run(&self, run: &crate::PipelineRun) -> Result<()> {
+        let id = run
+            .id
+            .ok_or_else(|| crate::Error::Other("Cannot update pipeline run without ID".to_string()))?;
+
+        sqlx::query(
+            r#"
+            UPDATE pipeline_runs SET
+                status = ?,
+                started_at = ?,
+                completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(run.status.as_str())
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List pipeline runs for a pipeline
+    pub async fn list_pipeline_runs(&self, pipeline_id: i64) -> Result<Vec<crate::PipelineRun>> {
+        let rows = sqlx::query_as::<_, PipelineRunRow>(
+            "SELECT * FROM pipeline_runs WHERE pipeline_id = ? ORDER BY created_at DESC",
+        )
+        .bind(pipeline_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List pipeline runs by status
+    pub async fn list_pipeline_runs_by_status(
+        &self,
+        status: crate::PipelineRunStatus,
+    ) -> Result<Vec<crate::PipelineRun>> {
+        let rows = sqlx::query_as::<_, PipelineRunRow>(
+            "SELECT * FROM pipeline_runs WHERE status = ? ORDER BY created_at DESC",
+        )
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // ==================== Pipeline Stage Operations ====================
+
+    /// Insert a new pipeline stage
+    pub async fn insert_pipeline_stage(&self, stage: &crate::PipelineStage) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pipeline_stages (
+                run_id, stage_name, status, agent_id, started_at, completed_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(stage.run_id)
+        .bind(&stage.stage_name)
+        .bind(stage.status.as_str())
+        .bind(&stage.agent_id)
+        .bind(stage.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(stage.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(stage.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get pipeline stage by ID
+    pub async fn get_pipeline_stage(&self, id: i64) -> Result<Option<crate::PipelineStage>> {
+        let row =
+            sqlx::query_as::<_, PipelineStageRow>("SELECT * FROM pipeline_stages WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get pipeline stage by name within a run
+    pub async fn get_pipeline_stage_by_name(
+        &self,
+        run_id: i64,
+        stage_name: &str,
+    ) -> Result<Option<crate::PipelineStage>> {
+        let row = sqlx::query_as::<_, PipelineStageRow>(
+            "SELECT * FROM pipeline_stages WHERE run_id = ? AND stage_name = ?",
+        )
+        .bind(run_id)
+        .bind(stage_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update pipeline stage
+    pub async fn update_pipeline_stage(&self, stage: &crate::PipelineStage) -> Result<()> {
+        let id = stage.id.ok_or_else(|| {
+            crate::Error::Other("Cannot update pipeline stage without ID".to_string())
+        })?;
+
+        sqlx::query(
+            r#"
+            UPDATE pipeline_stages SET
+                status = ?,
+                agent_id = ?,
+                started_at = ?,
+                completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(stage.status.as_str())
+        .bind(&stage.agent_id)
+        .bind(stage.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(stage.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List pipeline stages for a run
+    pub async fn list_pipeline_stages(&self, run_id: i64) -> Result<Vec<crate::PipelineStage>> {
+        let rows = sqlx::query_as::<_, PipelineStageRow>(
+            "SELECT * FROM pipeline_stages WHERE run_id = ? ORDER BY created_at ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List pipeline stages by status within a run
+    pub async fn list_pipeline_stages_by_status(
+        &self,
+        run_id: i64,
+        status: crate::PipelineStageStatus,
+    ) -> Result<Vec<crate::PipelineStage>> {
+        let rows = sqlx::query_as::<_, PipelineStageRow>(
+            "SELECT * FROM pipeline_stages WHERE run_id = ? AND status = ? ORDER BY created_at ASC",
+        )
+        .bind(run_id)
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
 }
 
 /// Token usage statistics
@@ -2649,3 +2943,115 @@ impl TryFrom<WebhookEventRow> for WebhookEvent {
         })
     }
 }
+
+// ==================== Pipeline Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct PipelineRow {
+    id: i64,
+    name: String,
+    definition: String,
+    enabled: i32,
+    created_at: String,
+}
+
+impl TryFrom<PipelineRow> for crate::Pipeline {
+    type Error = crate::Error;
+
+    fn try_from(row: PipelineRow) -> Result<Self> {
+        Ok(crate::Pipeline {
+            id: Some(row.id),
+            name: row.name,
+            definition: row.definition,
+            enabled: row.enabled != 0,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PipelineRunRow {
+    id: i64,
+    pipeline_id: i64,
+    status: String,
+    trigger_event: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<PipelineRunRow> for crate::PipelineRun {
+    type Error = crate::Error;
+
+    fn try_from(row: PipelineRunRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(crate::PipelineRun {
+            id: Some(row.id),
+            pipeline_id: row.pipeline_id,
+            status: crate::PipelineRunStatus::from_str(&row.status)?,
+            trigger_event: row.trigger_event,
+            started_at: row
+                .started_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PipelineStageRow {
+    id: i64,
+    run_id: i64,
+    stage_name: String,
+    status: String,
+    agent_id: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<PipelineStageRow> for crate::PipelineStage {
+    type Error = crate::Error;
+
+    fn try_from(row: PipelineStageRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(crate::PipelineStage {
+            id: Some(row.id),
+            run_id: row.run_id,
+            stage_name: row.stage_name,
+            status: crate::PipelineStageStatus::from_str(&row.status)?,
+            agent_id: row.agent_id,
+            started_at: row
+                .started_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+

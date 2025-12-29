@@ -11,12 +11,15 @@ pub mod agent;
 pub mod database;
 #[cfg(test)]
 mod database_webhook_tests;
+#[cfg(test)]
+mod database_pipeline_tests;
 pub mod epic;
 pub mod error;
 pub mod instruction;
 pub mod learning;
 pub mod message;
 pub mod network;
+pub mod pipeline;
 pub mod pr;
 pub mod session;
 pub mod shell_state;
@@ -56,3 +59,6 @@ pub use shell_state::{QueueEntry, ShellState, ShepherdLock};
 // Re-export webhook types
 pub use webhook::{WebhookEvent, WebhookEventStatus};
 pub use webhook_config::{EventConfig, EventFilter, WebhookConfig};
+
+// Re-export pipeline types
+pub use pipeline::{Pipeline, PipelineRun, PipelineRunStatus, PipelineStage, PipelineStageStatus};
