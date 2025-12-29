@@ -185,6 +185,151 @@ async fn try_post_pr_comment(pr_number: i32) -> Result<()> {
     Ok(())
 }
 
+/// Handle a pull_request_review.submitted event
+///
+/// Spawns an issue-fixer agent when changes are requested.
+///
+/// Returns Ok(()) if event was handled successfully, Err if processing should be retried.
+pub async fn handle_pr_review_submitted(
+    database: Arc<Database>,
+    event: &WebhookEvent,
+) -> Result<()> {
+    info!(
+        delivery_id = %event.delivery_id,
+        "Processing pull_request_review.submitted event"
+    );
+
+    // Parse payload
+    let payload: Value = serde_json::from_str(&event.payload)?;
+
+    // Extract action - must be "submitted"
+    let action = payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing action field".to_string()))?;
+
+    if action != "submitted" {
+        debug!(action = %action, "Skipping non-submitted action");
+        return Ok(());
+    }
+
+    // Extract review data
+    let review = payload
+        .get("review")
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing review field".to_string()))?;
+
+    let review_state = review
+        .get("state")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing review state".to_string()))?;
+
+    // Only handle "changes_requested" reviews
+    if review_state != "changes_requested" {
+        debug!(
+            review_state = %review_state,
+            "Skipping review with state other than changes_requested"
+        );
+        return Ok(());
+    }
+
+    let review_body = review
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Extract PR data
+    let pr = payload
+        .get("pull_request")
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing pull_request field".to_string()))?;
+
+    let pr_number = pr
+        .get("number")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing PR number".to_string()))?;
+
+    let branch_name = pr
+        .get("head")
+        .and_then(|h| h.get("ref"))
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing branch name".to_string()))?
+        .to_string();
+
+    let repo_full_name = payload
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing repository name".to_string()))?
+        .to_string();
+
+    info!(
+        pr_number = pr_number,
+        branch = %branch_name,
+        repository = %repo_full_name,
+        "Spawning issue-fixer agent for review changes requested"
+    );
+
+    // Look for existing pr-shepherd agent for this PR
+    let shepherd_agent_id = database
+        .list_agents()
+        .await?
+        .into_iter()
+        .find(|a| {
+            a.agent_type == AgentType::PrShepherd
+                && a.context.pr_number == Some(pr_number as i32)
+        })
+        .map(|a| a.id);
+
+    // Build custom context with review information
+    let mut custom = serde_json::json!({
+        "repository": repo_full_name,
+        "event_delivery_id": event.delivery_id,
+        "review_body": review_body,
+    });
+
+    // Link to shepherd if found
+    if let Some(shepherd_id) = shepherd_agent_id {
+        custom["shepherd_agent_id"] = serde_json::json!(shepherd_id.to_string());
+        info!(
+            pr_number = pr_number,
+            shepherd_id = %shepherd_id,
+            "Linking issue-fixer to existing pr-shepherd"
+        );
+    }
+
+    // Create agent context
+    let context = AgentContext {
+        pr_number: Some(pr_number as i32),
+        branch_name: Some(branch_name.clone()),
+        working_directory: None, // Will use existing worktree if shepherd exists
+        custom,
+        ..Default::default()
+    };
+
+    // Create issue-fixer agent
+    let agent = Agent::new(
+        AgentType::IssueFixer,
+        format!(
+            "Fix review comments for PR #{} on branch {}",
+            pr_number, branch_name
+        ),
+    )
+    .with_context(context);
+
+    // Save agent to database
+    database.insert_agent(&agent).await?;
+
+    info!(
+        agent_id = %agent.id,
+        pr_number = pr_number,
+        "issue-fixer agent created for review changes"
+    );
+
+    // TODO: Actually spawn the agent (call orchestrate CLI or spawn process)
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +526,278 @@ mod tests {
         // Verify agent was still created
         let agents = database.list_agents().await.unwrap();
         assert_eq!(agents.len(), 1);
+    }
+
+    // PR Review Event Handler Tests
+
+    fn create_pr_review_payload(
+        pr_number: i64,
+        branch: &str,
+        review_state: &str,
+        review_body: &str,
+    ) -> String {
+        serde_json::json!({
+            "action": "submitted",
+            "review": {
+                "state": review_state,
+                "body": review_body,
+            },
+            "pull_request": {
+                "number": pr_number,
+                "head": {
+                    "ref": branch,
+                },
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_review_changes_requested_creates_agent() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let review_body = "Please fix the null pointer issue in line 42";
+        let payload = create_pr_review_payload(
+            55,
+            "feature/fix-bug",
+            "changes_requested",
+            review_body,
+        );
+        let event = WebhookEvent::new(
+            "delivery-review-123".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        let result = handle_pr_review_submitted(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // Verify issue-fixer agent was created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        assert_eq!(agent.agent_type, AgentType::IssueFixer);
+        assert_eq!(agent.state, AgentState::Created);
+        assert_eq!(agent.context.pr_number, Some(55));
+        assert_eq!(agent.context.branch_name, Some("feature/fix-bug".to_string()));
+        assert!(agent.task.contains("55"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_review_skips_non_changes_requested() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Test "approved" review
+        let payload = create_pr_review_payload(60, "feature/approved", "approved", "LGTM!");
+        let event = WebhookEvent::new(
+            "delivery-review-approved".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        let result = handle_pr_review_submitted(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // No agent should be created for approved review
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+
+        // Test "commented" review
+        let payload = create_pr_review_payload(61, "feature/commented", "commented", "Nice work");
+        let event = WebhookEvent::new(
+            "delivery-review-commented".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        let result = handle_pr_review_submitted(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // Still no agent
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_review_skips_non_submitted_action() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = serde_json::json!({
+            "action": "edited",
+            "review": {
+                "state": "changes_requested",
+                "body": "Fix this",
+            },
+            "pull_request": {
+                "number": 70,
+                "head": {
+                    "ref": "feature/edited",
+                },
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-review-edited".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        let result = handle_pr_review_submitted(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // No agent for non-submitted action
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_review_parses_review_comments() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let review_body = "Multiple issues:\n\
+            1. Fix memory leak in function foo()\n\
+            2. Update documentation for API changes\n\
+            3. Add error handling for edge cases";
+
+        let payload = create_pr_review_payload(
+            75,
+            "feature/multiple-fixes",
+            "changes_requested",
+            review_body,
+        );
+        let event = WebhookEvent::new(
+            "delivery-review-comments".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        handle_pr_review_submitted(database.clone(), &event)
+            .await
+            .unwrap();
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        // Verify review body is in the agent context
+        let custom = &agent.context.custom;
+        assert!(custom.get("review_body").is_some());
+        assert_eq!(custom.get("review_body").unwrap().as_str().unwrap(), review_body);
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_review_links_to_existing_shepherd() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // First create a pr-shepherd agent for PR #80
+        let shepherd_context = AgentContext {
+            pr_number: Some(80),
+            branch_name: Some("feature/with-shepherd".to_string()),
+            ..Default::default()
+        };
+        let shepherd = Agent::new(
+            AgentType::PrShepherd,
+            "Shepherd PR #80".to_string(),
+        )
+        .with_context(shepherd_context);
+        database.insert_agent(&shepherd).await.unwrap();
+
+        // Now submit a review for the same PR
+        let payload = create_pr_review_payload(
+            80,
+            "feature/with-shepherd",
+            "changes_requested",
+            "Please fix the tests",
+        );
+        let event = WebhookEvent::new(
+            "delivery-review-link".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        handle_pr_review_submitted(database.clone(), &event)
+            .await
+            .unwrap();
+
+        // Should have both shepherd and issue-fixer
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 2);
+
+        // Find the issue-fixer agent
+        let fixer = agents
+            .iter()
+            .find(|a| a.agent_type == AgentType::IssueFixer)
+            .expect("Should have issue-fixer agent");
+
+        // Verify it has the shepherd_agent_id in context
+        let custom = &fixer.context.custom;
+        assert!(custom.get("shepherd_agent_id").is_some());
+        assert_eq!(
+            custom.get("shepherd_agent_id").unwrap().as_str().unwrap(),
+            shepherd.id.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_review_missing_fields() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Missing review field
+        let payload = serde_json::json!({
+            "action": "submitted",
+            "pull_request": {
+                "number": 90,
+            }
+        })
+        .to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-review-missing".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        let result = handle_pr_review_submitted(database.clone(), &event).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_review_extracts_repository_info() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = create_pr_review_payload(
+            100,
+            "feature/repo-info",
+            "changes_requested",
+            "Fix the bug",
+        );
+        let event = WebhookEvent::new(
+            "delivery-review-repo".to_string(),
+            "pull_request_review".to_string(),
+            payload,
+        );
+
+        handle_pr_review_submitted(database.clone(), &event)
+            .await
+            .unwrap();
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        let custom = &agent.context.custom;
+        assert_eq!(custom.get("repository").unwrap().as_str().unwrap(), "owner/repo");
+        assert_eq!(
+            custom.get("event_delivery_id").unwrap().as_str().unwrap(),
+            "delivery-review-repo"
+        );
     }
 }
