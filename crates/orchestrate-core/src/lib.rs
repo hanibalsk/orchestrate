@@ -20,6 +20,7 @@ pub mod learning;
 pub mod message;
 pub mod network;
 pub mod pipeline;
+pub mod pipeline_parser;
 pub mod pr;
 pub mod session;
 pub mod shell_state;
@@ -62,3 +63,6 @@ pub use webhook_config::{EventConfig, EventFilter, WebhookConfig};
 
 // Re-export pipeline types
 pub use pipeline::{Pipeline, PipelineRun, PipelineRunStatus, PipelineStage, PipelineStageStatus};
+pub use pipeline_parser::{
+    FailureAction, PipelineDefinition, StageCondition, StageDefinition, TriggerDefinition,
+};

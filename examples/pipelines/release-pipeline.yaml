@@ -1,0 +1,65 @@
+name: release-pipeline
+description: Release pipeline for version bumps and changelog generation
+version: 1
+
+triggers:
+  - event: push
+    branches: [main]
+
+stages:
+  - name: detect-changes
+    agent: change-detector
+    task: Analyze commits to determine version bump type
+    timeout: 5m
+    on_failure: halt
+
+  - name: update-version
+    agent: version-manager
+    task: Update version numbers in project files
+    timeout: 5m
+    depends_on: [detect-changes]
+    on_failure: halt
+
+  - name: generate-changelog
+    agent: changelog-generator
+    task: Generate changelog from commit history
+    timeout: 10m
+    parallel_with: update-version
+    on_failure: halt
+
+  - name: build-artifacts
+    agent: builder
+    task: Build release artifacts
+    timeout: 30m
+    depends_on: [update-version, generate-changelog]
+    on_failure: halt
+
+  - name: run-tests
+    agent: tester
+    task: Run full test suite on release build
+    timeout: 45m
+    depends_on: [build-artifacts]
+    on_failure: halt
+
+  - name: create-release
+    agent: release-manager
+    task: Create GitHub release with artifacts and changelog
+    timeout: 10m
+    requires_approval: true
+    approvers: [maintainer, project-lead]
+    depends_on: [run-tests]
+    on_failure: halt
+
+  - name: publish-artifacts
+    agent: publisher
+    task: Publish artifacts to package registry
+    timeout: 15m
+    depends_on: [create-release]
+    on_failure: continue
+
+  - name: notify-users
+    agent: notifier
+    task: Send release notifications to users and channels
+    timeout: 5m
+    depends_on: [publish-artifacts]
+    on_failure: continue

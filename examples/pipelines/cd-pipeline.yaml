@@ -1,0 +1,61 @@
+name: cd-pipeline
+description: Continuous deployment pipeline for main branch
+version: 1
+
+triggers:
+  - event: pull_request.merged
+    branches: [main]
+
+variables:
+  staging_region: us-west-2
+  prod_region: us-east-1
+
+stages:
+  - name: build
+    agent: builder
+    task: Build production artifacts
+    timeout: 20m
+    on_failure: halt
+
+  - name: deploy-staging
+    agent: deployer
+    task: Deploy to staging environment in ${staging_region}
+    environment: staging
+    timeout: 10m
+    depends_on: [build]
+    on_failure: rollback
+    rollback_to: build
+
+  - name: smoke-test-staging
+    agent: smoke-tester
+    task: Run smoke tests on staging
+    timeout: 15m
+    depends_on: [deploy-staging]
+    on_failure: rollback
+    rollback_to: deploy-staging
+
+  - name: load-test
+    agent: load-tester
+    task: Run load tests on staging
+    timeout: 30m
+    depends_on: [smoke-test-staging]
+    on_failure: continue
+
+  - name: deploy-prod
+    agent: deployer
+    task: Deploy to production environment in ${prod_region}
+    environment: production
+    timeout: 15m
+    requires_approval: true
+    approvers: [team-lead, devops]
+    depends_on: [smoke-test-staging, load-test]
+    on_failure: rollback
+    rollback_to: deploy-staging
+
+  - name: smoke-test-prod
+    agent: smoke-tester
+    task: Run smoke tests on production
+    timeout: 15m
+    depends_on: [deploy-prod]
+    on_failure: rollback
+    rollback_to: deploy-prod
