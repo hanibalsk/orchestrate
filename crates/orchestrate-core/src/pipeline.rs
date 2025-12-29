@@ -277,6 +277,146 @@ impl PipelineStage {
     }
 }
 
+/// Rollback event trigger type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RollbackTriggerType {
+    /// Automatic rollback triggered by stage failure
+    Automatic,
+    /// Manual rollback triggered by user
+    Manual,
+}
+
+impl RollbackTriggerType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl FromStr for RollbackTriggerType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "automatic" => Ok(Self::Automatic),
+            "manual" => Ok(Self::Manual),
+            _ => Err(Error::Other(format!("Invalid rollback trigger type: {}", s))),
+        }
+    }
+}
+
+/// Rollback event status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RollbackStatus {
+    /// Rollback is pending
+    Pending,
+    /// Rollback is running
+    Running,
+    /// Rollback succeeded
+    Succeeded,
+    /// Rollback failed
+    Failed,
+}
+
+impl RollbackStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl FromStr for RollbackStatus {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => Err(Error::Other(format!("Invalid rollback status: {}", s))),
+        }
+    }
+}
+
+/// A rollback event within a pipeline run
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackEvent {
+    /// Database ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    /// Run ID this rollback belongs to
+    pub run_id: i64,
+    /// Name of the stage that failed
+    pub failed_stage_name: String,
+    /// Name of the stage to rollback to
+    pub rollback_to_stage: String,
+    /// Type of trigger (automatic or manual)
+    pub trigger_type: RollbackTriggerType,
+    /// Current status of the rollback
+    pub status: RollbackStatus,
+    /// Error message if rollback failed
+    pub error_message: Option<String>,
+    /// When the rollback started
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the rollback completed
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Created timestamp
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+impl RollbackEvent {
+    /// Create a new rollback event
+    pub fn new(
+        run_id: i64,
+        failed_stage_name: String,
+        rollback_to_stage: String,
+        trigger_type: RollbackTriggerType,
+    ) -> Self {
+        Self {
+            id: None,
+            run_id,
+            failed_stage_name,
+            rollback_to_stage,
+            trigger_type,
+            status: RollbackStatus::Pending,
+            error_message: None,
+            started_at: None,
+            completed_at: None,
+            created_at: Some(Utc::now()),
+        }
+    }
+
+    /// Mark rollback as running
+    pub fn mark_running(&mut self) {
+        self.status = RollbackStatus::Running;
+        if self.started_at.is_none() {
+            self.started_at = Some(Utc::now());
+        }
+    }
+
+    /// Mark rollback as succeeded
+    pub fn mark_succeeded(&mut self) {
+        self.status = RollbackStatus::Succeeded;
+        self.completed_at = Some(Utc::now());
+    }
+
+    /// Mark rollback as failed
+    pub fn mark_failed(&mut self, error_message: String) {
+        self.status = RollbackStatus::Failed;
+        self.error_message = Some(error_message);
+        self.completed_at = Some(Utc::now());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

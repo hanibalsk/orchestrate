@@ -219,6 +219,13 @@ impl PipelineDefinition {
                     stage.name, rollback_to
                 )));
             }
+            // Prevent rollback to itself
+            if rollback_to == &stage.name {
+                return Err(Error::Other(format!(
+                    "Stage '{}' cannot rollback to itself - this would create a rollback loop",
+                    stage.name
+                )));
+            }
         }
 
         // Validate approvers when requires_approval is true
@@ -708,6 +715,24 @@ stages:
         let result = PipelineDefinition::from_yaml_str(yaml);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("rollback_to non-existent stage"));
+    }
+
+    #[test]
+    fn test_validation_rollback_to_self() {
+        let yaml = r#"
+name: test-pipeline
+description: Test
+stages:
+  - name: deploy
+    agent: deployer
+    task: Deploy
+    on_failure: rollback
+    rollback_to: deploy
+"#;
+
+        let result = PipelineDefinition::from_yaml_str(yaml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("rollback to itself"));
     }
 
     #[test]

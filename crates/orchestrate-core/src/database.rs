@@ -128,6 +128,10 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/008_approvals.sql"))
             .execute(&self.pool)
             .await?;
+        // Rollback events migration
+        sqlx::query(include_str!("../../../migrations/009_rollback_events.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -2249,6 +2253,98 @@ impl Database {
 
         rows.into_iter().map(|r| r.try_into()).collect()
     }
+
+    // Rollback event operations
+
+    /// Insert a rollback event
+    pub async fn insert_rollback_event(&self, event: &crate::RollbackEvent) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO rollback_events
+                (run_id, failed_stage_name, rollback_to_stage, trigger_type, status,
+                 error_message, started_at, completed_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(event.run_id)
+        .bind(&event.failed_stage_name)
+        .bind(&event.rollback_to_stage)
+        .bind(event.trigger_type.as_str())
+        .bind(event.status.as_str())
+        .bind(&event.error_message)
+        .bind(event.started_at.map(|t| t.to_rfc3339()))
+        .bind(event.completed_at.map(|t| t.to_rfc3339()))
+        .bind(event.created_at.map(|t| t.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get a rollback event by ID
+    pub async fn get_rollback_event(&self, id: i64) -> Result<Option<crate::RollbackEvent>> {
+        let row = sqlx::query_as::<_, RollbackEventRow>(
+            "SELECT * FROM rollback_events WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update a rollback event
+    pub async fn update_rollback_event(&self, event: &crate::RollbackEvent) -> Result<()> {
+        let id = event.id.ok_or_else(|| {
+            crate::Error::Other("Cannot update rollback event without an ID".to_string())
+        })?;
+
+        sqlx::query(
+            r#"
+            UPDATE rollback_events
+            SET status = ?, error_message = ?, started_at = ?, completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(event.status.as_str())
+        .bind(&event.error_message)
+        .bind(event.started_at.map(|t| t.to_rfc3339()))
+        .bind(event.completed_at.map(|t| t.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all rollback events for a pipeline run
+    pub async fn list_rollback_events(&self, run_id: i64) -> Result<Vec<crate::RollbackEvent>> {
+        let rows = sqlx::query_as::<_, RollbackEventRow>(
+            "SELECT * FROM rollback_events WHERE run_id = ? ORDER BY created_at ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Count rollback events for a specific stage in a run (for loop prevention)
+    pub async fn count_rollback_events_for_stage(
+        &self,
+        run_id: i64,
+        stage_name: &str,
+    ) -> Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM rollback_events WHERE run_id = ? AND rollback_to_stage = ?",
+        )
+        .bind(run_id)
+        .bind(stage_name)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(result)
+    }
 }
 
 /// Token usage statistics
@@ -3059,6 +3155,55 @@ impl TryFrom<PipelineStageRow> for crate::PipelineStage {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct RollbackEventRow {
+    id: i64,
+    run_id: i64,
+    failed_stage_name: String,
+    rollback_to_stage: String,
+    trigger_type: String,
+    status: String,
+    error_message: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: Option<String>,
+}
+
+impl TryFrom<RollbackEventRow> for crate::RollbackEvent {
+    type Error = crate::Error;
+
+    fn try_from(row: RollbackEventRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(crate::RollbackEvent {
+            id: Some(row.id),
+            run_id: row.run_id,
+            failed_stage_name: row.failed_stage_name,
+            rollback_to_stage: row.rollback_to_stage,
+            trigger_type: crate::RollbackTriggerType::from_str(&row.trigger_type)?,
+            status: crate::RollbackStatus::from_str(&row.status)?,
+            error_message: row.error_message,
+            started_at: row
+                .started_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: row
+                .created_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+        })
+    }
+}
 
 impl Database {
     // Approval Operations

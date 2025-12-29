@@ -68,7 +68,10 @@ pub use webhook::{WebhookEvent, WebhookEventStatus};
 pub use webhook_config::{EventConfig, EventFilter, WebhookConfig};
 
 // Re-export pipeline types
-pub use pipeline::{Pipeline, PipelineRun, PipelineRunStatus, PipelineStage, PipelineStageStatus};
+pub use pipeline::{
+    Pipeline, PipelineRun, PipelineRunStatus, PipelineStage, PipelineStageStatus, RollbackEvent,
+    RollbackStatus, RollbackTriggerType,
+};
 pub use pipeline_executor::{ExecutionContext, PipelineExecutor};
 pub use pipeline_parser::{
     FailureAction, PipelineDefinition, StageCondition, StageDefinition, TriggerDefinition,
