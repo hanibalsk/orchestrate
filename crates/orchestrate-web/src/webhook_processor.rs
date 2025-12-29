@@ -143,6 +143,9 @@ impl WebhookProcessor {
             "check_run" | "check_suite" => {
                 crate::event_handlers::handle_ci_status(self.database.clone(), event).await
             }
+            "push" => {
+                crate::event_handlers::handle_push_to_main(self.database.clone(), event).await
+            }
             _ => {
                 // Unknown event type - not an error, just skip
                 debug!(event_type = %event.event_type, "No handler for event type");
@@ -283,5 +286,94 @@ mod tests {
 
         // Should not error on empty queue
         processor.process_batch().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_processor_handles_push_events() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Insert push event to main branch
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "before": "abc123",
+            "after": "def456",
+            "repository": {
+                "full_name": "owner/repo"
+            },
+            "commits": [
+                {
+                    "added": ["file1.rs"],
+                    "modified": ["file2.rs"],
+                    "removed": []
+                }
+            ]
+        }).to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-push-test".to_string(),
+            "push".to_string(),
+            payload,
+        );
+        database.insert_webhook_event(&event).await.unwrap();
+
+        // Process event
+        let processor = WebhookProcessor::new(database.clone(), WebhookProcessorConfig::default());
+        processor.process_batch().await.unwrap();
+
+        // Event should be completed
+        let completed = database
+            .get_webhook_events_by_status(WebhookEventStatus::Completed, 10)
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+
+        // Verify regression-tester agent was created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_type, orchestrate_core::AgentType::RegressionTester);
+    }
+
+    #[tokio::test]
+    async fn test_processor_skips_push_to_feature_branch() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Insert push event to feature branch
+        let payload = serde_json::json!({
+            "ref": "refs/heads/feature/test",
+            "before": "abc123",
+            "after": "def456",
+            "repository": {
+                "full_name": "owner/repo"
+            },
+            "commits": [
+                {
+                    "added": ["file1.rs"],
+                    "modified": [],
+                    "removed": []
+                }
+            ]
+        }).to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-push-feature".to_string(),
+            "push".to_string(),
+            payload,
+        );
+        database.insert_webhook_event(&event).await.unwrap();
+
+        // Process event
+        let processor = WebhookProcessor::new(database.clone(), WebhookProcessorConfig::default());
+        processor.process_batch().await.unwrap();
+
+        // Event should be completed (successfully skipped)
+        let completed = database
+            .get_webhook_events_by_status(WebhookEventStatus::Completed, 10)
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+
+        // No agent should be created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
     }
 }

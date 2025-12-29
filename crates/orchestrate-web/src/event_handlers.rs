@@ -776,6 +776,152 @@ async fn find_duplicate_ci_fixer(
     Ok(None)
 }
 
+/// Handle a push event to main/master branch
+///
+/// Spawns a regression-tester agent to run the test suite.
+///
+/// Returns Ok(()) if event was handled successfully, Err if processing should be retried.
+pub async fn handle_push_to_main(
+    database: Arc<Database>,
+    event: &WebhookEvent,
+) -> Result<()> {
+    info!(
+        delivery_id = %event.delivery_id,
+        "Processing push event"
+    );
+
+    // Parse payload
+    let payload: Value = serde_json::from_str(&event.payload)?;
+
+    // Extract ref - must be refs/heads/main or refs/heads/master
+    let ref_name = payload
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing ref field".to_string()))?;
+
+    // Only handle pushes to main or master branch
+    if ref_name != "refs/heads/main" && ref_name != "refs/heads/master" {
+        debug!(ref_name = %ref_name, "Skipping push to non-main branch");
+        return Ok(());
+    }
+
+    let branch_name = if ref_name == "refs/heads/main" {
+        "main"
+    } else {
+        "master"
+    };
+
+    // Extract commit range
+    let before_sha = payload
+        .get("before")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing before SHA".to_string()))?
+        .to_string();
+
+    let after_sha = payload
+        .get("after")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing after SHA".to_string()))?
+        .to_string();
+
+    // Extract repository info
+    let repo_full_name = payload
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing repository name".to_string()))?
+        .to_string();
+
+    // Extract commits array to get changed files
+    let commits = payload
+        .get("commits")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing commits array".to_string()))?;
+
+    // Collect all changed files from commits
+    let mut changed_files = std::collections::HashSet::new();
+    for commit in commits {
+        // Extract added files
+        if let Some(added) = commit.get("added").and_then(|v| v.as_array()) {
+            for file in added {
+                if let Some(f) = file.as_str() {
+                    changed_files.insert(f.to_string());
+                }
+            }
+        }
+        // Extract modified files
+        if let Some(modified) = commit.get("modified").and_then(|v| v.as_array()) {
+            for file in modified {
+                if let Some(f) = file.as_str() {
+                    changed_files.insert(f.to_string());
+                }
+            }
+        }
+        // Extract removed files
+        if let Some(removed) = commit.get("removed").and_then(|v| v.as_array()) {
+            for file in removed {
+                if let Some(f) = file.as_str() {
+                    changed_files.insert(f.to_string());
+                }
+            }
+        }
+    }
+
+    let changed_files_vec: Vec<String> = changed_files.into_iter().collect();
+
+    info!(
+        branch = %branch_name,
+        before_sha = %before_sha,
+        after_sha = %after_sha,
+        repository = %repo_full_name,
+        changed_files_count = changed_files_vec.len(),
+        "Spawning regression-tester agent for push to main"
+    );
+
+    // Build custom context with push information
+    let custom = serde_json::json!({
+        "repository": repo_full_name,
+        "event_delivery_id": event.delivery_id,
+        "before_sha": before_sha,
+        "after_sha": after_sha,
+        "commit_range": format!("{}..{}", before_sha, after_sha),
+        "changed_files": changed_files_vec,
+    });
+
+    // Create agent context
+    let context = AgentContext {
+        pr_number: None,
+        branch_name: Some(branch_name.to_string()),
+        working_directory: None, // Will use main repo directory
+        custom,
+        ..Default::default()
+    };
+
+    // Create regression-tester agent
+    let agent = Agent::new(
+        AgentType::RegressionTester,
+        format!(
+            "Run regression tests for {} push to {}",
+            repo_full_name, branch_name
+        ),
+    )
+    .with_context(context);
+
+    // Save agent to database
+    database.insert_agent(&agent).await?;
+
+    info!(
+        agent_id = %agent.id,
+        branch = %branch_name,
+        "regression-tester agent created for push to main"
+    );
+
+    // TODO: Actually spawn the agent (call orchestrate CLI or spawn process)
+    // TODO: Agent should run test suite and create issue if regressions detected
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,5 +1846,306 @@ mod tests {
 
         let result = handle_ci_status(database.clone(), &event).await;
         assert!(result.is_err());
+    }
+
+    // Push to Main Event Handler Tests
+
+    fn create_push_payload(
+        ref_name: &str,
+        before_sha: &str,
+        after_sha: &str,
+        commits: Vec<serde_json::Value>,
+    ) -> String {
+        serde_json::json!({
+            "ref": ref_name,
+            "before": before_sha,
+            "after": after_sha,
+            "repository": {
+                "full_name": "owner/repo"
+            },
+            "commits": commits
+        })
+        .to_string()
+    }
+
+    fn create_commit(
+        added: Vec<&str>,
+        modified: Vec<&str>,
+        removed: Vec<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "added": added,
+            "modified": modified,
+            "removed": removed,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_to_main_creates_agent() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let commits = vec![
+            create_commit(vec!["file1.rs"], vec!["file2.rs"], vec![]),
+            create_commit(vec![], vec!["file3.rs"], vec!["old.rs"]),
+        ];
+
+        let payload = create_push_payload(
+            "refs/heads/main",
+            "abc123",
+            "def456",
+            commits,
+        );
+
+        let event = WebhookEvent::new(
+            "delivery-push-1".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        let result = handle_push_to_main(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // Verify regression-tester agent was created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        assert_eq!(agent.agent_type, AgentType::RegressionTester);
+        assert_eq!(agent.state, AgentState::Created);
+        assert_eq!(agent.context.branch_name, Some("main".to_string()));
+        assert!(agent.task.contains("owner/repo"));
+        assert!(agent.task.contains("main"));
+
+        // Verify context contains push details
+        let custom = &agent.context.custom;
+        assert_eq!(custom.get("repository").unwrap().as_str().unwrap(), "owner/repo");
+        assert_eq!(custom.get("before_sha").unwrap().as_str().unwrap(), "abc123");
+        assert_eq!(custom.get("after_sha").unwrap().as_str().unwrap(), "def456");
+        assert_eq!(custom.get("commit_range").unwrap().as_str().unwrap(), "abc123..def456");
+
+        // Verify changed files were collected
+        let changed_files = custom.get("changed_files").unwrap().as_array().unwrap();
+        assert_eq!(changed_files.len(), 4);
+
+        // Convert to set for comparison (order doesn't matter)
+        let file_names: std::collections::HashSet<String> = changed_files
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(file_names.contains("file1.rs"));
+        assert!(file_names.contains("file2.rs"));
+        assert!(file_names.contains("file3.rs"));
+        assert!(file_names.contains("old.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_to_master_creates_agent() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let commits = vec![create_commit(vec!["test.rs"], vec![], vec![])];
+
+        let payload = create_push_payload(
+            "refs/heads/master",
+            "sha1",
+            "sha2",
+            commits,
+        );
+
+        let event = WebhookEvent::new(
+            "delivery-push-master".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        let result = handle_push_to_main(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        assert_eq!(agent.agent_type, AgentType::RegressionTester);
+        assert_eq!(agent.context.branch_name, Some("master".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_skips_feature_branch() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let commits = vec![create_commit(vec!["file.rs"], vec![], vec![])];
+
+        let payload = create_push_payload(
+            "refs/heads/feature/new-feature",
+            "sha1",
+            "sha2",
+            commits,
+        );
+
+        let event = WebhookEvent::new(
+            "delivery-push-feature".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        let result = handle_push_to_main(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // No agent should be created for feature branch
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_skips_develop_branch() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let commits = vec![create_commit(vec!["file.rs"], vec![], vec![])];
+
+        let payload = create_push_payload(
+            "refs/heads/develop",
+            "sha1",
+            "sha2",
+            commits,
+        );
+
+        let event = WebhookEvent::new(
+            "delivery-push-develop".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        let result = handle_push_to_main(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_missing_fields() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Missing commits field
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "before": "sha1",
+            "after": "sha2",
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-push-missing".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        let result = handle_push_to_main(database.clone(), &event).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_no_changed_files() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Empty commits
+        let commits = vec![];
+
+        let payload = create_push_payload(
+            "refs/heads/main",
+            "sha1",
+            "sha2",
+            commits,
+        );
+
+        let event = WebhookEvent::new(
+            "delivery-push-empty".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        let result = handle_push_to_main(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // Agent should still be created even with no changed files
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        let custom = &agent.context.custom;
+        let changed_files = custom.get("changed_files").unwrap().as_array().unwrap();
+        assert_eq!(changed_files.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_deduplicates_files() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Multiple commits modifying the same files
+        let commits = vec![
+            create_commit(vec!["file1.rs"], vec!["file2.rs"], vec![]),
+            create_commit(vec![], vec!["file1.rs", "file2.rs"], vec![]),
+            create_commit(vec![], vec!["file2.rs"], vec![]),
+        ];
+
+        let payload = create_push_payload(
+            "refs/heads/main",
+            "sha1",
+            "sha2",
+            commits,
+        );
+
+        let event = WebhookEvent::new(
+            "delivery-push-dedup".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        handle_push_to_main(database.clone(), &event).await.unwrap();
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        let custom = &agent.context.custom;
+        let changed_files = custom.get("changed_files").unwrap().as_array().unwrap();
+
+        // Should only have 2 unique files
+        assert_eq!(changed_files.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_extracts_repository_info() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let commits = vec![create_commit(vec!["test.rs"], vec![], vec![])];
+
+        let payload = create_push_payload(
+            "refs/heads/main",
+            "before123",
+            "after456",
+            commits,
+        );
+
+        let event = WebhookEvent::new(
+            "delivery-push-repo".to_string(),
+            "push".to_string(),
+            payload,
+        );
+
+        handle_push_to_main(database.clone(), &event).await.unwrap();
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        let custom = &agent.context.custom;
+        assert_eq!(custom.get("repository").unwrap().as_str().unwrap(), "owner/repo");
+        assert_eq!(
+            custom.get("event_delivery_id").unwrap().as_str().unwrap(),
+            "delivery-push-repo"
+        );
     }
 }
