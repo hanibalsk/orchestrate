@@ -26,3 +26,10 @@ Cargo.lock
 *.db-journal
 *.db-shm
 *.db-wal
+
+# Node.js / Frontend
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+.env.local
+.env*.local
