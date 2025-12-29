@@ -140,6 +140,9 @@ impl WebhookProcessor {
             "pull_request_review" => {
                 crate::event_handlers::handle_pr_review_submitted(self.database.clone(), event).await
             }
+            "check_run" | "check_suite" => {
+                crate::event_handlers::handle_ci_status(self.database.clone(), event).await
+            }
             _ => {
                 // Unknown event type - not an error, just skip
                 debug!(event_type = %event.event_type, "No handler for event type");
