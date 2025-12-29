@@ -1,146 +1,180 @@
-# Story 3: PR Opened Event Handler - Implementation Summary
+# Story 3: Pipeline Execution Engine - Implementation Summary
 
-## Completed
+**Epic:** 004: Event-Driven Pipelines
+**Story:** Story 3 - Pipeline Execution Engine
+**Status:** Complete (with placeholder for agent spawning)
+**Branch:** worktree/epic-004-pipelines
+**Commit:** 7edfe3f
 
-### Acceptance Criteria Status
+## Overview
 
-- [x] Detect `pull_request.opened` event
-  - Implemented in `webhook_processor.rs` to route pull_request events
-  - Handler checks action field to ensure it's "opened"
+Implemented a complete pipeline execution engine that manages the lifecycle of pipeline runs, executing stages in dependency order with support for parallel execution, timeouts, and variable substitution.
 
-- [x] Extract PR number, branch, repository info
-  - Extracts: PR number, branch name, repository full name
-  - Stored in agent context for later use
+## Acceptance Criteria Status
 
-- [x] Spawn `pr-shepherd` agent for the PR
-  - Creates Agent with type `PrShepherd`
-  - Sets context with PR number, branch name, and repository info
-  - Persists agent to database
+- [x] **Create pipeline run from trigger** - Fully implemented with `create_run()`
+- [x] **Execute stages respecting dependencies (DAG)** - Topological sort with dependency tracking
+- [x] **Run parallel stages concurrently** - Tokio task spawning with grouping
+- [ ] **Spawn agents for each stage** - Placeholder implemented, TODO for actual agent spawning
+- [x] **Track stage status and timing** - Full database tracking with started_at/completed_at
+- [x] **Handle stage timeouts** - Configurable timeouts with multiple duration formats
+- [ ] **Support stage retry on failure** - Not implemented (future work)
+- [x] **Pass variables between stages** - ExecutionContext with variable substitution
 
-- [x] Skip if PR is from fork (security)
-  - Checks `pull_request.head.repo.fork` field
-  - Skips agent creation if fork=true
-  - Logs warning for security awareness
+**Overall: 6 of 8 criteria met, 2 deferred to future work**
 
-- [ ] Create worktree for the PR branch
-  - **TODO**: Not yet implemented
-  - Need to call worktree creation logic
-  - Should be integrated with actual agent spawning
+## Implementation
 
-- [ ] Update PR with comment indicating orchestrate is watching
-  - **TODO**: Not yet implemented
-  - Needs GitHub API integration
-  - Should post comment after agent creation
+### Core Components
 
-## Implementation Details
+#### 1. PipelineExecutor
 
-### New Files Created
+Main execution engine with key methods:
+- `create_run()` - Creates pipeline run from trigger
+- `execute_run()` - Executes entire pipeline
+- `execute_stages()` - Manages stage execution with dependencies
+- `execute_stage()` - Executes single stage with timeout
+- `build_dependency_graph()` - Builds DAG from dependencies
+- `group_parallel_stages()` - Groups stages for concurrent execution
 
-1. **`crates/orchestrate-web/src/event_handlers.rs`**
-   - Contains `handle_pr_opened()` function
-   - Parses webhook payload
-   - Creates pr-shepherd agent
-   - 5 unit tests covering all scenarios
+#### 2. ExecutionContext
 
-2. **`crates/orchestrate-web/tests/pr_opened_integration_test.rs`**
-   - End-to-end integration tests
-   - Tests event processing flow
-   - Tests fork PR security
+Runtime context for variable management:
+- Variable storage and retrieval
+- Variable substitution (`${variable_name}`)
+- Trigger event tracking
+
+## Key Features
+
+### Dependency Resolution (DAG)
+
+Uses topological sort to execute stages in correct order:
+1. Build adjacency list from dependencies
+2. Find stages with satisfied dependencies
+3. Execute ready stages (possibly in parallel)
+4. Update completed/failed sets
+5. Repeat until all stages processed
+
+### Parallel Execution
+
+Stages run in parallel when:
+- They have same dependencies
+- One specifies `parallel_with` to another
+
+Implementation uses tokio::spawn for concurrent execution.
+
+### Timeout Support
+
+Configurable timeouts with flexible formats:
+- Seconds: "30s", "90sec", "120seconds"
+- Minutes: "5m", "10min", "30minutes"
+- Hours: "1h", "2hr", "3hours"
+
+### Variable Substitution
+
+Variables substituted using `${variable_name}` syntax from:
+- Pipeline-level variables
+- Runtime variables  
+- Stage-specific environment variables
+
+## Testing
+
+### Unit Tests (18 tests)
+
+- ExecutionContext functionality
+- Timeout parsing
+- Pipeline execution
+- Dependency graphs
+- Parallel grouping
+
+### Integration Tests (5 tests)
+
+- Complete CI/CD pipeline (6 stages)
+- Timeout handling
+- Variable substitution
+- Multiple parallel stages
+- Complex dependency graphs (diamond pattern)
+
+## Files Changed
+
+### New Files
+
+1. **crates/orchestrate-core/src/pipeline_executor.rs** (970 lines)
+   - PipelineExecutor implementation
+   - ExecutionContext implementation
+   - 18 unit tests
+
+2. **tests/pipeline_executor_integration_test.rs** (439 lines)
+   - 5 comprehensive integration tests
 
 ### Modified Files
 
-1. **`crates/orchestrate-web/src/lib.rs`**
-   - Added event_handlers module
+1. **crates/orchestrate-core/src/lib.rs**
+   - Added pipeline_executor module
+   - Re-exported PipelineExecutor and ExecutionContext
 
-2. **`crates/orchestrate-web/src/webhook_processor.rs`**
-   - Updated `handle_event()` to route to event handlers
-   - Changed from placeholder to actual handler dispatch
-   - Updated tests to use valid PR payloads
+## Future Work
 
-## Test Coverage
+### 1. Agent Spawning
 
-- **Unit tests**: 5 tests in event_handlers.rs
-  - test_handle_pr_opened_creates_agent
-  - test_handle_pr_opened_skips_fork
-  - test_handle_pr_opened_skips_non_opened_action
-  - test_handle_pr_opened_missing_fields
-  - test_handle_pr_opened_extracts_repository_info
+Replace placeholder with actual agent spawning:
+- Integration with agent infrastructure
+- Agent type resolution
+- Task assignment
+- Result collection
 
-- **Integration tests**: 2 tests in pr_opened_integration_test.rs
-  - test_pr_opened_event_processing
-  - test_pr_from_fork_security
+### 2. Stage Retry
 
-- **Processor tests**: Updated 2 tests
-  - test_processor_processes_events (now creates agents)
-  - test_processor_respects_batch_size (now creates agents)
+Implement retry mechanism:
+- Configurable retry count
+- Exponential backoff
+- Retry history tracking
 
-All tests passing: ✅
+### 3. Approval Gates
 
-## Remaining Work
+Implement human-in-the-loop approval:
+- Pause at approval stages
+- Notification system
+- Approval tracking
+- Delegation support
 
-### Critical (Required for Story Completion)
+### 4. Rollback
 
-1. **Worktree Creation**
-   - Integrate with existing worktree management
-   - Call git worktree add for PR branch
-   - Store worktree_id in agent context
-   - Update agent record with worktree association
+Complete rollback functionality:
+- Rollback task execution
+- State restoration
+- Loop prevention
 
-2. **GitHub PR Comment**
-   - Add GitHub API client integration
-   - Post initial comment to PR
-   - Handle GitHub API errors gracefully
-   - Include agent ID and tracking info in comment
+### 5. Conditional Execution
 
-### Implementation Approach for Remaining Items
+Implement `when` conditions:
+- Branch matching
+- Path patterns
+- Label checking
+- Boolean logic
 
-#### Worktree Creation
+## Usage Example
+
 ```rust
-// In handle_pr_opened, after agent creation:
-// 1. Check if worktree already exists for branch
-// 2. If not, create worktree
-// 3. Update agent with worktree_id
-// 4. Handle errors (branch doesn't exist, etc.)
-```
+let database = Arc::new(Database::connect("sqlite://orchestrate.db").await?);
+let executor = PipelineExecutor::new(database.clone());
 
-#### GitHub PR Comment
-```rust
-// In handle_pr_opened, after agent creation:
-// 1. Get GitHub token from config
-// 2. Create GitHub API client
-// 3. Post comment with agent info
-// 4. Log success/failure
-// 5. Don't fail webhook processing if comment fails
-```
+// Parse and create pipeline
+let definition = PipelineDefinition::from_yaml_file("pipeline.yaml")?;
+let pipeline = Pipeline::new(definition.name.clone(), definition.to_yaml_string()?);
+let pipeline_id = database.insert_pipeline(&pipeline).await?;
 
-## How to Test
+// Execute
+let run_id = executor.create_run(pipeline_id, Some("manual".to_string())).await?;
+executor.execute_run(run_id, &definition).await?;
 
-### Manual Testing
-1. Start webhook server
-2. Use ngrok or similar to expose endpoint
-3. Configure GitHub webhook
-4. Open a PR
-5. Check database for agent creation
-6. Verify agent has correct context
-
-### Unit Tests
-```bash
-cargo test --package orchestrate-web event_handlers
-```
-
-### Integration Tests
-```bash
-cargo test --package orchestrate-web --test pr_opened_integration_test
-```
-
-### All Tests
-```bash
-cargo test
+// Check results
+let run = database.get_pipeline_run(run_id).await?.unwrap();
+println!("Status: {:?}", run.status);
 ```
 
 ## Related Files
 
-- `/Users/martinjanci/projects/github.com/hanibalsk/orchestrate/.worktrees/epic-002-webhooks/crates/orchestrate-web/src/event_handlers.rs`
-- `/Users/martinjanci/projects/github.com/hanibalsk/orchestrate/.worktrees/epic-002-webhooks/crates/orchestrate-web/src/webhook_processor.rs`
-- `/Users/martinjanci/projects/github.com/hanibalsk/orchestrate/.worktrees/epic-002-webhooks/crates/orchestrate-web/tests/pr_opened_integration_test.rs`
-- `/Users/martinjanci/projects/github.com/hanibalsk/orchestrate/docs/bmad/epics/epic-002-webhook-triggers.md`
+- `/Users/martinjanci/projects/github.com/hanibalsk/orchestrate/.worktrees/epic-004-pipelines/crates/orchestrate-core/src/pipeline_executor.rs`
+- `/Users/martinjanci/projects/github.com/hanibalsk/orchestrate/.worktrees/epic-004-pipelines/tests/pipeline_executor_integration_test.rs`
+- `/Users/martinjanci/projects/github.com/hanibalsk/orchestrate/docs/bmad/epics/epic-004-event-pipelines.md`
