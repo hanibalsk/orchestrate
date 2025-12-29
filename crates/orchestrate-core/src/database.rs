@@ -152,6 +152,10 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/013_environments.sql"))
             .execute(&self.pool)
             .await?;
+        // Deployments migration
+        sqlx::query(include_str!("../../../migrations/014_deployments.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -2075,6 +2079,358 @@ impl Database {
             .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    // ==================== Deployment Operations ====================
+
+    /// Create a new deployment record
+    #[tracing::instrument(skip(self, strategy, validation_result), level = "debug")]
+    pub async fn create_deployment(
+        &self,
+        environment_id: i64,
+        environment_name: &str,
+        version: &str,
+        provider: &crate::deployment_executor::DeploymentProvider,
+        strategy: Option<&crate::DeploymentStrategy>,
+        timeout_seconds: u32,
+        validation_result: Option<&crate::DeploymentValidation>,
+    ) -> Result<crate::deployment_executor::Deployment> {
+        use crate::deployment_executor::DeploymentStatus;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let provider_str = provider.to_string();
+        let strategy_json = strategy
+            .map(|s| serde_json::to_string(s).map_err(|e| crate::Error::Other(format!("Failed to serialize strategy: {}", e))))
+            .transpose()?;
+        let validation_json = validation_result
+            .map(|v| serde_json::to_string(v).map_err(|e| crate::Error::Other(format!("Failed to serialize validation: {}", e))))
+            .transpose()?;
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO deployments (
+                environment_id, environment_name, version, provider, strategy,
+                status, timeout_seconds, validation_result, started_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(environment_id)
+        .bind(environment_name)
+        .bind(version)
+        .bind(&provider_str)
+        .bind(&strategy_json)
+        .bind(DeploymentStatus::Pending.to_string())
+        .bind(timeout_seconds as i64)
+        .bind(&validation_json)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        self.get_deployment(id).await
+    }
+
+    /// Update deployment status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_deployment_status(
+        &self,
+        deployment_id: i64,
+        status: crate::deployment_executor::DeploymentStatus,
+        error_message: Option<&str>,
+    ) -> Result<crate::deployment_executor::Deployment> {
+        let completed_at = if matches!(
+            status,
+            crate::deployment_executor::DeploymentStatus::Completed
+                | crate::deployment_executor::DeploymentStatus::Failed
+                | crate::deployment_executor::DeploymentStatus::RolledBack
+                | crate::deployment_executor::DeploymentStatus::TimedOut
+        ) {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE deployments
+            SET status = ?, error_message = ?, completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(error_message)
+        .bind(&completed_at)
+        .bind(deployment_id)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_deployment(deployment_id).await
+    }
+
+    /// Get a deployment by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment(
+        &self,
+        deployment_id: i64,
+    ) -> Result<crate::deployment_executor::Deployment> {
+        use crate::deployment_executor::{DeploymentProvider, DeploymentStatus};
+
+        #[derive(sqlx::FromRow)]
+        struct DeploymentRow {
+            id: i64,
+            environment_id: i64,
+            environment_name: String,
+            version: String,
+            provider: String,
+            strategy: Option<String>,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            timeout_seconds: i64,
+            validation_result: Option<String>,
+        }
+
+        let row: DeploymentRow = sqlx::query_as("SELECT * FROM deployments WHERE id = ?")
+            .bind(deployment_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| crate::Error::Other(format!("Deployment {} not found", deployment_id)))?;
+
+        let provider: DeploymentProvider = row.provider.parse()?;
+        let strategy: Option<crate::DeploymentStrategy> = row
+            .strategy
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::from_str(s).map_err(|e| crate::Error::Other(format!("Failed to parse strategy: {}", e))))
+            .transpose()?;
+        let validation_result: Option<crate::DeploymentValidation> = row
+            .validation_result
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| serde_json::from_str(v).map_err(|e| crate::Error::Other(format!("Failed to parse validation_result: {}", e))))
+            .transpose()?;
+
+        let status = match row.status.as_str() {
+            "pending" => DeploymentStatus::Pending,
+            "validating" => DeploymentStatus::Validating,
+            "in_progress" => DeploymentStatus::InProgress,
+            "completed" => DeploymentStatus::Completed,
+            "failed" => DeploymentStatus::Failed,
+            "rolled_back" => DeploymentStatus::RolledBack,
+            "timed_out" => DeploymentStatus::TimedOut,
+            _ => DeploymentStatus::Pending,
+        };
+
+        let started_at = chrono::DateTime::parse_from_rfc3339(&row.started_at)
+            .map_err(|e| crate::Error::Other(format!("Failed to parse started_at: {}", e)))?
+            .into();
+        let completed_at = row
+            .completed_at
+            .as_ref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.into())
+                    .map_err(|e| crate::Error::Other(format!("Failed to parse completed_at: {}", e)))
+            })
+            .transpose()?;
+
+        Ok(crate::deployment_executor::Deployment {
+            id: row.id,
+            environment_id: row.environment_id,
+            environment_name: row.environment_name,
+            version: row.version,
+            provider,
+            strategy,
+            status,
+            error_message: row.error_message,
+            started_at,
+            completed_at,
+            timeout_seconds: row.timeout_seconds as u32,
+            validation_result,
+        })
+    }
+
+    /// List deployments for an environment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_deployments(
+        &self,
+        environment_name: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<crate::deployment_executor::Deployment>> {
+        use crate::deployment_executor::{DeploymentProvider, DeploymentStatus};
+
+        #[derive(sqlx::FromRow)]
+        struct DeploymentRow {
+            id: i64,
+            environment_id: i64,
+            environment_name: String,
+            version: String,
+            provider: String,
+            strategy: Option<String>,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            timeout_seconds: i64,
+            validation_result: Option<String>,
+        }
+
+        let limit = limit.unwrap_or(100);
+        let rows: Vec<DeploymentRow> = sqlx::query_as(
+            "SELECT * FROM deployments WHERE environment_name = ? ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(environment_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let provider: DeploymentProvider = row.provider.parse()?;
+                let strategy: Option<crate::DeploymentStrategy> = row
+                    .strategy
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()?;
+                let validation_result: Option<crate::DeploymentValidation> = row
+                    .validation_result
+                    .as_ref()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| serde_json::from_str(v))
+                    .transpose()?;
+
+                let status = match row.status.as_str() {
+                    "pending" => DeploymentStatus::Pending,
+                    "validating" => DeploymentStatus::Validating,
+                    "in_progress" => DeploymentStatus::InProgress,
+                    "completed" => DeploymentStatus::Completed,
+                    "failed" => DeploymentStatus::Failed,
+                    "rolled_back" => DeploymentStatus::RolledBack,
+                    "timed_out" => DeploymentStatus::TimedOut,
+                    _ => DeploymentStatus::Pending,
+                };
+
+                Ok(crate::deployment_executor::Deployment {
+                    id: row.id,
+                    environment_id: row.environment_id,
+                    environment_name: row.environment_name,
+                    version: row.version,
+                    provider,
+                    strategy,
+                    status,
+                    error_message: row.error_message,
+                    started_at: chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                        .map_err(|e| crate::Error::Other(e.to_string()))?
+                        .into(),
+                    completed_at: row
+                        .completed_at
+                        .as_ref()
+                        .map(|s| {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .map(|dt| dt.into())
+                                .map_err(|e| crate::Error::Other(e.to_string()))
+                        })
+                        .transpose()?,
+                    timeout_seconds: row.timeout_seconds as u32,
+                    validation_result,
+                })
+            })
+            .collect()
+    }
+
+    /// Add deployment progress event
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn add_deployment_progress(
+        &self,
+        deployment_id: i64,
+        message: &str,
+        progress_percent: u8,
+    ) -> Result<()> {
+        // Get current deployment status
+        let deployment = self.get_deployment(deployment_id).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO deployment_progress (deployment_id, status, message, progress_percent, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(deployment_id)
+        .bind(deployment.status.to_string())
+        .bind(message)
+        .bind(progress_percent as i64)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get deployment progress events
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment_progress(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Vec<crate::deployment_executor::DeploymentProgress>> {
+        use crate::deployment_executor::DeploymentStatus;
+
+        #[derive(sqlx::FromRow)]
+        struct ProgressRow {
+            deployment_id: i64,
+            status: String,
+            message: String,
+            progress_percent: i64,
+            details: Option<String>,
+            created_at: String,
+        }
+
+        let rows: Vec<ProgressRow> = sqlx::query_as(
+            "SELECT deployment_id, status, message, progress_percent, details, created_at
+             FROM deployment_progress
+             WHERE deployment_id = ?
+             ORDER BY created_at",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let status = match row.status.as_str() {
+                    "pending" => DeploymentStatus::Pending,
+                    "validating" => DeploymentStatus::Validating,
+                    "in_progress" => DeploymentStatus::InProgress,
+                    "completed" => DeploymentStatus::Completed,
+                    "failed" => DeploymentStatus::Failed,
+                    "rolled_back" => DeploymentStatus::RolledBack,
+                    "timed_out" => DeploymentStatus::TimedOut,
+                    _ => DeploymentStatus::Pending,
+                };
+
+                let details: Option<std::collections::HashMap<String, serde_json::Value>> = row
+                    .details
+                    .as_ref()
+                    .filter(|d| !d.is_empty())
+                    .map(|d| serde_json::from_str(d).map_err(|e| crate::Error::Other(format!("Failed to parse deployment progress details: {}", e))))
+                    .transpose()?;
+
+                Ok(crate::deployment_executor::DeploymentProgress {
+                    deployment_id: row.deployment_id,
+                    status,
+                    message: row.message,
+                    progress_percent: row.progress_percent as u8,
+                    timestamp: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                        .map_err(|e| crate::Error::Other(e.to_string()))?
+                        .into(),
+                    details,
+                })
+            })
+            .collect()
     }
 
     // ==================== Token Tracking Operations ====================

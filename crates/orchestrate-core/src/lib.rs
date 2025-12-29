@@ -21,6 +21,7 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 #[cfg(test)]
 mod database_environment_tests;
+pub mod deployment_executor;
 pub mod deployment_strategy;
 pub mod environment;
 pub mod epic;
@@ -126,4 +127,10 @@ pub use deployment_strategy::{
 // Re-export pre-deployment validation types
 pub use pre_deploy_validation::{
     DeploymentValidation, PreDeployValidator, ValidationCheck, ValidationStatus,
+};
+
+// Re-export deployment executor types
+pub use deployment_executor::{
+    Deployment, DeploymentExecutor, DeploymentProgress, DeploymentProvider, DeploymentRequest,
+    DeploymentStatus,
 };
