@@ -19,6 +19,7 @@ mod database_approval_tests;
 mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
+pub mod documentation;
 pub mod epic;
 pub mod error;
 pub mod experiment;
@@ -145,4 +146,12 @@ pub use learning_automation::{
     AutomationRun, AutomationRunStatus, AutomationTrigger, DurationEstimate, Improvement,
     ImprovementCategory, LearningAutomationConfig, LearningReport, ReportSummary, RiskFactor,
     RiskSeverity, TaskPrediction, TokenEstimate,
+};
+
+// Re-export documentation types
+pub use documentation::{
+    Adr, AdrConsequence, AdrStatus, ApiContact, ApiDocumentation, ApiEndpoint, ApiInfo, ApiLicense,
+    ApiParameter, ApiServer, Changelog, ChangelogEntry, ChangelogRelease, ChangeType, DocItemType,
+    DocIssueType, DocType, DocValidationIssue, DocValidationResult, ParameterLocation, PropertyInfo,
+    ReadmeContent, ReadmeSection, SchemaInfo,
 };

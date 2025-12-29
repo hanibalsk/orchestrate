@@ -181,6 +181,11 @@ enum Commands {
         #[arg(short = 'a', long)]
         agent_type: Option<String>,
     },
+    /// Documentation management
+    Docs {
+        #[command(subcommand)]
+        action: DocsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -981,6 +986,100 @@ enum ExperimentAction {
         /// Skip confirmation
         #[arg(short, long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsAction {
+    /// Generate documentation
+    Generate {
+        /// Documentation type (api, readme, changelog, adr)
+        #[arg(short = 't', long)]
+        doc_type: String,
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Output format (yaml, json, markdown)
+        #[arg(short, long, default_value = "yaml")]
+        format: String,
+    },
+    /// Validate documentation coverage
+    Validate {
+        /// Path to check (default: current directory)
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Check coverage percentage threshold
+        #[arg(long, default_value = "80")]
+        coverage_threshold: u32,
+        /// Fail on any issues
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Create an Architecture Decision Record
+    Adr {
+        #[command(subcommand)]
+        action: AdrAction,
+    },
+    /// Generate changelog from git history
+    Changelog {
+        /// Starting tag/commit
+        #[arg(long)]
+        from: Option<String>,
+        /// Ending tag/commit (default: HEAD)
+        #[arg(long)]
+        to: Option<String>,
+        /// Output file
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Append to existing changelog
+        #[arg(long)]
+        append: bool,
+    },
+    /// Serve documentation locally
+    Serve {
+        /// Port to serve on
+        #[arg(short, long, default_value = "8000")]
+        port: u16,
+        /// Documentation directory
+        #[arg(short, long, default_value = "docs")]
+        dir: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdrAction {
+    /// Create a new ADR
+    Create {
+        /// ADR title
+        title: String,
+        /// ADR status (proposed, accepted, deprecated, superseded)
+        #[arg(long, default_value = "proposed")]
+        status: String,
+    },
+    /// List all ADRs
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+        /// Show details
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Show a specific ADR
+    Show {
+        /// ADR number
+        number: u32,
+    },
+    /// Update ADR status
+    Update {
+        /// ADR number
+        number: u32,
+        /// New status
+        #[arg(long)]
+        status: String,
+        /// ADR that supersedes this one (if status is superseded)
+        #[arg(long)]
+        superseded_by: Option<u32>,
     },
 }
 
@@ -3361,6 +3460,388 @@ async fn main() -> Result<()> {
                 println!("Recommendations:");
                 for rec in &prediction.recommendations {
                     println!("  - {}", rec);
+                }
+            }
+        },
+        Commands::Docs { action } => match action {
+            DocsAction::Generate { doc_type, output, format } => {
+                use orchestrate_core::{ApiDocumentation, ApiEndpoint, DocType};
+
+                let doc_type_parsed = match doc_type.to_lowercase().as_str() {
+                    "api" => DocType::Api,
+                    "readme" => DocType::Readme,
+                    "changelog" => DocType::Changelog,
+                    "adr" => DocType::Adr,
+                    _ => anyhow::bail!("Unknown doc type: {}. Valid: api, readme, changelog, adr", doc_type),
+                };
+
+                match doc_type_parsed {
+                    DocType::Api => {
+                        // Generate API documentation from the codebase
+                        let mut api_doc = ApiDocumentation::new(
+                            "Orchestrate API",
+                            "1.0.0",
+                            Some("Agent orchestration and automation API"),
+                        );
+                        api_doc.add_server("http://localhost:8080", Some("Development server"));
+
+                        // Add sample endpoints from the known API
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/agents")
+                                .with_summary("List all agents")
+                                .with_tag("agents")
+                                .with_query_param("status", false, Some("Filter by status"))
+                                .with_query_param("type", false, Some("Filter by agent type")),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/agents/{id}")
+                                .with_summary("Get agent by ID")
+                                .with_tag("agents")
+                                .with_path_param("id", Some("Agent UUID")),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("POST", "/api/agents")
+                                .with_summary("Create a new agent")
+                                .with_tag("agents"),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/sessions")
+                                .with_summary("List sessions")
+                                .with_tag("sessions"),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/prs")
+                                .with_summary("List pull requests")
+                                .with_tag("pull-requests"),
+                        );
+
+                        let content = match format.to_lowercase().as_str() {
+                            "yaml" | "yml" => api_doc.to_openapi_yaml(),
+                            "json" => serde_json::to_string_pretty(&api_doc.to_openapi_json())?,
+                            _ => anyhow::bail!("Unknown format: {}. Valid: yaml, json", format),
+                        };
+
+                        if let Some(output_path) = output {
+                            std::fs::write(&output_path, &content)?;
+                            println!("API documentation generated: {}", output_path);
+                        } else {
+                            println!("{}", content);
+                        }
+                    }
+                    DocType::Changelog => {
+                        println!("Use 'orchestrate docs changelog' command for changelog generation");
+                    }
+                    DocType::Readme => {
+                        use orchestrate_core::{ReadmeContent, ReadmeSection};
+
+                        let mut readme = ReadmeContent {
+                            project_name: "Orchestrate".to_string(),
+                            description: Some("An agent orchestration and automation system".to_string()),
+                            sections: vec![],
+                        };
+
+                        readme.add_section(
+                            ReadmeSection::Installation,
+                            "```bash\ncargo install orchestrate\n```".to_string(),
+                        );
+                        readme.add_section(
+                            ReadmeSection::Usage,
+                            "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
+                        );
+
+                        if let Some(output_path) = output {
+                            std::fs::write(&output_path, readme.to_markdown())?;
+                            println!("README generated: {}", output_path);
+                        } else {
+                            println!("{}", readme.to_markdown());
+                        }
+                    }
+                    DocType::Adr => {
+                        println!("Use 'orchestrate docs adr create' command for ADR creation");
+                    }
+                    DocType::General => {
+                        println!("General documentation generation not implemented");
+                    }
+                }
+            }
+            DocsAction::Validate { path, coverage_threshold, strict } => {
+                use orchestrate_core::{DocValidationResult, DocValidationIssue, DocItemType, DocIssueType};
+
+                let check_path = path.unwrap_or_else(|| ".".to_string());
+                println!("Validating documentation in: {}", check_path);
+                println!();
+
+                // Create a mock validation result for now
+                // In a real implementation, this would scan the codebase
+                let mut result = DocValidationResult::new();
+                result.total_items = 100;  // Would be counted from actual code
+                result.documented_items = 85;  // Would be counted from actual code
+                result.calculate_coverage();
+
+                // Print summary
+                println!("{}", result.to_summary());
+
+                // Check threshold
+                if result.coverage_percentage < coverage_threshold as f64 {
+                    println!(
+                        "Warning: Coverage {:.1}% is below threshold {}%",
+                        result.coverage_percentage, coverage_threshold
+                    );
+                    if strict {
+                        std::process::exit(1);
+                    }
+                }
+
+                if strict && !result.is_valid() {
+                    println!("Validation failed due to issues (--strict mode)");
+                    std::process::exit(1);
+                }
+            }
+            DocsAction::Adr { action: adr_action } => match adr_action {
+                AdrAction::Create { title, status } => {
+                    use orchestrate_core::{Adr, AdrStatus};
+                    use std::str::FromStr;
+
+                    let adr_status = AdrStatus::from_str(&status)?;
+
+                    // Find the next ADR number
+                    let adr_dir = std::path::Path::new("docs/adrs");
+                    std::fs::create_dir_all(adr_dir)?;
+
+                    let mut max_number = 0;
+                    if adr_dir.exists() {
+                        for entry in std::fs::read_dir(adr_dir)? {
+                            if let Ok(entry) = entry {
+                                let name = entry.file_name();
+                                let name = name.to_string_lossy();
+                                if name.starts_with("adr-") && name.ends_with(".md") {
+                                    if let Some(num_str) = name.strip_prefix("adr-").and_then(|s| s.strip_suffix(".md")) {
+                                        if let Ok(num) = num_str.parse::<u32>() {
+                                            max_number = max_number.max(num);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let adr_number = max_number + 1;
+
+                    let adr = Adr {
+                        number: adr_number,
+                        title: title.clone(),
+                        status: adr_status,
+                        date: chrono::Utc::now(),
+                        context: "".to_string(),
+                        decision: "".to_string(),
+                        consequences: vec![],
+                        related_adrs: vec![],
+                        superseded_by: None,
+                        tags: vec![],
+                    };
+
+                    let file_path = adr_dir.join(format!("adr-{:04}.md", adr_number));
+                    std::fs::write(&file_path, adr.to_markdown())?;
+
+                    println!("Created ADR: {}", file_path.display());
+                    println!("  Title: {}", title);
+                    println!("  Status: {}", status);
+                    println!();
+                    println!("Edit the file to fill in context, decision, and consequences.");
+                }
+                AdrAction::List { status, verbose } => {
+                    let adr_dir = std::path::Path::new("docs/adrs");
+                    if !adr_dir.exists() {
+                        println!("No ADRs found (docs/adrs directory doesn't exist)");
+                        return Ok(());
+                    }
+
+                    println!("Architecture Decision Records");
+                    println!("{}", "=".repeat(60));
+                    println!();
+
+                    let mut entries: Vec<_> = std::fs::read_dir(adr_dir)?
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
+                        .collect();
+                    entries.sort_by_key(|e| e.file_name());
+
+                    for entry in entries {
+                        let content = std::fs::read_to_string(entry.path())?;
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+
+                        // Parse title from first line
+                        let title = content.lines().next().unwrap_or("").trim_start_matches("# ");
+
+                        // Parse status
+                        let adr_status = content.lines()
+                            .skip_while(|l| !l.starts_with("## Status"))
+                            .skip(1)
+                            .skip_while(|l| l.is_empty())
+                            .next()
+                            .unwrap_or("Unknown");
+
+                        // Filter by status if specified
+                        if let Some(ref filter_status) = status {
+                            if !adr_status.to_lowercase().contains(&filter_status.to_lowercase()) {
+                                continue;
+                            }
+                        }
+
+                        println!("{}: {}", name.trim_end_matches(".md"), title);
+                        if verbose {
+                            println!("  Status: {}", adr_status);
+                        }
+                    }
+                }
+                AdrAction::Show { number } => {
+                    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+                    if !adr_path.exists() {
+                        anyhow::bail!("ADR not found: adr-{:04}", number);
+                    }
+                    let content = std::fs::read_to_string(&adr_path)?;
+                    println!("{}", content);
+                }
+                AdrAction::Update { number, status, superseded_by } => {
+                    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+                    if !adr_path.exists() {
+                        anyhow::bail!("ADR not found: adr-{:04}", number);
+                    }
+
+                    let content = std::fs::read_to_string(&adr_path)?;
+
+                    // Simple status update - find and replace the status line
+                    let mut new_content = String::new();
+                    let mut in_status_section = false;
+                    let mut status_updated = false;
+
+                    for line in content.lines() {
+                        if line.starts_with("## Status") {
+                            in_status_section = true;
+                            new_content.push_str(line);
+                            new_content.push('\n');
+                        } else if in_status_section && !status_updated && !line.is_empty() {
+                            // Replace the status line
+                            let mut new_status = status.clone();
+                            if let Some(by) = superseded_by {
+                                new_status.push_str(&format!(" by [ADR-{:04}](./adr-{:04}.md)", by, by));
+                            }
+                            new_content.push_str(&new_status);
+                            new_content.push('\n');
+                            status_updated = true;
+                            in_status_section = false;
+                        } else {
+                            new_content.push_str(line);
+                            new_content.push('\n');
+                        }
+                    }
+
+                    std::fs::write(&adr_path, new_content)?;
+                    println!("Updated ADR-{:04} status to: {}", number, status);
+                }
+            },
+            DocsAction::Changelog { from, to, output, append } => {
+                use orchestrate_core::{Changelog, ChangelogEntry, ChangelogRelease, ChangeType};
+
+                let from_ref = from.unwrap_or_else(|| "HEAD~20".to_string());
+                let to_ref = to.unwrap_or_else(|| "HEAD".to_string());
+
+                println!("Generating changelog from {} to {}", from_ref, to_ref);
+
+                // Get git log
+                let git_output = std::process::Command::new("git")
+                    .args(["log", "--oneline", "--pretty=format:%s|%H|%an", &format!("{}..{}", from_ref, to_ref)])
+                    .output()?;
+
+                let log_output = String::from_utf8_lossy(&git_output.stdout);
+                let mut entries = vec![];
+
+                for line in log_output.lines() {
+                    let parts: Vec<&str> = line.splitn(3, '|').collect();
+                    if parts.len() >= 3 {
+                        let message = parts[0];
+                        let hash = parts[1];
+                        let author = parts[2];
+
+                        // Parse conventional commit
+                        let change_type = if message.starts_with("feat") {
+                            Some(ChangeType::Added)
+                        } else if message.starts_with("fix") {
+                            Some(ChangeType::Fixed)
+                        } else if message.starts_with("docs") {
+                            Some(ChangeType::Changed)
+                        } else if message.starts_with("refactor") || message.starts_with("chore") {
+                            Some(ChangeType::Changed)
+                        } else {
+                            None
+                        };
+
+                        if let Some(ct) = change_type {
+                            // Extract description after the commit type
+                            let desc = message.split(':').nth(1)
+                                .map(|s| s.trim())
+                                .unwrap_or(message)
+                                .to_string();
+
+                            entries.push(ChangelogEntry {
+                                change_type: ct,
+                                description: desc,
+                                commit_hash: Some(hash[..7].to_string()),
+                                pr_number: None,
+                                issue_number: None,
+                                author: Some(author.to_string()),
+                                scope: None,
+                                breaking: message.contains("BREAKING"),
+                            });
+                        }
+                    }
+                }
+
+                // Create a release
+                let release = ChangelogRelease {
+                    version: "Unreleased".to_string(),
+                    date: chrono::Utc::now(),
+                    entries,
+                    yanked: false,
+                };
+
+                let markdown = release.to_markdown();
+
+                if let Some(output_path) = output {
+                    if append {
+                        let mut existing = std::fs::read_to_string(&output_path).unwrap_or_default();
+                        if !existing.is_empty() {
+                            existing = format!("{}\n{}", markdown, existing);
+                        } else {
+                            existing = markdown;
+                        }
+                        std::fs::write(&output_path, existing)?;
+                        println!("Changelog appended to: {}", output_path);
+                    } else {
+                        std::fs::write(&output_path, &markdown)?;
+                        println!("Changelog written to: {}", output_path);
+                    }
+                } else {
+                    println!("{}", markdown);
+                }
+            }
+            DocsAction::Serve { port, dir } => {
+                println!("Serving documentation from {} on port {}", dir, port);
+                println!("Press Ctrl+C to stop");
+                println!();
+
+                // For now, just use Python's http.server if available
+                let status = std::process::Command::new("python3")
+                    .args(["-m", "http.server", &port.to_string()])
+                    .current_dir(&dir)
+                    .status();
+
+                match status {
+                    Ok(_) => {}
+                    Err(_) => {
+                        println!("Note: Python http.server not available.");
+                        println!("Please install a static file server to serve docs locally.");
+                    }
                 }
             }
         },

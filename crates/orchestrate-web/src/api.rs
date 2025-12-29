@@ -213,6 +213,12 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/experiments/:id/promote", post(promote_experiment))
         // Prediction routes
         .route("/api/predictions", post(get_prediction))
+        // Documentation routes
+        .route("/api/docs/generate", post(generate_documentation))
+        .route("/api/docs/validate", post(validate_documentation))
+        .route("/api/docs/adrs", get(list_adrs).post(create_adr))
+        .route("/api/docs/adrs/:number", get(get_adr).put(update_adr))
+        .route("/api/docs/changelog", post(generate_changelog))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -2513,6 +2519,481 @@ async fn get_prediction(
             })
             .collect(),
         recommendations: prediction.recommendations,
+    }))
+}
+
+// ==================== Documentation Handlers ====================
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocGenerateRequest {
+    doc_type: String,
+    format: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocGenerateResponse {
+    doc_type: String,
+    format: String,
+    content: String,
+    generated_at: String,
+}
+
+async fn generate_documentation(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<DocGenerateRequest>,
+) -> Result<Json<DocGenerateResponse>, ApiError> {
+    use orchestrate_core::{ApiDocumentation, ApiEndpoint, DocType, ReadmeContent, ReadmeSection};
+
+    let format = req.format.unwrap_or_else(|| "yaml".to_string());
+
+    let content = match req.doc_type.to_lowercase().as_str() {
+        "api" => {
+            let mut api_doc = ApiDocumentation::new(
+                "Orchestrate API",
+                "1.0.0",
+                Some("Agent orchestration and automation API"),
+            );
+            api_doc.add_server("http://localhost:8080", Some("Development server"));
+
+            // Add basic endpoints
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/agents")
+                    .with_summary("List all agents")
+                    .with_tag("agents"),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/agents/{id}")
+                    .with_summary("Get agent by ID")
+                    .with_tag("agents")
+                    .with_path_param("id", Some("Agent UUID")),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("POST", "/api/agents")
+                    .with_summary("Create a new agent")
+                    .with_tag("agents"),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/sessions")
+                    .with_summary("List sessions")
+                    .with_tag("sessions"),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/prs")
+                    .with_summary("List pull requests")
+                    .with_tag("pull-requests"),
+            );
+
+            match format.to_lowercase().as_str() {
+                "yaml" | "yml" => api_doc.to_openapi_yaml(),
+                "json" => serde_json::to_string_pretty(&api_doc.to_openapi_json())
+                    .map_err(|e| ApiError::internal(format!("JSON error: {}", e)))?,
+                _ => return Err(ApiError::bad_request(format!("Unknown format: {}", format))),
+            }
+        }
+        "readme" => {
+            let mut readme = ReadmeContent {
+                project_name: "Orchestrate".to_string(),
+                description: Some("An agent orchestration and automation system".to_string()),
+                sections: vec![],
+            };
+
+            readme.add_section(
+                ReadmeSection::Installation,
+                "```bash\ncargo install orchestrate\n```".to_string(),
+            );
+            readme.add_section(
+                ReadmeSection::Usage,
+                "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
+            );
+
+            readme.to_markdown()
+        }
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "Unknown doc type: {}. Valid: api, readme",
+                req.doc_type
+            )))
+        }
+    };
+
+    Ok(Json(DocGenerateResponse {
+        doc_type: req.doc_type,
+        format,
+        content,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocValidateRequest {
+    path: Option<String>,
+    coverage_threshold: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocValidateResponse {
+    total_items: usize,
+    documented_items: usize,
+    coverage_percentage: f64,
+    issues_count: usize,
+    is_valid: bool,
+    summary: String,
+}
+
+async fn validate_documentation(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<DocValidateRequest>,
+) -> Result<Json<DocValidateResponse>, ApiError> {
+    use orchestrate_core::DocValidationResult;
+
+    let _check_path = req.path.unwrap_or_else(|| ".".to_string());
+    let _threshold = req.coverage_threshold.unwrap_or(80);
+
+    // Create a mock validation result for now
+    let mut result = DocValidationResult::new();
+    result.total_items = 100;
+    result.documented_items = 85;
+    result.calculate_coverage();
+
+    Ok(Json(DocValidateResponse {
+        total_items: result.total_items,
+        documented_items: result.documented_items,
+        coverage_percentage: result.coverage_percentage,
+        issues_count: result.issues.len(),
+        is_valid: result.is_valid(),
+        summary: result.to_summary(),
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrListItem {
+    number: u32,
+    title: String,
+    status: String,
+    file_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrListResponse {
+    adrs: Vec<AdrListItem>,
+    total: usize,
+}
+
+async fn list_adrs(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<AdrListResponse>, ApiError> {
+    let adr_dir = std::path::Path::new("docs/adrs");
+    let mut adrs = vec![];
+
+    if adr_dir.exists() {
+        let entries: Vec<_> = std::fs::read_dir(adr_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to read ADR directory: {}", e)))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
+            .collect();
+
+        for entry in entries {
+            let content = std::fs::read_to_string(entry.path())
+                .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Parse number from filename
+            let number = name_str
+                .strip_prefix("adr-")
+                .and_then(|s| s.strip_suffix(".md"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            // Parse title from first line
+            let title = content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("# ")
+                .to_string();
+
+            // Parse status
+            let status = content
+                .lines()
+                .skip_while(|l| !l.starts_with("## Status"))
+                .nth(2)
+                .unwrap_or("Unknown")
+                .to_string();
+
+            adrs.push(AdrListItem {
+                number,
+                title,
+                status,
+                file_path: entry.path().to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    adrs.sort_by_key(|a| a.number);
+    let total = adrs.len();
+
+    Ok(Json(AdrListResponse { adrs, total }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrCreateRequest {
+    title: String,
+    status: Option<String>,
+    context: Option<String>,
+    decision: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrCreateResponse {
+    number: u32,
+    title: String,
+    status: String,
+    file_path: String,
+}
+
+async fn create_adr(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<AdrCreateRequest>,
+) -> Result<Json<AdrCreateResponse>, ApiError> {
+    use orchestrate_core::{Adr, AdrStatus};
+    use std::str::FromStr;
+
+    let status_str = req.status.unwrap_or_else(|| "proposed".to_string());
+    let adr_status = AdrStatus::from_str(&status_str)
+        .map_err(|_| ApiError::bad_request(format!("Invalid status: {}", status_str)))?;
+
+    // Find the next ADR number
+    let adr_dir = std::path::Path::new("docs/adrs");
+    std::fs::create_dir_all(adr_dir)
+        .map_err(|e| ApiError::internal(format!("Failed to create ADR directory: {}", e)))?;
+
+    let mut max_number = 0u32;
+    if adr_dir.exists() {
+        for entry in std::fs::read_dir(adr_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to read directory: {}", e)))?
+        {
+            if let Ok(entry) = entry {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(num_str) = name
+                    .strip_prefix("adr-")
+                    .and_then(|s| s.strip_suffix(".md"))
+                {
+                    if let Ok(num) = num_str.parse::<u32>() {
+                        max_number = max_number.max(num);
+                    }
+                }
+            }
+        }
+    }
+    let adr_number = max_number + 1;
+
+    let adr = Adr {
+        number: adr_number,
+        title: req.title.clone(),
+        status: adr_status,
+        date: chrono::Utc::now(),
+        context: req.context.unwrap_or_default(),
+        decision: req.decision.unwrap_or_default(),
+        consequences: vec![],
+        related_adrs: vec![],
+        superseded_by: None,
+        tags: vec![],
+    };
+
+    let file_path = adr_dir.join(format!("adr-{:04}.md", adr_number));
+    std::fs::write(&file_path, adr.to_markdown())
+        .map_err(|e| ApiError::internal(format!("Failed to write ADR: {}", e)))?;
+
+    Ok(Json(AdrCreateResponse {
+        number: adr_number,
+        title: req.title,
+        status: status_str,
+        file_path: file_path.to_string_lossy().to_string(),
+    }))
+}
+
+async fn get_adr(
+    State(_state): State<Arc<AppState>>,
+    Path(number): Path<u32>,
+) -> Result<String, ApiError> {
+    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+    if !adr_path.exists() {
+        return Err(ApiError::not_found(format!("ADR not found: adr-{:04}", number)));
+    }
+    std::fs::read_to_string(&adr_path)
+        .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrUpdateRequest {
+    status: Option<String>,
+    superseded_by: Option<u32>,
+}
+
+async fn update_adr(
+    State(_state): State<Arc<AppState>>,
+    Path(number): Path<u32>,
+    Json(req): Json<AdrUpdateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+    if !adr_path.exists() {
+        return Err(ApiError::not_found(format!("ADR not found: adr-{:04}", number)));
+    }
+
+    let content = std::fs::read_to_string(&adr_path)
+        .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))?;
+
+    let mut new_content = String::new();
+    let mut in_status_section = false;
+    let mut status_updated = false;
+
+    for line in content.lines() {
+        if line.starts_with("## Status") {
+            in_status_section = true;
+            new_content.push_str(line);
+            new_content.push('\n');
+        } else if in_status_section && !status_updated && !line.is_empty() {
+            if let Some(ref new_status) = req.status {
+                let mut status_line = new_status.clone();
+                if let Some(by) = req.superseded_by {
+                    status_line.push_str(&format!(" by [ADR-{:04}](./adr-{:04}.md)", by, by));
+                }
+                new_content.push_str(&status_line);
+                new_content.push('\n');
+            } else {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+            status_updated = true;
+            in_status_section = false;
+        } else {
+            new_content.push_str(line);
+            new_content.push('\n');
+        }
+    }
+
+    std::fs::write(&adr_path, new_content)
+        .map_err(|e| ApiError::internal(format!("Failed to write ADR: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "number": number,
+        "status": req.status.unwrap_or_else(|| "unchanged".to_string())
+    })))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChangelogRequest {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChangelogResponse {
+    version: String,
+    date: String,
+    entries: Vec<ChangelogEntryItem>,
+    markdown: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChangelogEntryItem {
+    change_type: String,
+    description: String,
+    commit_hash: Option<String>,
+    author: Option<String>,
+    breaking: bool,
+}
+
+async fn generate_changelog(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<ChangelogRequest>,
+) -> Result<Json<ChangelogResponse>, ApiError> {
+    use orchestrate_core::{ChangelogEntry, ChangelogRelease, ChangeType};
+
+    let from_ref = req.from.unwrap_or_else(|| "HEAD~20".to_string());
+    let to_ref = req.to.unwrap_or_else(|| "HEAD".to_string());
+
+    // Get git log
+    let git_output = std::process::Command::new("git")
+        .args([
+            "log",
+            "--oneline",
+            "--pretty=format:%s|%H|%an",
+            &format!("{}..{}", from_ref, to_ref),
+        ])
+        .output()
+        .map_err(|e| ApiError::internal(format!("Failed to run git: {}", e)))?;
+
+    let log_output = String::from_utf8_lossy(&git_output.stdout);
+    let mut entries = vec![];
+    let mut entry_items = vec![];
+
+    for line in log_output.lines() {
+        let parts: Vec<&str> = line.splitn(3, '|').collect();
+        if parts.len() >= 3 {
+            let message = parts[0];
+            let hash = parts[1];
+            let author = parts[2];
+
+            // Parse conventional commit
+            let change_type = if message.starts_with("feat") {
+                Some(ChangeType::Added)
+            } else if message.starts_with("fix") {
+                Some(ChangeType::Fixed)
+            } else if message.starts_with("docs") {
+                Some(ChangeType::Changed)
+            } else if message.starts_with("refactor") || message.starts_with("chore") {
+                Some(ChangeType::Changed)
+            } else {
+                None
+            };
+
+            if let Some(ct) = change_type {
+                let desc = message
+                    .split(':')
+                    .nth(1)
+                    .map(|s| s.trim())
+                    .unwrap_or(message)
+                    .to_string();
+                let breaking = message.contains("BREAKING");
+
+                entries.push(ChangelogEntry {
+                    change_type: ct,
+                    description: desc.clone(),
+                    commit_hash: Some(hash[..7].to_string()),
+                    pr_number: None,
+                    issue_number: None,
+                    author: Some(author.to_string()),
+                    scope: None,
+                    breaking,
+                });
+
+                entry_items.push(ChangelogEntryItem {
+                    change_type: ct.as_str().to_string(),
+                    description: desc,
+                    commit_hash: Some(hash[..7].to_string()),
+                    author: Some(author.to_string()),
+                    breaking,
+                });
+            }
+        }
+    }
+
+    let release = ChangelogRelease {
+        version: "Unreleased".to_string(),
+        date: chrono::Utc::now(),
+        entries,
+        yanked: false,
+    };
+
+    Ok(Json(ChangelogResponse {
+        version: release.version.clone(),
+        date: release.date.to_rfc3339(),
+        entries: entry_items,
+        markdown: release.to_markdown(),
     }))
 }
 

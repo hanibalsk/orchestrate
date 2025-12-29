@@ -140,6 +140,21 @@ pub enum AgentType {
     // System agents
     BackgroundController,
     Scheduler,
+
+    // Documentation agents (Epic 011)
+    DocGenerator,
+
+    // Requirements agents (Epic 012)
+    RequirementsAnalyzer,
+
+    // Multi-repo agents (Epic 013)
+    MultiRepoCoordinator,
+
+    // CI/CD agents (Epic 014)
+    CiIntegrator,
+
+    // Incident response agents (Epic 015)
+    IncidentResponder,
 }
 
 impl AgentType {
@@ -159,6 +174,11 @@ impl AgentType {
             AgentType::IssueTriager => "issue_triager",
             AgentType::BackgroundController => "background_controller",
             AgentType::Scheduler => "scheduler",
+            AgentType::DocGenerator => "doc_generator",
+            AgentType::RequirementsAnalyzer => "requirements_analyzer",
+            AgentType::MultiRepoCoordinator => "multi_repo_coordinator",
+            AgentType::CiIntegrator => "ci_integrator",
+            AgentType::IncidentResponder => "incident_responder",
         }
     }
 
@@ -178,6 +198,11 @@ impl AgentType {
             "issue_triager" => Ok(AgentType::IssueTriager),
             "background_controller" => Ok(AgentType::BackgroundController),
             "scheduler" => Ok(AgentType::Scheduler),
+            "doc_generator" => Ok(AgentType::DocGenerator),
+            "requirements_analyzer" => Ok(AgentType::RequirementsAnalyzer),
+            "multi_repo_coordinator" => Ok(AgentType::MultiRepoCoordinator),
+            "ci_integrator" => Ok(AgentType::CiIntegrator),
+            "incident_responder" => Ok(AgentType::IncidentResponder),
             _ => Err(crate::Error::Other(format!("Unknown agent type: {}", s))),
         }
     }
@@ -216,6 +241,19 @@ impl AgentType {
                 vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
             }
             AgentType::Scheduler => vec!["Bash", "Read"],
+            AgentType::DocGenerator => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+            }
+            AgentType::RequirementsAnalyzer => vec!["Bash", "Read", "Glob", "Grep"],
+            AgentType::MultiRepoCoordinator => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
+            }
+            AgentType::CiIntegrator => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+            }
+            AgentType::IncidentResponder => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
+            }
         }
     }
 
@@ -228,6 +266,9 @@ impl AgentType {
             AgentType::ConflictResolver => 30,
             AgentType::RegressionTester => 50,
             AgentType::IssueTriager => 30,
+            AgentType::DocGenerator => 50,
+            AgentType::RequirementsAnalyzer => 40,
+            AgentType::CiIntegrator => 40,
             _ => 80,
         }
     }
