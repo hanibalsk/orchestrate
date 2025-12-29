@@ -24,6 +24,7 @@ pub mod epic;
 pub mod requirements;
 pub mod multi_repo;
 pub mod ci_integration;
+pub mod incident;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -177,4 +178,13 @@ pub use multi_repo::{
 pub use ci_integration::{
     CiArtifact, CiAuthType, CiConclusion, CiConfig, CiFailureAnalysis, CiJob, CiProvider, CiRun,
     CiRunStatus, CiStep, CiTriggerRequest, FailedJob, FailedTest,
+};
+
+// Re-export incident types
+pub use incident::{
+    ActionItem, ActionItemPriority, ActionResult, AnomalyMetric, EscalationCondition,
+    EscalationRule, EscalationTarget, EscalationTargetType, Evidence, EvidenceType, Hypothesis,
+    Incident, IncidentImpact, IncidentSeverity, IncidentStatus, Playbook, PlaybookAction,
+    PlaybookExecution, PlaybookExecutionStatus, PlaybookTrigger, PostMortem, RelatedEvent,
+    RootCauseAnalysis, TimelineEvent, TimelineEventType,
 };

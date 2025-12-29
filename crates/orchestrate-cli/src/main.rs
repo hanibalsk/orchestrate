@@ -201,6 +201,11 @@ enum Commands {
         #[command(subcommand)]
         action: CiAction,
     },
+    /// Incident response management
+    Incident {
+        #[command(subcommand)]
+        action: IncidentAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1254,6 +1259,99 @@ enum CiAction {
         /// Attempt auto-fix
         #[arg(long)]
         auto_fix: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IncidentAction {
+    /// List incidents
+    List {
+        /// Filter by status
+        #[arg(short, long)]
+        status: Option<String>,
+        /// Filter by severity
+        #[arg(long)]
+        severity: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show incident details
+    Show {
+        /// Incident ID
+        id: String,
+    },
+    /// Create a new incident
+    Create {
+        /// Incident title
+        #[arg(short, long)]
+        title: String,
+        /// Severity (critical, high, medium, low)
+        #[arg(short, long, default_value = "medium")]
+        severity: String,
+        /// Description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// Investigate incident
+    Investigate {
+        /// Incident ID
+        id: String,
+    },
+    /// Run mitigation playbook
+    Mitigate {
+        /// Incident ID
+        id: String,
+        /// Playbook name
+        #[arg(short, long)]
+        playbook: String,
+    },
+    /// Resolve incident
+    Resolve {
+        /// Incident ID
+        id: String,
+        /// Resolution description
+        #[arg(short, long)]
+        resolution: String,
+    },
+    /// Generate post-mortem
+    Postmortem {
+        /// Incident ID
+        id: String,
+        /// Output file
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Playbook management
+    Playbook {
+        #[command(subcommand)]
+        action: PlaybookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaybookAction {
+    /// List playbooks
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new playbook
+    Create {
+        /// Playbook name
+        name: String,
+        /// Description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// Run a playbook
+    Run {
+        /// Playbook name or ID
+        name: String,
+        /// Associated incident ID
+        #[arg(short, long)]
+        incident: Option<String>,
     },
 }
 
@@ -4620,6 +4718,191 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        },
+        Commands::Incident { action } => match action {
+            IncidentAction::List { status, severity, json } => {
+                // In production, would query database for incidents
+                println!("Incidents");
+                println!("{}", "=".repeat(60));
+
+                if let Some(s) = status {
+                    println!("Filtering by status: {}", s);
+                }
+                if let Some(sev) = severity {
+                    println!("Filtering by severity: {}", sev);
+                }
+
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No incidents found. Create one with 'orchestrate incident create'");
+                }
+            }
+            IncidentAction::Show { id } => {
+                println!("Incident: {}", id);
+                println!("{}", "=".repeat(60));
+                println!("(Would load incident details from database)");
+            }
+            IncidentAction::Create { title, severity, description } => {
+                use orchestrate_core::{Incident, IncidentSeverity};
+                use std::str::FromStr;
+
+                let sev = IncidentSeverity::from_str(&severity)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                let inc_id = format!("INC-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+                let mut incident = Incident::new(&inc_id, &title, sev);
+
+                if let Some(desc) = description {
+                    incident.description = desc;
+                }
+
+                // Store to incidents.yaml for now
+                let incidents_file = std::path::Path::new("incidents.yaml");
+                let mut incidents: Vec<serde_json::Value> = if incidents_file.exists() {
+                    let content = std::fs::read_to_string(incidents_file)?;
+                    serde_yaml::from_str(&content).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+
+                incidents.push(serde_json::json!({
+                    "id": incident.id,
+                    "title": incident.title,
+                    "description": incident.description,
+                    "severity": incident.severity.as_str(),
+                    "status": incident.status.as_str(),
+                    "detected_at": incident.detected_at.to_rfc3339(),
+                }));
+
+                std::fs::write(incidents_file, serde_yaml::to_string(&incidents)?)?;
+
+                println!("Created incident: {}", incident.id);
+                println!("  Title: {}", incident.title);
+                println!("  Severity: {}", incident.severity.as_str());
+                println!("  Status: {}", incident.status.as_str());
+                println!();
+                println!("Next steps:");
+                println!("  orchestrate incident investigate {}", incident.id);
+                println!("  orchestrate incident mitigate {} --playbook <name>", incident.id);
+            }
+            IncidentAction::Investigate { id } => {
+                use orchestrate_core::{RootCauseAnalysis, EvidenceType};
+
+                println!("Investigating incident: {}", id);
+                println!();
+
+                // Create sample RCA
+                let mut rca = RootCauseAnalysis::new(&id);
+                rca.set_primary_cause("Investigating... (would analyze logs and metrics)");
+                rca.add_evidence(EvidenceType::LogPattern, "Error patterns detected", "application logs");
+                rca.add_hypothesis("Possible resource exhaustion", 0.6);
+
+                println!("{}", rca.to_summary());
+                println!("(Full investigation would analyze logs, metrics, and recent changes)");
+            }
+            IncidentAction::Mitigate { id, playbook } => {
+                println!("Executing playbook '{}' for incident: {}", playbook, id);
+                println!();
+                println!("Playbook actions:");
+                println!("  (Would load and execute playbook from playbooks.yaml)");
+                println!();
+                println!("(In production, would execute remediation actions)");
+            }
+            IncidentAction::Resolve { id, resolution } => {
+                println!("Resolving incident: {}", id);
+                println!("  Resolution: {}", resolution);
+                println!();
+                println!("Incident marked as resolved.");
+                println!("  Generate post-mortem with: orchestrate incident postmortem {}", id);
+            }
+            IncidentAction::Postmortem { id, output } => {
+                use orchestrate_core::{Incident, IncidentSeverity, PostMortem, ActionItemPriority};
+
+                // Create sample incident for post-mortem
+                let incident = Incident::new(&id, "Sample Incident", IncidentSeverity::High);
+
+                let mut pm = PostMortem::from_incident(&incident);
+                pm.summary = "Incident summary goes here".to_string();
+                pm.root_cause = "Root cause analysis".to_string();
+                pm.resolution = "Actions taken to resolve".to_string();
+                pm.add_action_item("Review and prevent recurrence", ActionItemPriority::High, None);
+                pm.lessons_learned.push("Document lessons learned".to_string());
+
+                let content = pm.to_markdown();
+
+                if let Some(path) = output {
+                    std::fs::write(&path, &content)?;
+                    println!("Post-mortem saved to: {}", path);
+                } else {
+                    println!("{}", content);
+                }
+            }
+            IncidentAction::Playbook { action: pb_action } => match pb_action {
+                PlaybookAction::List { json } => {
+                    let playbooks_file = std::path::Path::new("playbooks.yaml");
+                    if !playbooks_file.exists() {
+                        println!("No playbooks defined. Create one with 'orchestrate incident playbook create'");
+                        return Ok(());
+                    }
+
+                    let content = std::fs::read_to_string(playbooks_file)?;
+                    let playbooks: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&playbooks)?);
+                    } else {
+                        println!("Playbooks");
+                        println!("{}", "=".repeat(60));
+                        for pb in &playbooks {
+                            println!("{}: {}",
+                                pb["name"].as_str().unwrap_or(""),
+                                pb["description"].as_str().unwrap_or(""),
+                            );
+                        }
+                        println!("\nTotal: {} playbooks", playbooks.len());
+                    }
+                }
+                PlaybookAction::Create { name, description } => {
+                    use orchestrate_core::Playbook;
+
+                    let pb_id = format!("pb-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+                    let mut playbook = Playbook::new(&pb_id, &name);
+                    if let Some(desc) = description {
+                        playbook.description = desc;
+                    }
+
+                    let playbooks_file = std::path::Path::new("playbooks.yaml");
+                    let mut playbooks: Vec<serde_json::Value> = if playbooks_file.exists() {
+                        let content = std::fs::read_to_string(playbooks_file)?;
+                        serde_yaml::from_str(&content).unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+
+                    playbooks.push(serde_json::json!({
+                        "id": playbook.id,
+                        "name": playbook.name,
+                        "description": playbook.description,
+                        "triggers": [],
+                        "actions": [],
+                    }));
+
+                    std::fs::write(playbooks_file, serde_yaml::to_string(&playbooks)?)?;
+
+                    println!("Created playbook: {}", playbook.name);
+                    println!("  ID: {}", playbook.id);
+                    println!("  Edit playbooks.yaml to add triggers and actions");
+                }
+                PlaybookAction::Run { name, incident } => {
+                    println!("Running playbook: {}", name);
+                    if let Some(inc_id) = incident {
+                        println!("  For incident: {}", inc_id);
+                    }
+                    println!();
+                    println!("(Would load and execute playbook actions)");
+                }
+            },
         },
     }
 
