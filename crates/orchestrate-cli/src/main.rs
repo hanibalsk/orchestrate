@@ -580,6 +580,12 @@ enum TestAction {
         /// Limit for history results
         #[arg(long, default_value = "10")]
         limit: i64,
+        /// Analyze coverage only for changed files (git diff)
+        #[arg(long)]
+        diff: bool,
+        /// Base branch for diff comparison (default: main)
+        #[arg(long, default_value = "main", requires = "diff")]
+        base: String,
     },
     /// Validate test quality
     Validate {
@@ -598,6 +604,39 @@ enum TestAction {
         /// Output format (text, json)
         #[arg(short, long, default_value = "text")]
         output: String,
+    },
+    /// Run tests
+    Run {
+        /// Language/framework (rust, typescript, python)
+        #[arg(short, long, default_value = "rust")]
+        language: String,
+        /// Run tests only for changed code
+        #[arg(long)]
+        changed: bool,
+        /// Base branch for changed comparison (default: main)
+        #[arg(long, default_value = "main", requires = "changed")]
+        base: String,
+        /// Test pattern to filter tests
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Verbose test output
+        #[arg(short = 'V', long)]
+        verbose_tests: bool,
+    },
+    /// Generate comprehensive test report
+    Report {
+        /// Output format (text, json, markdown, html)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Output file path (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Include coverage metrics
+        #[arg(long)]
+        include_coverage: bool,
+        /// Include test quality metrics
+        #[arg(long)]
+        include_quality: bool,
     },
     /// Analyze PR changes and suggest tests
     AnalyzePr {
@@ -1892,6 +1931,8 @@ async fn main() -> Result<()> {
                 module,
                 history,
                 limit,
+                diff,
+                base,
             } => {
                 handle_test_coverage(
                     &db,
@@ -1902,6 +1943,8 @@ async fn main() -> Result<()> {
                     module.as_deref(),
                     history,
                     limit,
+                    diff,
+                    &base,
                 )
                 .await?;
             }
@@ -1914,6 +1957,31 @@ async fn main() -> Result<()> {
             } => {
                 handle_test_validate(&db, &file, mutation, source.as_deref(), store, &output)
                     .await?;
+            }
+            TestAction::Run {
+                language,
+                changed,
+                base,
+                pattern,
+                verbose_tests,
+            } => {
+                handle_test_run(&db, &language, changed, &base, pattern.as_deref(), verbose_tests)
+                    .await?;
+            }
+            TestAction::Report {
+                format,
+                output,
+                include_coverage,
+                include_quality,
+            } => {
+                handle_test_report(
+                    &db,
+                    &format,
+                    output.as_deref(),
+                    include_coverage,
+                    include_quality,
+                )
+                .await?;
             }
             TestAction::AnalyzePr {
                 pr,
@@ -3402,6 +3470,8 @@ async fn handle_test_coverage(
     module_name: Option<&str>,
     show_history: bool,
     limit: i64,
+    diff_mode: bool,
+    base_branch: &str,
 ) -> Result<()> {
     use orchestrate_core::{CoverageFormat, CoverageService};
 
@@ -3445,6 +3515,103 @@ async fn handle_test_coverage(
         } else {
             anyhow::bail!("Module name required for coverage history. Use --module <name>");
         }
+        return Ok(());
+    }
+
+    // If diff mode, analyze coverage only for changed files
+    if diff_mode {
+        println!("🔍 Analyzing coverage for changed files (diff from {})", base_branch);
+        println!();
+
+        // Get changed files
+        use std::process::Command;
+        let output = Command::new("git")
+            .args(&["diff", "--name-only", base_branch])
+            .output()?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to get git diff. Make sure you're in a git repository.");
+        }
+
+        let changed_files: Vec<String> = String::from_utf8(output.stdout)?
+            .lines()
+            .map(|s| s.to_string())
+            .filter(|f| f.ends_with(".rs") || f.ends_with(".ts") || f.ends_with(".tsx") || f.ends_with(".py"))
+            .collect();
+
+        if changed_files.is_empty() {
+            println!("No changed code files found in diff from {}", base_branch);
+            return Ok(());
+        }
+
+        println!("Changed files: {}", changed_files.len());
+        for file in &changed_files {
+            println!("  - {}", file);
+        }
+        println!();
+
+        // Run tests with coverage
+        println!("🧪 Running tests with coverage instrumentation...");
+        let project_root = std::env::current_dir()?;
+        let report_path = service.run_tests_with_coverage(&project_root, language).await?;
+
+        println!("📊 Parsing coverage report: {}", report_path.display());
+        let format = match language {
+            "rust" => CoverageFormat::Lcov,
+            "typescript" => CoverageFormat::Lcov,
+            "python" => CoverageFormat::Cobertura,
+            _ => anyhow::bail!("Unsupported language: {}. Use: rust, typescript, python", language),
+        };
+
+        let full_report = service.parse_coverage_report(&report_path, format).await?;
+
+        // Filter to only changed files
+        println!();
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║            Coverage for Changed Files                       ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+        println!();
+
+        let mut total_lines = 0;
+        let mut covered_lines = 0;
+
+        for module in &full_report.modules {
+            for file_coverage in &module.files {
+                // Check if this file is in the changed files
+                if changed_files.iter().any(|cf| file_coverage.file_path.ends_with(cf)) {
+                    total_lines += file_coverage.lines_total;
+                    covered_lines += file_coverage.lines_covered;
+
+                    let status = if file_coverage.coverage_percent >= module.threshold { "✅" } else { "⚠️" };
+                    println!("  {} {}: {:.1}% ({}/{} lines)",
+                        status,
+                        file_coverage.file_path,
+                        file_coverage.coverage_percent,
+                        file_coverage.lines_covered,
+                        file_coverage.lines_total
+                    );
+                }
+            }
+        }
+
+        println!();
+        let overall_percent = if total_lines > 0 {
+            (covered_lines as f64 / total_lines as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!("  Overall (changed files): {:.1}% ({}/{} lines)", overall_percent, covered_lines, total_lines);
+        println!();
+
+        if let Some(threshold_val) = threshold {
+            if overall_percent < threshold_val {
+                println!("⚠️  Coverage ({:.1}%) is below threshold ({:.1}%)", overall_percent, threshold_val);
+                std::process::exit(1);
+            } else {
+                println!("✅ Coverage meets threshold of {:.1}%", threshold_val);
+            }
+        }
+
         return Ok(());
     }
 
@@ -3527,6 +3694,357 @@ async fn handle_test_coverage(
     }
 
     Ok(())
+}
+
+async fn handle_test_run(
+    _db: &Database,
+    language: &str,
+    changed_only: bool,
+    base_branch: &str,
+    pattern: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    use std::process::Command;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                    Running Tests                             ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+
+    // If running tests for changed code only
+    if changed_only {
+        println!("🔍 Finding tests for changed code (diff from {})", base_branch);
+        println!();
+
+        // Get changed files
+        let output = Command::new("git")
+            .args(&["diff", "--name-only", base_branch])
+            .output()?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to get git diff. Make sure you're in a git repository.");
+        }
+
+        let changed_files: Vec<String> = String::from_utf8(output.stdout)?
+            .lines()
+            .map(|s| s.to_string())
+            .filter(|f| f.ends_with(".rs") || f.ends_with(".ts") || f.ends_with(".tsx") || f.ends_with(".py"))
+            .collect();
+
+        if changed_files.is_empty() {
+            println!("No changed code files found in diff from {}", base_branch);
+            return Ok(());
+        }
+
+        println!("Changed files: {}", changed_files.len());
+        for file in &changed_files {
+            println!("  - {}", file);
+        }
+        println!();
+    }
+
+    // Build test command based on language
+    let mut cmd = match language {
+        "rust" => {
+            let mut c = Command::new("cargo");
+            c.arg("test");
+            if let Some(pat) = pattern {
+                c.arg(pat);
+            }
+            if verbose {
+                c.arg("--");
+                c.arg("--nocapture");
+            }
+            c
+        }
+        "typescript" => {
+            let mut c = Command::new("npm");
+            c.arg("test");
+            if let Some(pat) = pattern {
+                c.arg("--");
+                c.arg(pat);
+            }
+            c
+        }
+        "python" => {
+            let mut c = Command::new("pytest");
+            if verbose {
+                c.arg("-v");
+            }
+            if let Some(pat) = pattern {
+                c.arg("-k");
+                c.arg(pat);
+            }
+            c
+        }
+        _ => anyhow::bail!("Unsupported language: {}. Use: rust, typescript, python", language),
+    };
+
+    println!("🧪 Running {} tests...", language);
+    if let Some(pat) = pattern {
+        println!("   Pattern: {}", pat);
+    }
+    println!();
+
+    // Run the tests
+    let status = cmd.status()?;
+
+    println!();
+    if status.success() {
+        println!("✅ All tests passed!");
+    } else {
+        println!("❌ Some tests failed");
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn handle_test_report(
+    db: &Database,
+    format: &str,
+    output_path: Option<&std::path::Path>,
+    include_coverage: bool,
+    include_quality: bool,
+) -> Result<()> {
+    use orchestrate_core::CoverageService;
+    use serde_json::json;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                  Generating Test Report                     ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+
+    // Collect test metrics
+    let mut report_data = json!({
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "sections": {}
+    });
+
+    // Add coverage metrics if requested
+    if include_coverage {
+        println!("📊 Collecting coverage metrics...");
+        let coverage_service = CoverageService::new(db.clone());
+
+        // Get latest coverage report
+        match coverage_service.get_latest_coverage().await {
+            Ok(Some(latest)) => {
+                report_data["sections"]["coverage"] = json!({
+                    "overall_percent": latest.overall_percent,
+                    "timestamp": latest.timestamp,
+                    "modules": latest.modules.iter().map(|m| json!({
+                        "name": m.module_name,
+                        "coverage": m.coverage_percent,
+                        "threshold": m.threshold,
+                        "meets_threshold": m.meets_threshold(),
+                    })).collect::<Vec<_>>()
+                });
+            }
+            _ => {
+                report_data["sections"]["coverage"] = json!({
+                    "error": "No coverage data available"
+                });
+            }
+        }
+    }
+
+    // Add quality metrics if requested
+    if include_quality {
+        println!("🔍 Collecting quality metrics...");
+        // For now, we'll add a placeholder. This would integrate with test validation results
+        report_data["sections"]["quality"] = json!({
+            "note": "Quality metrics feature coming soon"
+        });
+    }
+
+    // Generate report in requested format
+    let report_content = match format {
+        "json" => {
+            serde_json::to_string_pretty(&report_data)?
+        }
+        "markdown" => {
+            generate_markdown_report(&report_data)
+        }
+        "html" => {
+            generate_html_report(&report_data)
+        }
+        "text" => {
+            generate_text_report(&report_data)
+        }
+        _ => anyhow::bail!("Unsupported format: {}. Use: text, json, markdown, html", format),
+    };
+
+    // Output report
+    if let Some(path) = output_path {
+        tokio::fs::write(path, &report_content).await?;
+        println!();
+        println!("✅ Test report written to: {}", path.display());
+    } else {
+        println!();
+        println!("{}", report_content);
+    }
+
+    Ok(())
+}
+
+fn generate_text_report(data: &serde_json::Value) -> String {
+    let mut report = String::new();
+
+    report.push_str("═══════════════════════════════════════════════════════════════\n");
+    report.push_str("                      TEST REPORT                              \n");
+    report.push_str("═══════════════════════════════════════════════════════════════\n");
+    report.push_str("\n");
+
+    if let Some(generated_at) = data["generated_at"].as_str() {
+        report.push_str(&format!("Generated: {}\n\n", generated_at));
+    }
+
+    // Coverage section
+    if let Some(coverage) = data["sections"]["coverage"].as_object() {
+        if let Some(overall) = coverage["overall_percent"].as_f64() {
+            report.push_str("COVERAGE SUMMARY\n");
+            report.push_str(&format!("Overall: {:.1}%\n\n", overall));
+
+            if let Some(modules) = coverage["modules"].as_array() {
+                report.push_str("Module Breakdown:\n");
+                for module in modules {
+                    let name = module["name"].as_str().unwrap_or("unknown");
+                    let cov = module["coverage"].as_f64().unwrap_or(0.0);
+                    let threshold = module["threshold"].as_f64().unwrap_or(0.0);
+                    let meets = module["meets_threshold"].as_bool().unwrap_or(false);
+                    let status = if meets { "✅" } else { "⚠️" };
+
+                    report.push_str(&format!("  {} {}: {:.1}% (target: {:.0}%)\n",
+                        status, name, cov, threshold));
+                }
+            }
+        } else if let Some(error) = coverage["error"].as_str() {
+            report.push_str(&format!("Coverage: {}\n", error));
+        }
+        report.push_str("\n");
+    }
+
+    // Quality section
+    if let Some(quality) = data["sections"]["quality"].as_object() {
+        if let Some(note) = quality["note"].as_str() {
+            report.push_str("QUALITY METRICS\n");
+            report.push_str(&format!("{}\n\n", note));
+        }
+    }
+
+    report
+}
+
+fn generate_markdown_report(data: &serde_json::Value) -> String {
+    let mut report = String::new();
+
+    report.push_str("# Test Report\n\n");
+
+    if let Some(generated_at) = data["generated_at"].as_str() {
+        report.push_str(&format!("*Generated: {}*\n\n", generated_at));
+    }
+
+    // Coverage section
+    if let Some(coverage) = data["sections"]["coverage"].as_object() {
+        if let Some(overall) = coverage["overall_percent"].as_f64() {
+            report.push_str("## Coverage Summary\n\n");
+            report.push_str(&format!("**Overall:** {:.1}%\n\n", overall));
+
+            if let Some(modules) = coverage["modules"].as_array() {
+                report.push_str("### Module Breakdown\n\n");
+                report.push_str("| Module | Coverage | Threshold | Status |\n");
+                report.push_str("|--------|----------|-----------|--------|\n");
+
+                for module in modules {
+                    let name = module["name"].as_str().unwrap_or("unknown");
+                    let cov = module["coverage"].as_f64().unwrap_or(0.0);
+                    let threshold = module["threshold"].as_f64().unwrap_or(0.0);
+                    let meets = module["meets_threshold"].as_bool().unwrap_or(false);
+                    let status = if meets { "✅" } else { "⚠️" };
+
+                    report.push_str(&format!("| {} | {:.1}% | {:.0}% | {} |\n",
+                        name, cov, threshold, status));
+                }
+            }
+        } else if let Some(error) = coverage["error"].as_str() {
+            report.push_str(&format!("**Coverage:** {}\n", error));
+        }
+        report.push_str("\n");
+    }
+
+    // Quality section
+    if let Some(quality) = data["sections"]["quality"].as_object() {
+        if let Some(note) = quality["note"].as_str() {
+            report.push_str("## Quality Metrics\n\n");
+            report.push_str(&format!("{}\n\n", note));
+        }
+    }
+
+    report
+}
+
+fn generate_html_report(data: &serde_json::Value) -> String {
+    let mut report = String::new();
+
+    report.push_str("<!DOCTYPE html>\n");
+    report.push_str("<html>\n<head>\n");
+    report.push_str("<title>Test Report</title>\n");
+    report.push_str("<style>\n");
+    report.push_str("body { font-family: Arial, sans-serif; margin: 40px; }\n");
+    report.push_str("h1 { color: #333; }\n");
+    report.push_str("table { border-collapse: collapse; width: 100%; margin: 20px 0; }\n");
+    report.push_str("th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }\n");
+    report.push_str("th { background-color: #4CAF50; color: white; }\n");
+    report.push_str(".good { color: green; }\n");
+    report.push_str(".warning { color: orange; }\n");
+    report.push_str("</style>\n");
+    report.push_str("</head>\n<body>\n");
+
+    report.push_str("<h1>Test Report</h1>\n");
+
+    if let Some(generated_at) = data["generated_at"].as_str() {
+        report.push_str(&format!("<p><em>Generated: {}</em></p>\n", generated_at));
+    }
+
+    // Coverage section
+    if let Some(coverage) = data["sections"]["coverage"].as_object() {
+        if let Some(overall) = coverage["overall_percent"].as_f64() {
+            report.push_str("<h2>Coverage Summary</h2>\n");
+            report.push_str(&format!("<p><strong>Overall:</strong> {:.1}%</p>\n", overall));
+
+            if let Some(modules) = coverage["modules"].as_array() {
+                report.push_str("<h3>Module Breakdown</h3>\n");
+                report.push_str("<table>\n");
+                report.push_str("<tr><th>Module</th><th>Coverage</th><th>Threshold</th><th>Status</th></tr>\n");
+
+                for module in modules {
+                    let name = module["name"].as_str().unwrap_or("unknown");
+                    let cov = module["coverage"].as_f64().unwrap_or(0.0);
+                    let threshold = module["threshold"].as_f64().unwrap_or(0.0);
+                    let meets = module["meets_threshold"].as_bool().unwrap_or(false);
+                    let status = if meets { "✅" } else { "⚠️" };
+                    let class = if meets { "good" } else { "warning" };
+
+                    report.push_str(&format!("<tr><td>{}</td><td>{:.1}%</td><td>{:.0}%</td><td class=\"{}\">{}</td></tr>\n",
+                        name, cov, threshold, class, status));
+                }
+                report.push_str("</table>\n");
+            }
+        } else if let Some(error) = coverage["error"].as_str() {
+            report.push_str(&format!("<p><strong>Coverage:</strong> {}</p>\n", error));
+        }
+    }
+
+    // Quality section
+    if let Some(quality) = data["sections"]["quality"].as_object() {
+        if let Some(note) = quality["note"].as_str() {
+            report.push_str("<h2>Quality Metrics</h2>\n");
+            report.push_str(&format!("<p>{}</p>\n", note));
+        }
+    }
+
+    report.push_str("</body>\n</html>\n");
+    report
 }
 
 async fn handle_test_validate(
