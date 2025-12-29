@@ -192,19 +192,36 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
 
 /// Create the full router with both API and UI routes
 pub fn create_router(state: Arc<AppState>) -> Router {
+    create_router_with_webhook(state, None)
+}
+
+/// Create the full router with both API, UI routes, and optional webhook endpoint
+pub fn create_router_with_webhook(state: Arc<AppState>, webhook_secret: Option<String>) -> Router {
     let api_router = create_api_router(state.clone());
     let ui_router = crate::ui::create_ui_router().with_state(state.clone());
 
     // Create WebSocket state with the same database
     let ws_state = Arc::new(crate::websocket::WsState::new(state.db.clone()));
 
-    Router::new()
+    let mut router = Router::new()
         .merge(api_router)
         .merge(ui_router)
         .route(
             "/ws",
             axum::routing::get(crate::websocket::ws_handler).with_state(ws_state),
-        )
+        );
+
+    // Add webhook endpoint (always available, secret is optional for signature verification)
+    let secret = webhook_secret.or_else(|| std::env::var("GITHUB_WEBHOOK_SECRET").ok());
+    let webhook_config = crate::webhook::WebhookConfig::new(secret);
+    let webhook_state = Arc::new(crate::webhook::WebhookState::new(webhook_config, state.db.clone()));
+
+    router = router.route(
+        "/webhooks/github",
+        post(crate::webhook::github_webhook_handler).with_state(webhook_state),
+    );
+
+    router
 }
 
 // ==================== Handlers ====================
