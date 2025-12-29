@@ -25,6 +25,7 @@ pub mod deployment_executor;
 pub mod deployment_strategy;
 pub mod environment;
 pub mod epic;
+pub mod post_deploy_verification;
 pub mod pre_deploy_validation;
 pub mod error;
 pub mod feedback;
@@ -133,4 +134,10 @@ pub use pre_deploy_validation::{
 pub use deployment_executor::{
     Deployment, DeploymentExecutor, DeploymentProgress, DeploymentProvider, DeploymentRequest,
     DeploymentStatus,
+};
+
+// Re-export post-deployment verification types
+pub use post_deploy_verification::{
+    PostDeployVerifier, VerificationCheck, VerificationCheckStatus, VerificationCheckType,
+    VerificationResult,
 };

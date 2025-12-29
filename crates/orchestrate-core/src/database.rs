@@ -156,6 +156,12 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/014_deployments.sql"))
             .execute(&self.pool)
             .await?;
+        // Deployment verification migration
+        sqlx::query(include_str!(
+            "../../../migrations/015_deployment_verification.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2431,6 +2437,233 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    // ==================== Deployment Verification Operations ====================
+
+    /// Create a deployment verification record
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_deployment_verification(
+        &self,
+        deployment_id: i64,
+    ) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "INSERT INTO deployment_verifications (deployment_id, overall_status, should_rollback, started_at, created_at, updated_at)
+             VALUES (?, 'pending', 0, ?, ?, ?)",
+        )
+        .bind(deployment_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Add a verification check
+    #[tracing::instrument(skip(self, details), level = "debug")]
+    pub async fn add_verification_check(
+        &self,
+        verification_id: i64,
+        check_type: &str,
+        status: &str,
+        message: &str,
+        details: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let details_json = details.map(|d| serde_json::to_string(d).unwrap_or_default());
+
+        sqlx::query(
+            "INSERT INTO verification_checks (verification_id, check_type, status, message, details, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(verification_id)
+        .bind(check_type)
+        .bind(status)
+        .bind(message)
+        .bind(details_json)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update verification overall status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_verification_status(
+        &self,
+        verification_id: i64,
+        overall_status: &str,
+        should_rollback: bool,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE deployment_verifications
+             SET overall_status = ?, should_rollback = ?, completed_at = ?
+             WHERE id = ?",
+        )
+        .bind(overall_status)
+        .bind(should_rollback as i64)
+        .bind(&now)
+        .bind(verification_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get deployment verification by deployment ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment_verification(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::post_deploy_verification::VerificationResult>> {
+        use crate::post_deploy_verification::{
+            VerificationCheck, VerificationCheckStatus, VerificationCheckType, VerificationResult,
+        };
+
+        #[derive(sqlx::FromRow)]
+        struct VerificationRow {
+            id: i64,
+            deployment_id: i64,
+            overall_status: String,
+            should_rollback: i64,
+            started_at: String,
+            completed_at: Option<String>,
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct CheckRow {
+            check_type: String,
+            status: String,
+            message: String,
+            details: Option<String>,
+            created_at: String,
+        }
+
+        let verification_row: Option<VerificationRow> = sqlx::query_as(
+            "SELECT id, deployment_id, overall_status, should_rollback, started_at, completed_at
+             FROM deployment_verifications
+             WHERE deployment_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(verification_row) = verification_row else {
+            return Ok(None);
+        };
+
+        let check_rows: Vec<CheckRow> = sqlx::query_as(
+            "SELECT check_type, status, message, details, created_at
+             FROM verification_checks
+             WHERE verification_id = ?
+             ORDER BY created_at",
+        )
+        .bind(verification_row.id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let checks: Result<Vec<VerificationCheck>> = check_rows
+            .into_iter()
+            .map(|row| {
+                let check_type = match row.check_type.as_str() {
+                    "smoke_test" => VerificationCheckType::SmokeTest,
+                    "health_endpoint" => VerificationCheckType::HealthEndpoint,
+                    "version_check" => VerificationCheckType::VersionCheck,
+                    "log_error_check" => VerificationCheckType::LogErrorCheck,
+                    "error_rate_monitoring" => VerificationCheckType::ErrorRateMonitoring,
+                    _ => {
+                        return Err(crate::Error::Other(format!(
+                            "Invalid verification check type: {}",
+                            row.check_type
+                        )))
+                    }
+                };
+
+                let status = match row.status.as_str() {
+                    "pending" => VerificationCheckStatus::Pending,
+                    "running" => VerificationCheckStatus::Running,
+                    "passed" => VerificationCheckStatus::Passed,
+                    "failed" => VerificationCheckStatus::Failed,
+                    "skipped" => VerificationCheckStatus::Skipped,
+                    _ => {
+                        return Err(crate::Error::Other(format!(
+                            "Invalid verification status: {}",
+                            row.status
+                        )))
+                    }
+                };
+
+                let details = row
+                    .details
+                    .as_ref()
+                    .filter(|d| !d.is_empty())
+                    .map(|d| {
+                        serde_json::from_str(d).map_err(|e| {
+                            crate::Error::Other(format!(
+                                "Failed to parse verification check details: {}",
+                                e
+                            ))
+                        })
+                    })
+                    .transpose()?;
+
+                let timestamp = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .into();
+
+                Ok(VerificationCheck {
+                    check_type,
+                    status,
+                    message: row.message,
+                    details,
+                    timestamp,
+                })
+            })
+            .collect();
+
+        let overall_status = match verification_row.overall_status.as_str() {
+            "pending" => VerificationCheckStatus::Pending,
+            "running" => VerificationCheckStatus::Running,
+            "passed" => VerificationCheckStatus::Passed,
+            "failed" => VerificationCheckStatus::Failed,
+            "skipped" => VerificationCheckStatus::Skipped,
+            _ => {
+                return Err(crate::Error::Other(format!(
+                    "Invalid verification overall status: {}",
+                    verification_row.overall_status
+                )))
+            }
+        };
+
+        let started_at = chrono::DateTime::parse_from_rfc3339(&verification_row.started_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .into();
+
+        let completed_at = verification_row
+            .completed_at
+            .as_ref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.into())
+                    .map_err(|e| crate::Error::Other(e.to_string()))
+            })
+            .transpose()?;
+
+        Ok(Some(VerificationResult {
+            deployment_id: verification_row.deployment_id,
+            checks: checks?,
+            overall_status,
+            should_rollback: verification_row.should_rollback != 0,
+            started_at,
+            completed_at,
+        }))
     }
 
     // ==================== Token Tracking Operations ====================
