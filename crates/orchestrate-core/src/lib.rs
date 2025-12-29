@@ -26,6 +26,7 @@ pub mod deployment_rollback;
 pub mod deployment_strategy;
 pub mod environment;
 pub mod epic;
+pub mod release_management;
 pub mod post_deploy_verification;
 pub mod pre_deploy_validation;
 pub mod error;
@@ -147,4 +148,10 @@ pub use post_deploy_verification::{
 pub use deployment_rollback::{
     DeploymentRollback, RollbackEvent as DeploymentRollbackEvent, RollbackNotification,
     RollbackRequest, RollbackStatus as DeploymentRollbackStatus, RollbackType,
+};
+
+// Re-export release management types
+pub use release_management::{
+    BumpType, Changelog, ChangelogEntry, Commit, CommitType, ReleaseAsset, ReleaseManager,
+    ReleasePreparation, ReleaseRequest, Version,
 };

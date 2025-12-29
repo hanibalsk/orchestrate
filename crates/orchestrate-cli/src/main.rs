@@ -179,6 +179,11 @@ enum Commands {
         #[command(subcommand)]
         action: DeployAction,
     },
+    /// Release management
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -902,6 +907,37 @@ enum DeployAction {
         /// Output format (table, json)
         #[arg(long, default_value = "table")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseAction {
+    /// Prepare a new release (bump version, generate changelog)
+    Prepare {
+        /// Version bump type (major, minor, patch)
+        #[arg(short, long)]
+        r#type: String,
+        /// Path to workspace Cargo.toml
+        #[arg(long, default_value = "./Cargo.toml")]
+        cargo_toml: PathBuf,
+        /// Path to CHANGELOG.md
+        #[arg(long, default_value = "./CHANGELOG.md")]
+        changelog: PathBuf,
+        /// Also bump frontend package.json if it exists
+        #[arg(long)]
+        bump_frontend: bool,
+    },
+    /// Create and tag a release
+    Create {
+        /// Version to release (e.g., 1.2.3)
+        #[arg(short, long)]
+        version: String,
+        /// Release message (defaults to changelog entry)
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Push tag to remote
+        #[arg(long)]
+        push: bool,
     },
 }
 
@@ -2669,6 +2705,24 @@ async fn main() -> Result<()> {
                     &format,
                 )
                 .await?;
+            }
+        },
+
+        Commands::Release { action } => match action {
+            ReleaseAction::Prepare {
+                r#type,
+                cargo_toml,
+                changelog,
+                bump_frontend,
+            } => {
+                handle_release_prepare(&db, &r#type, &cargo_toml, &changelog, bump_frontend).await?;
+            }
+            ReleaseAction::Create {
+                version,
+                message,
+                push,
+            } => {
+                handle_release_create(&db, &version, message.as_deref(), push).await?;
             }
         },
     }
@@ -4805,6 +4859,145 @@ async fn handle_deploy_rollback(
 
     println!();
     println!("Environment '{}' has been rolled back to version '{}'", env, rollback_event.target_version);
+
+    Ok(())
+}
+
+// ==================== Release Management Handlers ====================
+
+async fn handle_release_prepare(
+    db: &Database,
+    bump_type_str: &str,
+    cargo_toml: &PathBuf,
+    changelog_path: &PathBuf,
+    bump_frontend: bool,
+) -> Result<()> {
+    use orchestrate_core::{BumpType, ReleaseManager};
+    use std::str::FromStr;
+
+    // Parse bump type
+    let bump_type = BumpType::from_str(bump_type_str)?;
+
+    let manager = ReleaseManager::new(db.clone());
+
+    println!("Preparing {} release...", bump_type);
+    println!();
+
+    // Prepare release
+    let preparation = manager.prepare_release(bump_type.clone(), cargo_toml).await?;
+
+    println!("New version: {}", preparation.new_version);
+    println!("Release branch: {}", preparation.branch_name);
+    println!();
+
+    // Show changelog preview
+    println!("Changelog preview:");
+    println!("{}", preparation.changelog.to_markdown());
+
+    // Ask for confirmation
+    print!("Proceed with version bump? [y/N]: ");
+    use std::io::{self, Write};
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    if !input.trim().eq_ignore_ascii_case("y") {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // Create release branch
+    println!("\nCreating release branch...");
+    manager.create_release_branch(&preparation.branch_name).await?;
+    println!("✓ Created branch: {}", preparation.branch_name);
+
+    // Bump version in Cargo.toml
+    println!("\nBumping version in Cargo.toml...");
+    manager.bump_version(cargo_toml, &preparation.new_version).await?;
+    println!("✓ Updated Cargo.toml: {}", preparation.new_version);
+
+    // Bump frontend package.json if requested
+    if bump_frontend {
+        let package_json = PathBuf::from("frontend/package.json");
+        if package_json.exists() {
+            println!("\nBumping version in package.json...");
+            manager.bump_package_json_version(&package_json, &preparation.new_version).await?;
+            println!("✓ Updated package.json: {}", preparation.new_version);
+        }
+    }
+
+    // Update CHANGELOG.md
+    println!("\nUpdating CHANGELOG.md...");
+    manager.update_changelog_file(changelog_path, &preparation.changelog).await?;
+    println!("✓ Updated CHANGELOG.md");
+
+    println!("\n{}", "=".repeat(60));
+    println!("Release preparation complete!");
+    println!("{}", "=".repeat(60));
+    println!();
+    println!("Next steps:");
+    println!("  1. Review the changes");
+    println!("  2. Commit the version bump:");
+    println!("     git add -A");
+    println!("     git commit -m \"chore: Bump version to {}\"", preparation.new_version);
+    println!("  3. Create the release:");
+    println!("     orchestrate release create --version {}", preparation.new_version);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_release_create(
+    db: &Database,
+    version_str: &str,
+    message: Option<&str>,
+    push: bool,
+) -> Result<()> {
+    use orchestrate_core::{ReleaseManager, Version};
+
+    let manager = ReleaseManager::new(db.clone());
+
+    // Parse version
+    let version = Version::parse(version_str)?;
+
+    println!("Creating release for version {}...", version);
+    println!();
+
+    // Get release message (use provided or default)
+    let release_message = message
+        .map(String::from)
+        .unwrap_or_else(|| format!("Release version {}", version));
+
+    // Create git tag
+    println!("Creating git tag...");
+    manager.create_release_tag(&version, &release_message).await?;
+    println!("✓ Created tag: v{}", version);
+
+    // Push tag if requested
+    if push {
+        println!("\nPushing tag to remote...");
+        manager.push_tag(&version).await?;
+        println!("✓ Pushed tag to origin");
+    }
+
+    println!("\n{}", "=".repeat(60));
+    println!("Release created successfully!");
+    println!("{}", "=".repeat(60));
+    println!();
+    println!("Version: {}", version);
+    println!("Tag: v{}", version);
+
+    if !push {
+        println!();
+        println!("To push the tag to remote, run:");
+        println!("  git push origin v{}", version);
+    }
+
+    println!();
+    println!("To create a GitHub release, use the GitHub CLI:");
+    println!("  gh release create v{} --title \"Release {}\" --notes-file CHANGELOG.md", version, version);
+    println!();
 
     Ok(())
 }
