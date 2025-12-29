@@ -12,5 +12,5 @@ pub mod ui;
 pub mod websocket;
 
 pub use api::create_router;
-pub use schedule_executor::{ScheduleExecutor, ScheduleExecutorConfig};
+pub use schedule_executor::{MissedSchedulePolicy, ScheduleExecutor, ScheduleExecutorConfig};
 pub use ui::create_ui_router;

@@ -44,17 +44,40 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
+/// Policy for handling missed schedules
+#[derive(Clone, Debug, PartialEq)]
+pub enum MissedSchedulePolicy {
+    /// Run the schedule immediately once
+    RunImmediately,
+    /// Skip missed runs and wait for next scheduled time
+    Skip,
+    /// Catch up missed runs (up to a limit)
+    CatchUp,
+}
+
+impl Default for MissedSchedulePolicy {
+    fn default() -> Self {
+        Self::RunImmediately
+    }
+}
+
 /// Schedule executor configuration
 #[derive(Clone, Debug)]
 pub struct ScheduleExecutorConfig {
     /// Polling interval in seconds
     pub poll_interval_secs: u64,
+    /// Policy for handling missed schedules
+    pub missed_policy: MissedSchedulePolicy,
+    /// Maximum number of catch-up runs
+    pub catch_up_limit: usize,
 }
 
 impl Default for ScheduleExecutorConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: 60,
+            missed_policy: MissedSchedulePolicy::RunImmediately,
+            catch_up_limit: 3,
         }
     }
 }
@@ -126,11 +149,105 @@ impl ScheduleExecutor {
             return Ok(());
         }
 
+        // Check if this is a missed schedule
+        let now = chrono::Utc::now();
+        let next_run = schedule.next_run.unwrap_or(now);
+        let is_missed = next_run < now;
+
+        if is_missed {
+            let missed_duration = now.signed_duration_since(next_run);
+            warn!(
+                schedule_id = schedule_id,
+                schedule_name = %schedule_name,
+                missed_duration_secs = missed_duration.num_seconds(),
+                policy = ?self.config.missed_policy,
+                "Schedule missed its run time"
+            );
+
+            // Handle based on policy
+            match self.config.missed_policy {
+                MissedSchedulePolicy::Skip => {
+                    info!(
+                        schedule_id = schedule_id,
+                        schedule_name = %schedule_name,
+                        "Skipping missed schedule per policy"
+                    );
+
+                    // Just update next_run without executing
+                    schedule.last_run = Some(now);
+                    schedule.update_next_run()?;
+                    self.database.update_schedule(&schedule).await?;
+                    self.database.unlock_schedule(schedule_id).await?;
+
+                    return Ok(());
+                }
+                MissedSchedulePolicy::RunImmediately => {
+                    info!(
+                        schedule_id = schedule_id,
+                        schedule_name = %schedule_name,
+                        "Running missed schedule immediately"
+                    );
+
+                    // Run once and update
+                    self.execute_schedule_once(&mut schedule).await?;
+                }
+                MissedSchedulePolicy::CatchUp => {
+                    info!(
+                        schedule_id = schedule_id,
+                        schedule_name = %schedule_name,
+                        "Catching up missed schedule runs"
+                    );
+
+                    // Calculate how many runs were missed
+                    let missed_count = self.calculate_missed_runs(&schedule, now).await?;
+                    let runs_to_execute = missed_count.min(self.config.catch_up_limit);
+
+                    info!(
+                        schedule_id = schedule_id,
+                        missed_count = missed_count,
+                        runs_to_execute = runs_to_execute,
+                        catch_up_limit = self.config.catch_up_limit,
+                        "Executing catch-up runs"
+                    );
+
+                    // Execute multiple times
+                    for i in 0..runs_to_execute {
+                        debug!(
+                            schedule_id = schedule_id,
+                            run_number = i + 1,
+                            total = runs_to_execute,
+                            "Executing catch-up run"
+                        );
+                        self.execute_schedule_once(&mut schedule).await?;
+                    }
+                }
+            }
+        } else {
+            // Normal execution for schedules that are due
+            info!(
+                schedule_id = schedule_id,
+                schedule_name = %schedule_name,
+                "Executing schedule"
+            );
+
+            self.execute_schedule_once(&mut schedule).await?;
+        }
+
+        // Release the lock
+        self.database.unlock_schedule(schedule_id).await?;
+
         info!(
             schedule_id = schedule_id,
-            schedule_name = %schedule_name,
-            "Executing schedule"
+            next_run = ?schedule.next_run,
+            "Updated schedule for next run"
         );
+
+        Ok(())
+    }
+
+    /// Execute a schedule once
+    async fn execute_schedule_once(&self, schedule: &mut Schedule) -> orchestrate_core::Result<()> {
+        let schedule_id = schedule.id;
 
         // Create a schedule run record
         let mut run = ScheduleRun::new(schedule_id);
@@ -138,7 +255,7 @@ impl ScheduleExecutor {
         run.id = run_id;
 
         // Try to execute the schedule
-        match self.spawn_agent(&schedule).await {
+        match self.spawn_agent(schedule).await {
             Ok(agent_id) => {
                 info!(
                     schedule_id = schedule_id,
@@ -167,18 +284,50 @@ impl ScheduleExecutor {
         schedule.last_run = Some(chrono::Utc::now());
         schedule.update_next_run()?;
 
-        self.database.update_schedule(&schedule).await?;
-
-        // Release the lock
-        self.database.unlock_schedule(schedule_id).await?;
-
-        info!(
-            schedule_id = schedule_id,
-            next_run = ?schedule.next_run,
-            "Updated schedule for next run"
-        );
+        self.database.update_schedule(schedule).await?;
 
         Ok(())
+    }
+
+    /// Calculate how many runs were missed
+    async fn calculate_missed_runs(
+        &self,
+        schedule: &Schedule,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> orchestrate_core::Result<usize> {
+        use orchestrate_core::CronSchedule;
+
+        let next_run = schedule.next_run.unwrap_or(now);
+        if next_run >= now {
+            return Ok(0);
+        }
+
+        let cron = CronSchedule::new(&schedule.cron_expression)?;
+        let mut count = 0;
+        let mut current = next_run;
+
+        // Count how many runs were missed
+        // We iterate from the last known next_run and count all occurrences
+        // that should have happened but are now in the past
+        loop {
+            let next_occurrence = cron.next_after(&current)?;
+
+            if next_occurrence >= now {
+                // We've caught up to the present
+                break;
+            }
+
+            count += 1;
+
+            if count >= 100 {
+                // Cap at 100 to prevent infinite loops
+                break;
+            }
+
+            current = next_occurrence;
+        }
+
+        Ok(count)
     }
 
     /// Spawn an agent for the given schedule
@@ -400,5 +549,169 @@ mod tests {
         // Only one schedule run should be recorded
         let runs = database.get_schedule_runs(schedule_id, 10).await.unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_missed_schedule_run_immediately_policy() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Create a schedule that missed its run time (2 hours ago)
+        let mut schedule = Schedule::new(
+            "missed-schedule".to_string(),
+            "@hourly".to_string(),
+            "background_controller".to_string(),
+            "Missed task".to_string(),
+        );
+        schedule.next_run = Some(Utc::now() - chrono::Duration::hours(2));
+        let schedule_id = database.insert_schedule(&schedule).await.unwrap();
+
+        // Execute with RunImmediately policy (default)
+        let config = ScheduleExecutorConfig {
+            missed_policy: MissedSchedulePolicy::RunImmediately,
+            ..Default::default()
+        };
+        let executor = ScheduleExecutor::new(database.clone(), config);
+        executor.check_and_execute().await.unwrap();
+
+        // Schedule should be executed immediately
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        // Verify a schedule run was recorded
+        let runs = database.get_schedule_runs(schedule_id, 10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, ScheduleRunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_missed_schedule_skip_policy() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Create a schedule that missed its run time (2 hours ago)
+        let mut schedule = Schedule::new(
+            "missed-schedule".to_string(),
+            "@hourly".to_string(),
+            "background_controller".to_string(),
+            "Missed task".to_string(),
+        );
+        schedule.next_run = Some(Utc::now() - chrono::Duration::hours(2));
+        let schedule_id = database.insert_schedule(&schedule).await.unwrap();
+
+        // Execute with Skip policy
+        let config = ScheduleExecutorConfig {
+            missed_policy: MissedSchedulePolicy::Skip,
+            ..Default::default()
+        };
+        let executor = ScheduleExecutor::new(database.clone(), config);
+        executor.check_and_execute().await.unwrap();
+
+        // No agent should be created (skipped)
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+
+        // No schedule run should be recorded
+        let runs = database.get_schedule_runs(schedule_id, 10).await.unwrap();
+        assert_eq!(runs.len(), 0);
+
+        // Next run should be updated to next scheduled time
+        let updated_schedule = database.get_schedule(schedule_id).await.unwrap().unwrap();
+        assert!(updated_schedule.next_run.is_some());
+        assert!(updated_schedule.next_run.unwrap() > Utc::now());
+    }
+
+    #[tokio::test]
+    async fn test_missed_schedule_catch_up_policy() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Create a schedule that missed multiple runs (every 15 mins, missed 5 times)
+        let mut schedule = Schedule::new(
+            "catch-up-schedule".to_string(),
+            "*/15 * * * *".to_string(), // Every 15 minutes
+            "background_controller".to_string(),
+            "Catch-up task".to_string(),
+        );
+        // Set next_run to 75 minutes ago (5 missed runs)
+        schedule.next_run = Some(Utc::now() - chrono::Duration::minutes(75));
+        let schedule_id = database.insert_schedule(&schedule).await.unwrap();
+
+        // Execute with CatchUp policy (limit 3)
+        let config = ScheduleExecutorConfig {
+            missed_policy: MissedSchedulePolicy::CatchUp,
+            catch_up_limit: 3,
+            ..Default::default()
+        };
+        let executor = ScheduleExecutor::new(database.clone(), config);
+        executor.check_and_execute().await.unwrap();
+
+        // Should execute 3 times (catch_up_limit)
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 3);
+
+        // Verify 3 schedule runs were recorded
+        let runs = database.get_schedule_runs(schedule_id, 10).await.unwrap();
+        assert_eq!(runs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_missed_schedule_catch_up_less_than_limit() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Create a schedule that missed 2 runs
+        let mut schedule = Schedule::new(
+            "catch-up-schedule-2".to_string(),
+            "@hourly".to_string(),
+            "background_controller".to_string(),
+            "Catch-up task 2".to_string(),
+        );
+        // Set next_run to 2 hours ago (2 missed runs)
+        schedule.next_run = Some(Utc::now() - chrono::Duration::hours(2));
+        let schedule_id = database.insert_schedule(&schedule).await.unwrap();
+
+        // Execute with CatchUp policy (limit 3)
+        let config = ScheduleExecutorConfig {
+            missed_policy: MissedSchedulePolicy::CatchUp,
+            catch_up_limit: 3,
+            ..Default::default()
+        };
+        let executor = ScheduleExecutor::new(database.clone(), config);
+        executor.check_and_execute().await.unwrap();
+
+        // Should execute 2 times (actual missed runs < limit)
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 2);
+
+        // Verify 2 schedule runs were recorded
+        let runs = database.get_schedule_runs(schedule_id, 10).await.unwrap();
+        assert_eq!(runs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_missed_schedule_logging() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Create a schedule that missed its run time
+        let mut schedule = Schedule::new(
+            "logged-missed-schedule".to_string(),
+            "@hourly".to_string(),
+            "background_controller".to_string(),
+            "Logged missed task".to_string(),
+        );
+        schedule.next_run = Some(Utc::now() - chrono::Duration::hours(3));
+        database.insert_schedule(&schedule).await.unwrap();
+
+        // Execute with RunImmediately policy
+        let config = ScheduleExecutorConfig {
+            missed_policy: MissedSchedulePolicy::RunImmediately,
+            ..Default::default()
+        };
+        let executor = ScheduleExecutor::new(database.clone(), config);
+
+        // This should log the missed schedule event
+        // We can't easily test the log output, but we ensure it doesn't panic
+        executor.check_and_execute().await.unwrap();
+
+        // Verify execution happened
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
     }
 }
