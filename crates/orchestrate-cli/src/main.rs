@@ -557,6 +557,30 @@ enum TestAction {
         #[arg(long)]
         platform: Option<String>,
     },
+    /// Analyze test coverage
+    Coverage {
+        /// Language/framework (rust, typescript, python)
+        #[arg(short, long, default_value = "rust")]
+        language: String,
+        /// Coverage report format (lcov, cobertura)
+        #[arg(short, long)]
+        format: Option<String>,
+        /// Path to existing coverage report (skips running tests)
+        #[arg(short, long)]
+        report: Option<PathBuf>,
+        /// Coverage threshold percentage (0-100)
+        #[arg(short, long)]
+        threshold: Option<f64>,
+        /// Module name to set threshold for
+        #[arg(short, long)]
+        module: Option<String>,
+        /// Show coverage history
+        #[arg(long)]
+        history: bool,
+        /// Limit for history results
+        #[arg(long, default_value = "10")]
+        limit: i64,
+    },
 }
 
 #[tokio::main]
@@ -1821,6 +1845,27 @@ async fn main() -> Result<()> {
                     output.as_deref(),
                     write,
                     platform.as_deref(),
+                )
+                .await?;
+            }
+            TestAction::Coverage {
+                language,
+                format,
+                report,
+                threshold,
+                module,
+                history,
+                limit,
+            } => {
+                handle_test_coverage(
+                    &db,
+                    &language,
+                    format.as_deref(),
+                    report.as_deref(),
+                    threshold,
+                    module.as_deref(),
+                    history,
+                    limit,
                 )
                 .await?;
             }
@@ -3288,6 +3333,142 @@ async fn handle_test_generate(
             println!("   Default location: {}", result.test_file_path.display());
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn handle_test_coverage(
+    db: &Database,
+    language: &str,
+    format: Option<&str>,
+    report_path: Option<&std::path::Path>,
+    threshold: Option<f64>,
+    module_name: Option<&str>,
+    show_history: bool,
+    limit: i64,
+) -> Result<()> {
+    use orchestrate_core::{CoverageFormat, CoverageService};
+
+    let service = CoverageService::new(db.clone());
+
+    // If setting a threshold for a module
+    if let (Some(module), Some(threshold_val)) = (module_name, threshold) {
+        service.set_module_threshold(module, threshold_val).await?;
+        println!("✅ Set coverage threshold for '{}' to {}%", module, threshold_val);
+        return Ok(());
+    }
+
+    // If showing history
+    if show_history {
+        if let Some(module) = module_name {
+            println!("╔══════════════════════════════════════════════════════════════╗");
+            println!("║           Coverage History for {}                    ", module);
+            println!("╚══════════════════════════════════════════════════════════════╝");
+            println!();
+
+            let history = service.get_coverage_history(module, limit).await?;
+
+            if history.is_empty() {
+                println!("No coverage history found for module: {}", module);
+            } else {
+                for (i, report) in history.iter().enumerate() {
+                    let module_coverage = report.modules.iter()
+                        .find(|m| m.module_name == module)
+                        .unwrap();
+
+                    let meets_threshold = if module_coverage.meets_threshold() { "✅" } else { "⚠️" };
+                    println!("{}. {} - {:.2}% {} (threshold: {:.0}%)",
+                        i + 1,
+                        report.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                        module_coverage.coverage_percent,
+                        meets_threshold,
+                        module_coverage.threshold
+                    );
+                }
+            }
+        } else {
+            anyhow::bail!("Module name required for coverage history. Use --module <name>");
+        }
+        return Ok(());
+    }
+
+    // Parse or run coverage
+    let coverage_report = if let Some(report_path) = report_path {
+        // Parse existing coverage report
+        let format = format.unwrap_or("lcov");
+        let coverage_format = match format {
+            "lcov" => CoverageFormat::Lcov,
+            "cobertura" => CoverageFormat::Cobertura,
+            _ => anyhow::bail!("Unsupported coverage format: {}. Use: lcov, cobertura", format),
+        };
+
+        println!("📊 Parsing coverage report: {}", report_path.display());
+        service.parse_coverage_report(report_path, coverage_format).await?
+    } else {
+        // Run tests with coverage
+        println!("🧪 Running tests with coverage instrumentation...");
+        let project_root = std::env::current_dir()?;
+        let report_path = service.run_tests_with_coverage(&project_root, language).await?;
+
+        println!("📊 Parsing coverage report: {}", report_path.display());
+        let format = match language {
+            "rust" => CoverageFormat::Lcov,
+            "typescript" => CoverageFormat::Lcov,
+            "python" => CoverageFormat::Cobertura,
+            _ => anyhow::bail!("Unsupported language: {}. Use: rust, typescript, python", language),
+        };
+
+        service.parse_coverage_report(&report_path, format).await?
+    };
+
+    // Store coverage report
+    let report_id = service.store_coverage(&coverage_report).await?;
+    info!("Stored coverage report with ID: {}", report_id);
+
+    // Display coverage report
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                  Coverage Report                             ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+
+    for module in &coverage_report.modules {
+        let meets_threshold = if module.meets_threshold() { "" } else { " ⚠️" };
+        println!("  {}: {:.1}% (target: {:.0}%){}",
+            module.module_name,
+            module.coverage_percent,
+            module.threshold,
+            meets_threshold
+        );
+
+        // Show low-coverage files
+        let low_coverage_files: Vec<_> = module.files.iter()
+            .filter(|f| f.coverage_percent < module.threshold)
+            .collect();
+
+        if !low_coverage_files.is_empty() {
+            for file in low_coverage_files {
+                println!("    - {}: {:.1}% ⚠️", file.file_path, file.coverage_percent);
+            }
+        }
+    }
+
+    println!();
+    println!("  Overall: {:.1}%", coverage_report.overall_percent);
+    println!();
+
+    // Identify untested files
+    let untested = service.find_untested_files(&coverage_report).await;
+    if !untested.is_empty() {
+        println!("⚠️  Files Below Threshold:");
+        for file in untested.iter().take(10) {
+            println!("   - {} ({:.1}%)", file.file_path, file.coverage_percent);
+        }
+        if untested.len() > 10 {
+            println!("   ... and {} more", untested.len() - 10);
+        }
+        println!();
     }
 
     Ok(())

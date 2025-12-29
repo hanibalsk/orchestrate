@@ -8,6 +8,7 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod coverage;
 pub mod database;
 #[cfg(test)]
 mod database_webhook_tests;
@@ -63,4 +64,9 @@ pub use test_generation::{
     AcceptanceCriterion, E2ETestPlatform, E2ETestResult, FunctionSignature,
     IntegrationTestResult, InterfaceInfo, InterfaceType, Language, ModuleInfo, Parameter,
     TestCase, TestCategory, TestFixture, TestGenerationResult, TestGenerationService, TestType,
+};
+
+// Re-export coverage types
+pub use coverage::{
+    CoverageFormat, CoverageReport, CoverageService, FileCoverage, ModuleCoverage,
 };
