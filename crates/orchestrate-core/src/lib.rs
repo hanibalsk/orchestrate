@@ -8,8 +8,12 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod approval;
+pub mod approval_service;
 pub mod condition_evaluator;
 pub mod database;
+#[cfg(test)]
+mod database_approval_tests;
 #[cfg(test)]
 mod database_webhook_tests;
 #[cfg(test)]
@@ -72,3 +76,7 @@ pub use pipeline_parser::{
 
 // Re-export condition evaluator types
 pub use condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationResult, SkipReason};
+
+// Re-export approval types
+pub use approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
+pub use approval_service::ApprovalService;

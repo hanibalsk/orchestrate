@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
 use crate::instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
     LearningPattern, PatternStatus, PatternType,
@@ -122,6 +123,9 @@ impl Database {
             .await?;
         // Pipelines migration
         sqlx::query(include_str!("../../../migrations/007_pipelines.sql"))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(include_str!("../../../migrations/008_approvals.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -3055,3 +3059,272 @@ impl TryFrom<PipelineStageRow> for crate::PipelineStage {
     }
 }
 
+
+impl Database {
+    // Approval Operations
+
+    /// Create a new approval request
+    pub async fn create_approval_request(
+        &self,
+        request: ApprovalRequest,
+    ) -> Result<ApprovalRequest> {
+        let mut request = request;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO approval_requests
+            (stage_id, run_id, status, required_approvers, required_count,
+             approval_count, rejection_count, timeout_seconds, timeout_action,
+             timeout_at, resolved_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(request.stage_id)
+        .bind(request.run_id)
+        .bind(request.status.as_str())
+        .bind(&request.required_approvers)
+        .bind(request.required_count)
+        .bind(request.approval_count)
+        .bind(request.rejection_count)
+        .bind(request.timeout_seconds)
+        .bind(&request.timeout_action)
+        .bind(request.timeout_at.map(|t| t.to_rfc3339()))
+        .bind(request.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(request.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        request.id = Some(result.last_insert_rowid());
+        Ok(request)
+    }
+
+    /// Get an approval request by ID
+    pub async fn get_approval_request(&self, id: i64) -> Result<Option<ApprovalRequest>> {
+        let row = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get approval request by stage ID
+    pub async fn get_approval_request_by_stage(
+        &self,
+        stage_id: i64,
+    ) -> Result<Option<ApprovalRequest>> {
+        let row = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE stage_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(stage_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update an approval request
+    pub async fn update_approval_request(&self, request: &ApprovalRequest) -> Result<()> {
+        let id = request
+            .id
+            .ok_or_else(|| crate::Error::Other("Approval request ID is required".to_string()))?;
+
+        sqlx::query(
+            r#"
+            UPDATE approval_requests
+            SET status = ?, approval_count = ?, rejection_count = ?,
+                required_approvers = ?, resolved_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(request.status.as_str())
+        .bind(request.approval_count)
+        .bind(request.rejection_count)
+        .bind(&request.required_approvers)
+        .bind(request.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all pending approval requests
+    pub async fn list_pending_approvals(&self) -> Result<Vec<ApprovalRequest>> {
+        let rows = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List approval requests that have timed out
+    pub async fn list_timed_out_approvals(&self) -> Result<Vec<ApprovalRequest>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE status = 'pending'
+              AND timeout_at IS NOT NULL
+              AND timeout_at < ?
+            ORDER BY timeout_at ASC
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Create an approval decision
+    pub async fn create_approval_decision(
+        &self,
+        decision: ApprovalDecision,
+    ) -> Result<ApprovalDecision> {
+        let mut decision = decision;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO approval_decisions
+            (approval_id, approver, decision, comment, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(decision.approval_id)
+        .bind(&decision.approver)
+        .bind(decision.decision as i32)
+        .bind(&decision.comment)
+        .bind(decision.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        decision.id = Some(result.last_insert_rowid());
+        Ok(decision)
+    }
+
+    /// Get all decisions for an approval request
+    pub async fn get_approval_decisions(&self, approval_id: i64) -> Result<Vec<ApprovalDecision>> {
+        let rows = sqlx::query_as::<_, ApprovalDecisionRow>(
+            r#"
+            SELECT id, approval_id, approver, decision, comment, created_at
+            FROM approval_decisions
+            WHERE approval_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(approval_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+}
+
+// Database row types for approval
+
+#[derive(sqlx::FromRow)]
+struct ApprovalRequestRow {
+    id: i64,
+    stage_id: i64,
+    run_id: i64,
+    status: String,
+    required_approvers: String,
+    required_count: i32,
+    approval_count: i32,
+    rejection_count: i32,
+    timeout_seconds: Option<i64>,
+    timeout_action: Option<String>,
+    timeout_at: Option<String>,
+    resolved_at: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ApprovalRequestRow> for ApprovalRequest {
+    type Error = crate::Error;
+
+    fn try_from(row: ApprovalRequestRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(Self {
+            id: Some(row.id),
+            stage_id: row.stage_id,
+            run_id: row.run_id,
+            status: ApprovalStatus::from_str(&row.status)?,
+            required_approvers: row.required_approvers,
+            required_count: row.required_count,
+            approval_count: row.approval_count,
+            rejection_count: row.rejection_count,
+            timeout_seconds: row.timeout_seconds,
+            timeout_action: row.timeout_action,
+            timeout_at: row
+                .timeout_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            resolved_at: row
+                .resolved_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ApprovalDecisionRow {
+    id: i64,
+    approval_id: i64,
+    approver: String,
+    decision: i32,
+    comment: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ApprovalDecisionRow> for ApprovalDecision {
+    type Error = crate::Error;
+
+    fn try_from(row: ApprovalDecisionRow) -> Result<Self> {
+        Ok(Self {
+            id: Some(row.id),
+            approval_id: row.approval_id,
+            approver: row.approver,
+            decision: row.decision != 0,
+            comment: row.comment,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}

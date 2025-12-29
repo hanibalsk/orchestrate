@@ -11,6 +11,7 @@
 //! - Variable passing between stages
 
 use crate::{
+    approval_service::ApprovalService,
     condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationResult},
     pipeline::{PipelineRun, PipelineStage},
     pipeline_parser::{FailureAction, PipelineDefinition, StageDefinition},
@@ -25,6 +26,7 @@ use tracing::{debug, error, info, warn};
 pub struct PipelineExecutor {
     database: Arc<Database>,
     condition_evaluator: ConditionEvaluator,
+    approval_service: ApprovalService,
 }
 
 /// Context for pipeline execution containing runtime variables
@@ -124,9 +126,11 @@ impl Default for ExecutionContext {
 impl PipelineExecutor {
     /// Create a new pipeline executor
     pub fn new(database: Arc<Database>) -> Self {
+        let approval_service = ApprovalService::new((*database).clone());
         Self {
             database,
             condition_evaluator: ConditionEvaluator::new(),
+            approval_service,
         }
     }
 
@@ -365,6 +369,64 @@ impl PipelineExecutor {
             }
         }
 
+        // Handle approval gate if required
+        if stage_def.requires_approval {
+            info!(
+                stage = %stage_def.name,
+                approvers = ?stage_def.approvers,
+                "Stage requires approval"
+            );
+
+            // Mark stage as waiting for approval
+            stage.mark_waiting_approval();
+            self.database.update_pipeline_stage(&stage).await?;
+
+            // Mark pipeline run as waiting for approval
+            let mut run = self
+                .database
+                .get_pipeline_run(run_id)
+                .await?
+                .ok_or_else(|| Error::Other("Pipeline run not found".to_string()))?;
+            run.mark_waiting_approval();
+            self.database.update_pipeline_run(&run).await?;
+
+            // Create approval request
+            let stage_id = stage
+                .id
+                .ok_or_else(|| Error::Other("Stage ID is required".to_string()))?;
+
+            // Determine required count (default to all approvers)
+            let required_count = stage_def.approvers.len() as i32;
+
+            // Create approval with default 24-hour timeout
+            let _approval = self
+                .approval_service
+                .create_approval(
+                    stage_id,
+                    run_id,
+                    stage_def.approvers.clone(),
+                    required_count,
+                    Some(24 * 3600), // 24 hours default timeout
+                    Some("reject".to_string()), // Default to reject on timeout
+                )
+                .await?;
+
+            info!(
+                stage = %stage_def.name,
+                "Approval request created - pipeline will pause until approved"
+            );
+
+            // NOTE: The executor should not proceed with this stage yet.
+            // In a real implementation, this would return an indication that
+            // the pipeline is paused, and a separate approval handler would
+            // resume execution after approval is granted.
+            // For now, we return an error to halt execution.
+            return Err(Error::Other(format!(
+                "Stage '{}' requires approval - pipeline execution paused",
+                stage_def.name
+            )));
+        }
+
         // Mark stage as running
         // TODO: Set actual agent_id when agent spawning is implemented
         stage.mark_running(None);
@@ -497,9 +559,11 @@ impl PipelineExecutor {
 
     /// Clone executor for parallel stage execution
     fn clone_for_stage(&self) -> Self {
+        let approval_service = ApprovalService::new((*self.database).clone());
         Self {
             database: Arc::clone(&self.database),
             condition_evaluator: ConditionEvaluator::new(),
+            approval_service,
         }
     }
 }
