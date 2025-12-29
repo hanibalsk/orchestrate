@@ -1503,16 +1503,16 @@ async fn run_daemon(
     // Create semaphore for concurrency control
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
-    // Start web API if port > 0
+    // Start web server (API + UI) if port > 0
     if port > 0 {
         let db_clone = db.clone();
         tokio::spawn(async move {
             let state = Arc::new(orchestrate_web::api::AppState::new(db_clone, None));
-            let router = orchestrate_web::api::create_api_router(state);
+            let router = orchestrate_web::create_router(state);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
                 .await
                 .expect("Failed to bind to port");
-            info!("Web API listening on port {}", port);
+            info!("Web server listening on port {} (API + UI)", port);
             axum::serve(listener, router).await.ok();
         });
     }
