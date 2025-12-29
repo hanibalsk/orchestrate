@@ -536,6 +536,16 @@ enum ScheduleAction {
         #[arg(short, long, default_value = "10")]
         limit: i64,
     },
+    /// Add a schedule from a built-in template
+    AddTemplate {
+        /// Template name (security-scan, dependency-check, code-quality, documentation-check, database-backup)
+        template_name: String,
+        /// Optional custom schedule name (defaults to template name)
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// List available schedule templates
+    ListTemplates,
 }
 
 #[tokio::main]
@@ -1946,6 +1956,72 @@ async fn main() -> Result<()> {
                         println!("  Error: {}", error);
                     }
                 }
+            }
+
+            ScheduleAction::AddTemplate { template_name, name } => {
+                // Get the template
+                let template = orchestrate_core::schedule_template::get_template(&template_name)
+                    .ok_or_else(|| anyhow::anyhow!("Template '{}' not found. Use 'orchestrate schedule list-templates' to see available templates", template_name))?;
+
+                // Use custom name if provided, otherwise use template name
+                let schedule_name = name.as_ref().unwrap_or(&template.name).clone();
+
+                // Check if schedule with this name already exists
+                if db.get_schedule_by_name(&schedule_name).await?.is_some() {
+                    anyhow::bail!("Schedule '{}' already exists", schedule_name);
+                }
+
+                // Create schedule from template
+                let mut schedule = Schedule::new(
+                    schedule_name.clone(),
+                    template.cron.clone(),
+                    template.agent.clone(),
+                    template.task.clone(),
+                );
+
+                // Calculate next run
+                schedule.update_next_run()?;
+
+                // Insert into database
+                let id = db.insert_schedule(&schedule).await?;
+
+                println!("Schedule '{}' created from template '{}'", schedule_name, template_name);
+                println!("Description: {}", template.description);
+                println!("Cron: {}", template.cron);
+                println!("Agent: {}", template.agent);
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+                println!("Schedule ID: {}", id);
+            }
+
+            ScheduleAction::ListTemplates => {
+                use orchestrate_core::schedule_template;
+
+                let templates = schedule_template::get_templates();
+
+                if templates.is_empty() {
+                    println!("No templates available");
+                    return Ok(());
+                }
+
+                println!("Available schedule templates:\n");
+
+                // Sort by name for consistent output
+                let mut template_names: Vec<String> = templates.keys().cloned().collect();
+                template_names.sort();
+
+                for name in template_names {
+                    let template = &templates[&name];
+                    println!("Template: {}", template.name);
+                    println!("  Description: {}", template.description);
+                    println!("  Schedule: {}", template.cron);
+                    println!("  Agent: {}", template.agent);
+                    println!("  Task: {}", template.task);
+                    println!();
+                }
+
+                println!("To add a template, use: orchestrate schedule add-template <template-name>");
             }
         },
     }
