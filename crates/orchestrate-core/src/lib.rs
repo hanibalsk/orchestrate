@@ -23,6 +23,7 @@ pub mod documentation;
 pub mod epic;
 pub mod requirements;
 pub mod multi_repo;
+pub mod ci_integration;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -155,7 +156,7 @@ pub use documentation::{
     Adr, AdrConsequence, AdrStatus, ApiContact, ApiDocumentation, ApiEndpoint, ApiInfo, ApiLicense,
     ApiParameter, ApiServer, Changelog, ChangelogEntry, ChangelogRelease, ChangeType, DocItemType,
     DocIssueType, DocType, DocValidationIssue, DocValidationResult, ParameterLocation, PropertyInfo,
-    ReadmeContent, ReadmeSection, SchemaInfo,
+    ReadmeContent, ReadmeSection, ReadmeSectionContent, SchemaInfo,
 };
 
 // Re-export requirements types
@@ -170,4 +171,10 @@ pub use multi_repo::{
     CoordinatedRelease, CrossRepoBranch, LinkedPr, LinkedPrGroup, LinkedPrStatus, ReleaseStatus,
     RepoBranchStatus, RepoConfig, RepoDependencyGraph, RepoProvider, RepoRelease, RepoStatus,
     Repository,
+};
+
+// Re-export CI integration types
+pub use ci_integration::{
+    CiArtifact, CiAuthType, CiConclusion, CiConfig, CiFailureAnalysis, CiJob, CiProvider, CiRun,
+    CiRunStatus, CiStep, CiTriggerRequest, FailedJob, FailedTest,
 };

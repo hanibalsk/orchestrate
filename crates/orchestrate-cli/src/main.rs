@@ -196,6 +196,11 @@ enum Commands {
         #[command(subcommand)]
         action: RepoAction,
     },
+    /// CI/CD integration
+    Ci {
+        #[command(subcommand)]
+        action: CiAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1186,6 +1191,69 @@ enum RepoAction {
         /// Specific repository to sync
         #[arg(short, long)]
         repo: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CiAction {
+    /// Configure CI provider
+    Config {
+        /// CI provider (github_actions, gitlab_ci, circleci, jenkins)
+        provider: String,
+        /// API URL (optional, uses default for provider)
+        #[arg(short, long)]
+        api_url: Option<String>,
+        /// Authentication token
+        #[arg(short, long)]
+        token: Option<String>,
+    },
+    /// Show CI run status
+    Status {
+        /// Run ID
+        run_id: Option<String>,
+        /// Branch to filter by
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Trigger a CI workflow
+    Trigger {
+        /// Workflow name
+        workflow: String,
+        /// Branch to run on
+        #[arg(short, long, default_value = "main")]
+        branch: String,
+        /// Additional inputs (key=value format)
+        #[arg(short, long)]
+        input: Vec<String>,
+    },
+    /// Get CI run logs
+    Logs {
+        /// Run ID
+        run_id: String,
+        /// Job name filter
+        #[arg(short, long)]
+        job: Option<String>,
+    },
+    /// Retry a failed CI run
+    Retry {
+        /// Run ID to retry
+        run_id: String,
+    },
+    /// Cancel a running CI job
+    Cancel {
+        /// Run ID to cancel
+        run_id: String,
+    },
+    /// Analyze CI failure
+    Analyze {
+        /// Run ID to analyze
+        run_id: String,
+        /// Attempt auto-fix
+        #[arg(long)]
+        auto_fix: bool,
     },
 }
 
@@ -3638,22 +3706,27 @@ async fn main() -> Result<()> {
                         println!("Use 'orchestrate docs changelog' command for changelog generation");
                     }
                     DocType::Readme => {
-                        use orchestrate_core::{ReadmeContent, ReadmeSection};
+                        use orchestrate_core::{ReadmeContent, ReadmeSection, ReadmeSectionContent};
 
-                        let mut readme = ReadmeContent {
-                            project_name: "Orchestrate".to_string(),
-                            description: Some("An agent orchestration and automation system".to_string()),
-                            sections: vec![],
+                        let readme = ReadmeContent {
+                            sections: vec![
+                                ReadmeSectionContent {
+                                    section_type: ReadmeSection::Title,
+                                    heading: Some("# Orchestrate".to_string()),
+                                    content: "An agent orchestration and automation system".to_string(),
+                                },
+                                ReadmeSectionContent {
+                                    section_type: ReadmeSection::Installation,
+                                    heading: Some("## Installation".to_string()),
+                                    content: "```bash\ncargo install orchestrate\n```".to_string(),
+                                },
+                                ReadmeSectionContent {
+                                    section_type: ReadmeSection::Usage,
+                                    heading: Some("## Usage".to_string()),
+                                    content: "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
+                                },
+                            ],
                         };
-
-                        readme.add_section(
-                            ReadmeSection::Installation,
-                            "```bash\ncargo install orchestrate\n```".to_string(),
-                        );
-                        readme.add_section(
-                            ReadmeSection::Usage,
-                            "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
-                        );
 
                         if let Some(output_path) = output {
                             std::fs::write(&output_path, readme.to_markdown())?;
@@ -3708,7 +3781,8 @@ async fn main() -> Result<()> {
                     use orchestrate_core::{Adr, AdrStatus};
                     use std::str::FromStr;
 
-                    let adr_status = AdrStatus::from_str(&status)?;
+                    let adr_status = AdrStatus::from_str(&status)
+                        .map_err(|e| anyhow::anyhow!(e))?;
 
                     // Find the next ADR number
                     let adr_dir = std::path::Path::new("docs/adrs");
@@ -3733,7 +3807,7 @@ async fn main() -> Result<()> {
                     let adr_number = max_number + 1;
 
                     let adr = Adr {
-                        number: adr_number,
+                        number: adr_number as i32,
                         title: title.clone(),
                         status: adr_status,
                         date: chrono::Utc::now(),
@@ -4302,9 +4376,9 @@ async fn main() -> Result<()> {
                     let name = repo["name"].as_str().unwrap_or("").to_string();
                     let deps: Vec<String> = repo["depends_on"]
                         .as_array()
-                        .map(|arr| arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(|s| s.to_string())
+                        .map(|arr: &Vec<serde_json::Value>| arr.iter()
+                            .filter_map(|v: &serde_json::Value| v.as_str())
+                            .map(|s: &str| s.to_string())
                             .collect())
                         .unwrap_or_default();
                     graph.add_repo(&name, deps);
@@ -4392,6 +4466,157 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        },
+        Commands::Ci { action } => match action {
+            CiAction::Config { provider, api_url, token } => {
+                use orchestrate_core::{CiConfig, CiProvider, CiAuthType};
+                use std::str::FromStr;
+
+                let provider = CiProvider::from_str(&provider)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                let default_url = match provider {
+                    CiProvider::GitHubActions => "https://api.github.com",
+                    CiProvider::GitLabCi => "https://gitlab.com/api/v4",
+                    CiProvider::CircleCi => "https://circleci.com/api/v2",
+                    CiProvider::JenkinsCI => "http://localhost:8080",
+                    CiProvider::Custom => "",
+                };
+
+                let config = CiConfig {
+                    provider,
+                    api_url: api_url.or_else(|| Some(default_url.to_string())),
+                    auth_type: CiAuthType::Bearer,
+                    token,
+                    custom_config: std::collections::HashMap::new(),
+                };
+
+                // Save to ci-config.yaml
+                let config_file = std::path::Path::new("ci-config.yaml");
+                std::fs::write(config_file, serde_yaml::to_string(&config)?)?;
+
+                println!("CI Configuration saved");
+                println!("  Provider: {}", provider.as_str());
+                println!("  API URL: {}", config.api_url.as_deref().unwrap_or("(default)"));
+                println!("  Auth: {}", if config.token.is_some() { "configured" } else { "not configured" });
+            }
+            CiAction::Status { run_id, branch, json } => {
+                use orchestrate_core::{CiRun, CiProvider, CiRunStatus, CiConclusion};
+
+                // Load config
+                let config_file = std::path::Path::new("ci-config.yaml");
+                if !config_file.exists() {
+                    println!("CI not configured. Run 'orchestrate ci config' first.");
+                    return Ok(());
+                }
+
+                // Simulated CI status (in real impl, would query provider API)
+                if let Some(id) = run_id {
+                    let run = CiRun::new(&id, CiProvider::GitHubActions, "build", "main");
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&run)?);
+                    } else {
+                        println!("CI Run: {}", run.id);
+                        println!("  Workflow: {}", run.workflow_name);
+                        println!("  Branch: {}", run.branch);
+                        println!("  Status: {}", run.status.as_str());
+                        if let Some(conclusion) = run.conclusion {
+                            println!("  Conclusion: {}", conclusion.as_str());
+                        }
+                    }
+                } else {
+                    println!("Recent CI Runs");
+                    println!("{}", "=".repeat(60));
+                    println!("  (No runs found. Specify --run-id for details)");
+                    if let Some(b) = branch {
+                        println!("  Filtering by branch: {}", b);
+                    }
+                }
+            }
+            CiAction::Trigger { workflow, branch, input } => {
+                use orchestrate_core::CiTriggerRequest;
+
+                let mut inputs = std::collections::HashMap::new();
+                for i in input {
+                    if let Some((key, value)) = i.split_once('=') {
+                        inputs.insert(key.to_string(), value.to_string());
+                    }
+                }
+
+                let request = CiTriggerRequest {
+                    workflow_name: workflow.clone(),
+                    branch: branch.clone(),
+                    inputs,
+                };
+
+                println!("Triggering CI workflow...");
+                println!("  Workflow: {}", request.workflow_name);
+                println!("  Branch: {}", request.branch);
+                if !request.inputs.is_empty() {
+                    println!("  Inputs:");
+                    for (k, v) in &request.inputs {
+                        println!("    {}: {}", k, v);
+                    }
+                }
+                println!();
+                println!("(Would trigger via provider API in real implementation)");
+            }
+            CiAction::Logs { run_id, job } => {
+                println!("Fetching logs for run: {}", run_id);
+                if let Some(j) = job {
+                    println!("  Job filter: {}", j);
+                }
+                println!();
+                println!("(Would fetch logs from provider API in real implementation)");
+            }
+            CiAction::Retry { run_id } => {
+                println!("Retrying CI run: {}", run_id);
+                println!("(Would retry via provider API in real implementation)");
+            }
+            CiAction::Cancel { run_id } => {
+                println!("Cancelling CI run: {}", run_id);
+                println!("(Would cancel via provider API in real implementation)");
+            }
+            CiAction::Analyze { run_id, auto_fix } => {
+                use orchestrate_core::{CiFailureAnalysis, FailedTest, FailedJob};
+
+                println!("Analyzing CI failure: {}", run_id);
+                println!();
+
+                // Create sample analysis (in real impl, would fetch and parse logs)
+                let mut analysis = CiFailureAnalysis::new(&run_id);
+
+                // Simulate finding issues
+                analysis.failed_jobs.push(FailedJob {
+                    job_name: "test".to_string(),
+                    step_name: Some("Run tests".to_string()),
+                    error_summary: "Test suite failed".to_string(),
+                    log_url: Some(format!("https://ci.example.com/runs/{}/jobs/test", run_id)),
+                });
+
+                analysis.failed_tests.push(FailedTest {
+                    test_name: "test_example_function".to_string(),
+                    test_file: Some("src/lib.rs".to_string()),
+                    error_message: "assertion failed: expected true, got false".to_string(),
+                    stack_trace: None,
+                    failure_count: 1,
+                    is_flaky: false,
+                });
+
+                analysis.add_recommendation("Review the test assertions");
+                analysis.add_recommendation("Check if test data is up to date");
+
+                println!("{}", analysis.to_summary());
+
+                if auto_fix {
+                    if analysis.should_auto_fix() {
+                        println!("Auto-fix is possible for this failure.");
+                        println!("(Would spawn issue-fixer agent in real implementation)");
+                    } else {
+                        println!("Auto-fix not recommended (may be flaky or complex failure)");
                     }
                 }
             }

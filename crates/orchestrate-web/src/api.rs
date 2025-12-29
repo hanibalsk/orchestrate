@@ -2542,7 +2542,7 @@ async fn generate_documentation(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<DocGenerateRequest>,
 ) -> Result<Json<DocGenerateResponse>, ApiError> {
-    use orchestrate_core::{ApiDocumentation, ApiEndpoint, DocType, ReadmeContent, ReadmeSection};
+    use orchestrate_core::{ApiDocumentation, ApiEndpoint, ReadmeContent, ReadmeSectionContent, ReadmeSection};
 
     let format = req.format.unwrap_or_else(|| "yaml".to_string());
 
@@ -2591,20 +2591,25 @@ async fn generate_documentation(
             }
         }
         "readme" => {
-            let mut readme = ReadmeContent {
-                project_name: "Orchestrate".to_string(),
-                description: Some("An agent orchestration and automation system".to_string()),
-                sections: vec![],
+            let readme = ReadmeContent {
+                sections: vec![
+                    ReadmeSectionContent {
+                        section_type: ReadmeSection::Title,
+                        heading: Some("# Orchestrate".to_string()),
+                        content: "An agent orchestration and automation system".to_string(),
+                    },
+                    ReadmeSectionContent {
+                        section_type: ReadmeSection::Installation,
+                        heading: Some("## Installation".to_string()),
+                        content: "```bash\ncargo install orchestrate\n```".to_string(),
+                    },
+                    ReadmeSectionContent {
+                        section_type: ReadmeSection::Usage,
+                        heading: Some("## Usage".to_string()),
+                        content: "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
+                    },
+                ],
             };
-
-            readme.add_section(
-                ReadmeSection::Installation,
-                "```bash\ncargo install orchestrate\n```".to_string(),
-            );
-            readme.add_section(
-                ReadmeSection::Usage,
-                "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
-            );
 
             readme.to_markdown()
         }
@@ -2790,7 +2795,7 @@ async fn create_adr(
     let adr_number = max_number + 1;
 
     let adr = Adr {
-        number: adr_number,
+        number: adr_number as i32,
         title: req.title.clone(),
         status: adr_status,
         date: chrono::Utc::now(),
@@ -2820,7 +2825,7 @@ async fn get_adr(
 ) -> Result<String, ApiError> {
     let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
     if !adr_path.exists() {
-        return Err(ApiError::not_found(format!("ADR not found: adr-{:04}", number)));
+        return Err(ApiError::not_found(&format!("ADR adr-{:04}", number)));
     }
     std::fs::read_to_string(&adr_path)
         .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))
@@ -2839,7 +2844,7 @@ async fn update_adr(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
     if !adr_path.exists() {
-        return Err(ApiError::not_found(format!("ADR not found: adr-{:04}", number)));
+        return Err(ApiError::not_found(&format!("ADR adr-{:04}", number)));
     }
 
     let content = std::fs::read_to_string(&adr_path)

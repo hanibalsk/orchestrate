@@ -749,6 +749,11 @@ If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <re
             AgentType::Scheduler => "scheduler.md",
             AgentType::RegressionTester => "regression-tester.md",
             AgentType::IssueTriager => "issue-triager.md",
+            AgentType::DocGenerator => "doc-generator.md",
+            AgentType::RequirementsAnalyzer => "requirements-analyzer.md",
+            AgentType::MultiRepoCoordinator => "multi-repo-coordinator.md",
+            AgentType::CiIntegrator => "ci-integrator.md",
+            AgentType::IncidentResponder => "incident-responder.md",
         };
 
         // Look for agent file in common locations
