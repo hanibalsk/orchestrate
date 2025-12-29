@@ -10,8 +10,10 @@
 pub mod api;
 pub mod ui;
 pub mod webhook;
+pub mod webhook_processor;
 pub mod websocket;
 
 pub use api::{create_router, create_router_with_webhook};
 pub use ui::create_ui_router;
 pub use webhook::{WebhookConfig, WebhookState, github_webhook_handler};
+pub use webhook_processor::{WebhookProcessor, WebhookProcessorConfig};

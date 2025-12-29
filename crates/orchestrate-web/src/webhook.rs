@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use orchestrate_core::{Database, WebhookEvent};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -30,11 +31,12 @@ impl WebhookConfig {
 #[derive(Clone)]
 pub struct WebhookState {
     pub config: WebhookConfig,
+    pub database: Database,
 }
 
 impl WebhookState {
-    pub fn new(config: WebhookConfig) -> Self {
-        Self { config }
+    pub fn new(config: WebhookConfig, database: Database) -> Self {
+        Self { config, database }
     }
 }
 
@@ -133,7 +135,21 @@ pub async fn github_webhook_handler(
     }
 
     // Parse payload (basic validation)
-    match serde_json::from_slice::<serde_json::Value>(&body) {
+    let payload_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Invalid UTF-8 in payload");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(WebhookResponse {
+                    status: "error".to_string(),
+                    message: "Invalid UTF-8 in payload".to_string(),
+                }),
+            );
+        }
+    };
+
+    match serde_json::from_str::<serde_json::Value>(payload_str) {
         Ok(payload) => {
             info!(
                 event_type = %event_type,
@@ -154,7 +170,33 @@ pub async fn github_webhook_handler(
         }
     }
 
-    // TODO: Queue event for async processing (Story 2)
+    // Queue event for async processing
+    let delivery_id_str = delivery_id.unwrap_or_else(|| {
+        // Generate a delivery ID if not provided (shouldn't happen with GitHub)
+        uuid::Uuid::new_v4().to_string()
+    });
+
+    let webhook_event = WebhookEvent::new(
+        delivery_id_str.clone(),
+        event_type.clone(),
+        payload_str.to_string(),
+    );
+
+    match state.database.insert_webhook_event(&webhook_event).await {
+        Ok(id) => {
+            info!(
+                event_id = id,
+                delivery_id = %delivery_id_str,
+                event_type = %event_type,
+                "Webhook event queued"
+            );
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to queue webhook event");
+            // Don't return error to GitHub - we've received the webhook
+            // Log the error and continue
+        }
+    }
 
     // Return 200 OK quickly
     (
@@ -228,9 +270,10 @@ mod tests {
     }
 
     /// Helper to create test router
-    fn create_test_router(secret: Option<String>) -> Router {
+    async fn create_test_router(secret: Option<String>) -> Router {
         let config = WebhookConfig::new(secret);
-        let state = Arc::new(WebhookState::new(config));
+        let database = orchestrate_core::Database::in_memory().await.unwrap();
+        let state = Arc::new(WebhookState::new(config, database));
         Router::new()
             .route("/webhooks/github", post(github_webhook_handler))
             .with_state(state)
@@ -250,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_missing_event_header() {
-        let router = create_test_router(None);
+        let router = create_test_router(None).await;
 
         let response = router
             .oneshot(
@@ -273,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_malformed_json() {
-        let router = create_test_router(None);
+        let router = create_test_router(None).await;
 
         let response = router
             .oneshot(
@@ -298,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_without_signature_when_no_secret() {
-        let router = create_test_router(None);
+        let router = create_test_router(None).await;
 
         let payload = r#"{"action":"opened","number":1}"#;
         let response = router
@@ -324,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_missing_signature_when_secret_configured() {
-        let router = create_test_router(Some("my-secret".to_string()));
+        let router = create_test_router(Some("my-secret".to_string())).await;
 
         let payload = r#"{"action":"opened","number":1}"#;
         let response = router
@@ -350,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_webhook_invalid_signature() {
-        let router = create_test_router(Some("my-secret".to_string()));
+        let router = create_test_router(Some("my-secret".to_string())).await;
 
         let payload = r#"{"action":"opened","number":1}"#;
         let response = router
@@ -378,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn test_webhook_valid_signature() {
         let secret = "my-secret";
-        let router = create_test_router(Some(secret.to_string()));
+        let router = create_test_router(Some(secret.to_string())).await;
 
         let payload = r#"{"action":"opened","number":1}"#;
         let signature = compute_github_signature(secret, payload);
@@ -409,7 +452,7 @@ mod tests {
     async fn test_webhook_logs_event_details() {
         // This test verifies that the webhook handler logs the event type and delivery ID
         // We're mainly testing that the handler doesn't panic and returns success
-        let router = create_test_router(None);
+        let router = create_test_router(None).await;
 
         let payload = r#"{"action":"synchronize","pull_request":{"number":42}}"#;
         let response = router
@@ -471,5 +514,43 @@ mod tests {
         let invalid_hex = "sha256=not-hex-string";
 
         assert!(!verify_signature(secret, payload, invalid_hex));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_queues_event() {
+        let database = orchestrate_core::Database::in_memory().await.unwrap();
+        let config = WebhookConfig::new(None);
+        let state = Arc::new(WebhookState::new(config, database.clone()));
+        let router = Router::new()
+            .route("/webhooks/github", post(github_webhook_handler))
+            .with_state(state);
+
+        let payload = r#"{"action":"opened","number":123}"#;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/webhooks/github")
+                    .header("content-type", "application/json")
+                    .header("x-github-event", "pull_request")
+                    .header("x-github-delivery", "test-queue-delivery")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify event was queued
+        let event = database
+            .get_webhook_event_by_delivery_id("test-queue-delivery")
+            .await
+            .unwrap();
+        assert!(event.is_some());
+        let event = event.unwrap();
+        assert_eq!(event.event_type, "pull_request");
+        assert_eq!(event.payload, payload);
+        assert_eq!(event.status, orchestrate_core::WebhookEventStatus::Pending);
     }
 }

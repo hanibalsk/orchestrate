@@ -9,6 +9,8 @@
 
 pub mod agent;
 pub mod database;
+#[cfg(test)]
+mod database_webhook_tests;
 pub mod epic;
 pub mod error;
 pub mod instruction;
@@ -18,6 +20,7 @@ pub mod network;
 pub mod pr;
 pub mod session;
 pub mod shell_state;
+pub mod webhook;
 pub mod worktree;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
@@ -48,3 +51,6 @@ pub use network::{
 
 // Re-export shell state types
 pub use shell_state::{QueueEntry, ShellState, ShepherdLock};
+
+// Re-export webhook types
+pub use webhook::{WebhookEvent, WebhookEventStatus};

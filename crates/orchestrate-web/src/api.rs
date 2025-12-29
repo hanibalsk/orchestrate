@@ -203,7 +203,7 @@ pub fn create_router_with_webhook(state: Arc<AppState>, webhook_secret: Option<S
     // Add webhook endpoint (always available, secret is optional for signature verification)
     let secret = webhook_secret.or_else(|| std::env::var("GITHUB_WEBHOOK_SECRET").ok());
     let webhook_config = crate::webhook::WebhookConfig::new(secret);
-    let webhook_state = Arc::new(crate::webhook::WebhookState::new(webhook_config));
+    let webhook_state = Arc::new(crate::webhook::WebhookState::new(webhook_config, state.db.clone()));
 
     router = router.route(
         "/webhooks/github",
