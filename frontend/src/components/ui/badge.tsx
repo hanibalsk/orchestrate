@@ -15,6 +15,7 @@ const badgeVariants = cva(
         destructive:
           'border-transparent bg-destructive text-destructive-foreground shadow',
         outline: 'text-foreground',
+        success: 'border-transparent bg-success text-white',
         // Agent states
         created: 'border-transparent bg-gray-500 text-white',
         initializing: 'border-transparent bg-cyan-600 text-white',
