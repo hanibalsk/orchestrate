@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 orchestrate-core.workspace = true
+orchestrate-github.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower = { workspace = true, features = ["util"] }

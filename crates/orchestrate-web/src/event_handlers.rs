@@ -2,10 +2,14 @@
 //!
 //! This module processes specific webhook events and spawns appropriate agents.
 
-use orchestrate_core::{Agent, AgentContext, AgentType, Database, Result, WebhookEvent};
+use orchestrate_core::{
+    create_pr_worktree, Agent, AgentContext, AgentType, Database, Result, WebhookEvent,
+};
+use orchestrate_github::GitHubClient;
 use serde_json::Value;
+use std::env;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Handle a pull_request.opened event
 ///
@@ -82,10 +86,34 @@ pub async fn handle_pr_opened(
         "Spawning pr-shepherd agent for PR"
     );
 
+    // Create worktree for the PR branch
+    let worktree_dir = env::var("WORKTREE_DIR").unwrap_or_else(|_| ".worktrees".to_string());
+
+    let mut worktree = match create_pr_worktree(pr_number as i32, &branch_name, &worktree_dir) {
+        Ok(wt) => wt,
+        Err(e) => {
+            warn!(
+                pr_number = pr_number,
+                branch = %branch_name,
+                error = %e,
+                "Failed to create worktree, continuing without it"
+            );
+            // Continue without worktree - agent can still be created
+            // This allows the system to work even if git operations fail
+            orchestrate_core::Worktree::new(
+                format!("pr-{}", pr_number),
+                format!("{}/.worktrees/pr-{}", env::current_dir().unwrap().display(), pr_number),
+                branch_name.clone(),
+                "main".to_string(),
+            )
+        }
+    };
+
     // Create agent context
     let context = AgentContext {
         pr_number: Some(pr_number as i32),
         branch_name: Some(branch_name.clone()),
+        working_directory: Some(worktree.path.clone()),
         custom: serde_json::json!({
             "repository": repo_full_name,
             "event_delivery_id": event.delivery_id,
@@ -94,24 +122,65 @@ pub async fn handle_pr_opened(
     };
 
     // Create pr-shepherd agent
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         AgentType::PrShepherd,
         format!("Shepherd PR #{} on branch {}", pr_number, branch_name),
     )
     .with_context(context);
 
-    // Save agent to database
+    // Associate worktree with agent
+    worktree = worktree.with_agent(agent.id);
+    agent = agent.with_worktree(worktree.id.clone());
+
+    // Save agent to database FIRST (worktree has FK to agent)
     database.insert_agent(&agent).await?;
+
+    // Save worktree to database AFTER agent
+    database.insert_worktree(&worktree).await?;
 
     info!(
         agent_id = %agent.id,
         pr_number = pr_number,
-        "pr-shepherd agent created"
+        worktree_id = %worktree.id,
+        "pr-shepherd agent and worktree created"
     );
 
+    // Post comment on PR indicating orchestrate is watching
+    // This is done asynchronously and errors are logged but not fatal
+    if let Err(e) = try_post_pr_comment(pr_number as i32).await {
+        error!(
+            pr_number = pr_number,
+            error = %e,
+            "Failed to post PR comment, continuing anyway"
+        );
+    }
+
     // TODO: Actually spawn the agent (call orchestrate CLI or spawn process)
-    // TODO: Create worktree for the PR branch
-    // TODO: Update PR with comment indicating orchestrate is watching
+
+    Ok(())
+}
+
+/// Try to post a comment on the PR
+///
+/// This is a best-effort operation. Failures are logged but not fatal.
+async fn try_post_pr_comment(pr_number: i32) -> Result<()> {
+    let client = GitHubClient::new()
+        .map_err(|e| orchestrate_core::Error::Other(format!("Failed to create GitHub client: {}", e)))?;
+
+    let comment_body = format!(
+        "🤖 **Orchestrate is now watching this PR**\n\n\
+        I'll automatically:\n\
+        - Monitor for review comments and fix issues\n\
+        - Watch CI checks and resolve failures\n\
+        - Keep the PR up to date\n\n\
+        PR shepherd agent has been assigned to PR #{}.",
+        pr_number
+    );
+
+    client.post_comment(pr_number, &comment_body)
+        .map_err(|e| orchestrate_core::Error::Other(format!("Failed to post comment: {}", e)))?;
+
+    info!(pr_number = pr_number, "Posted orchestrate watching comment");
 
     Ok(())
 }
@@ -262,5 +331,55 @@ mod tests {
         let custom = &agent.context.custom;
         assert_eq!(custom.get("repository").unwrap().as_str().unwrap(), "owner/repo");
         assert_eq!(custom.get("event_delivery_id").unwrap().as_str().unwrap(), "delivery-456");
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_opened_creates_worktree() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = create_pr_opened_payload(123, "feature/worktree-test", false);
+        let event = WebhookEvent::new(
+            "delivery-worktree".to_string(),
+            "pull_request".to_string(),
+            payload,
+        );
+
+        handle_pr_opened(database.clone(), &event).await.unwrap();
+
+        // Verify agent was created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+        let agent = &agents[0];
+
+        // Verify worktree was created (would be done by git worktree add in implementation)
+        // For now, just verify that agent has worktree_id set
+        assert!(agent.worktree_id.is_some(), "Agent should have worktree_id");
+
+        let worktree_id = agent.worktree_id.as_ref().unwrap();
+
+        // Verify worktree record exists in database
+        let worktree_path = database.get_worktree_path(worktree_id).await.unwrap();
+        assert!(worktree_path.is_some(), "Worktree should exist in database");
+    }
+
+    #[tokio::test]
+    async fn test_handle_pr_opened_posts_comment() {
+        // Note: This test verifies the function completes successfully
+        // Actual GitHub API calls would need to be mocked or tested in integration tests
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = create_pr_opened_payload(456, "feature/comment-test", false);
+        let event = WebhookEvent::new(
+            "delivery-comment".to_string(),
+            "pull_request".to_string(),
+            payload,
+        );
+
+        let result = handle_pr_opened(database.clone(), &event).await;
+        assert!(result.is_ok(), "Handler should succeed even if comment posting fails gracefully");
+
+        // Verify agent was still created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
     }
 }

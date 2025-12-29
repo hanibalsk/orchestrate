@@ -30,7 +30,7 @@ pub use error::{Error, Result};
 pub use message::{Message, MessageRole};
 pub use pr::{MergeStrategy, PrStatus, PullRequest};
 pub use session::Session;
-pub use worktree::{Worktree, WorktreeStatus};
+pub use worktree::{create_pr_worktree, Worktree, WorktreeStatus};
 
 // Re-export instruction types
 pub use instruction::{
