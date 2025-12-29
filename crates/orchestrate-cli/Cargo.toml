@@ -27,3 +27,4 @@ uuid.workspace = true
 chrono.workspace = true
 shellexpand.workspace = true
 axum.workspace = true
+regex.workspace = true

@@ -243,6 +243,34 @@ impl Database {
         Ok(row)
     }
 
+    /// Insert a new worktree
+    pub async fn insert_worktree(&self, worktree: &crate::Worktree) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO worktrees (id, name, path, branch_name, base_branch, status, agent_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                path = excluded.path,
+                branch_name = excluded.branch_name,
+                status = excluded.status,
+                agent_id = excluded.agent_id
+            "#,
+        )
+        .bind(&worktree.id)
+        .bind(&worktree.name)
+        .bind(&worktree.path)
+        .bind(&worktree.branch_name)
+        .bind(&worktree.base_branch)
+        .bind(format!("{:?}", worktree.status).to_lowercase())
+        .bind(worktree.agent_id.map(|id| id.to_string()))
+        .bind(worktree.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     // ==================== Message Operations ====================
 
     /// Insert a message

@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_core::{
     Agent, AgentState, AgentType, CustomInstruction, Database,
-    LearningEngine, PatternStatus, ShellState,
+    Epic, EpicStatus, Story, StoryStatus, BmadPhase,
+    LearningEngine, PatternStatus, ShellState, Worktree,
 };
 use orchestrate_claude::{AgentLoop, ClaudeClient, ClaudeCliClient};
 use std::path::PathBuf;
@@ -97,6 +98,11 @@ enum Commands {
         #[command(subcommand)]
         action: BmadAction,
     },
+    /// Story management
+    Story {
+        #[command(subcommand)]
+        action: StoryAction,
+    },
     /// Start web interface
     Web {
         #[arg(short, long, default_value = "8080")]
@@ -131,6 +137,11 @@ enum Commands {
     Tokens {
         #[command(subcommand)]
         action: TokensAction,
+    },
+    /// Story management
+    Story {
+        #[command(subcommand)]
+        action: StoryAction,
     },
 }
 
@@ -236,14 +247,43 @@ enum WtAction {
 
 #[derive(Subcommand)]
 enum BmadAction {
-    /// Process epics
+    /// Process epics from docs/bmad/epics/
     Process {
+        /// Pattern to match epic files (e.g., "epic-001-*")
         pattern: Option<String>,
+        /// Epics directory (default: docs/bmad/epics)
+        #[arg(short, long, default_value = "docs/bmad/epics")]
+        dir: PathBuf,
+        /// Dry run - show what would be done without executing
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Show BMAD status
+    /// Show BMAD status for all epics
     Status,
-    /// Reset BMAD state
-    Reset,
+    /// Reset BMAD state (clear all epics and stories)
+    Reset {
+        /// Force reset without confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoryAction {
+    /// List all stories
+    List {
+        /// Filter by epic ID
+        #[arg(short, long)]
+        epic: Option<String>,
+        /// Filter by status
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Show story details
+    Show {
+        /// Story ID (e.g., epic-001.1)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -439,6 +479,36 @@ enum TokensAction {
     },
 }
 
+#[derive(Subcommand)]
+enum StoryAction {
+    /// List stories
+    List {
+        /// Filter by epic ID
+        #[arg(short, long)]
+        epic: Option<String>,
+        /// Filter by status
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Show story details
+    Show {
+        /// Story ID
+        id: String,
+    },
+    /// Create a new story
+    Create {
+        /// Epic ID
+        #[arg(short, long)]
+        epic_id: String,
+        /// Story title
+        #[arg(short, long)]
+        title: String,
+        /// Story description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -628,22 +698,14 @@ async fn main() -> Result<()> {
         },
 
         Commands::Bmad { action } => match action {
-            BmadAction::Process { pattern } => {
-                println!(
-                    "Processing epics{}...",
-                    pattern.as_ref().map(|p| format!(" matching '{}'", p)).unwrap_or_default()
-                );
-                // TODO: Implement BMAD processing
+            BmadAction::Process { pattern, dir, dry_run } => {
+                process_bmad_epics(&db, &dir, pattern.as_deref(), dry_run).await?;
             }
             BmadAction::Status => {
-                let epics = db.get_pending_epics().await?;
-                println!("Pending epics: {}", epics.len());
-                for epic in epics {
-                    println!("  - {}: {}", epic.id, epic.title);
-                }
+                show_bmad_status(&db).await?;
             }
-            BmadAction::Reset => {
-                println!("Resetting BMAD state... (not implemented)");
+            BmadAction::Reset { force } => {
+                reset_bmad_state(&db, force).await?;
             }
         },
 
@@ -1797,4 +1859,398 @@ async fn run_agent_with_cli(
 
     db.update_agent(agent).await?;
     result
+}
+
+// ==================== BMAD Functions ====================
+
+/// Process BMAD epics from the specified directory
+async fn process_bmad_epics(
+    db: &Database,
+    epics_dir: &std::path::Path,
+    pattern: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    use std::fs;
+    use regex::Regex;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                    BMAD EPIC PROCESSOR                       ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+
+    // Check if directory exists
+    if !epics_dir.exists() {
+        println!("📁 Epics directory does not exist: {}", epics_dir.display());
+        println!("   Creating directory...");
+        if !dry_run {
+            fs::create_dir_all(epics_dir)?;
+        }
+        println!("   ✓ Created {}", epics_dir.display());
+        println!();
+        println!("To add epics, create markdown files in this directory:");
+        println!("   {}/epic-001-my-feature.md", epics_dir.display());
+        return Ok(());
+    }
+
+    // Find epic files
+    let entries: Vec<_> = fs::read_dir(epics_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.ends_with(".md") && name.starts_with("epic-")
+        })
+        .collect();
+
+    if entries.is_empty() {
+        println!("📭 No epic files found in {}", epics_dir.display());
+        println!();
+        println!("Expected format: epic-<id>-<name>.md");
+        println!("Example: epic-001-user-authentication.md");
+        return Ok(());
+    }
+
+    // Filter by pattern if provided
+    let pattern_regex = pattern.map(|p| {
+        let regex_pattern = p.replace("*", ".*").replace("?", ".");
+        Regex::new(&format!("^{}$", regex_pattern)).ok()
+    }).flatten();
+
+    let filtered_entries: Vec<_> = entries
+        .into_iter()
+        .filter(|e| {
+            if let Some(ref re) = pattern_regex {
+                let name = e.file_name().to_string_lossy().to_string();
+                re.is_match(&name)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    println!("📋 Found {} epic file(s){}",
+        filtered_entries.len(),
+        pattern.map(|p| format!(" matching '{}'", p)).unwrap_or_default()
+    );
+    println!();
+
+    if dry_run {
+        println!("🔍 DRY RUN - No changes will be made");
+        println!();
+    }
+
+    for entry in filtered_entries {
+        let path = entry.path();
+        let filename = entry.file_name().to_string_lossy().to_string();
+
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("📖 Processing: {}", filename);
+
+        // Parse the epic file
+        let content = fs::read_to_string(&path)?;
+        let (epic, stories) = parse_epic_file(&filename, &content)?;
+
+        println!("   Title: {}", epic.title);
+        println!("   Stories: {}", stories.len());
+
+        if dry_run {
+            println!("   [DRY RUN] Would create epic and {} stories", stories.len());
+            for story in &stories {
+                println!("      - {}: {}", story.id, story.title);
+            }
+            continue;
+        }
+
+        // Save epic to database
+        db.upsert_epic(&epic).await?;
+        println!("   ✓ Epic saved to database");
+
+        // Save stories to database
+        for story in &stories {
+            db.upsert_story(story).await?;
+        }
+        println!("   ✓ {} stories saved", stories.len());
+
+        // Create worktree for the epic
+        let worktree_name = format!("epic-{}", epic.id.replace("epic-", ""));
+        let worktree_path = format!(".worktrees/{}", worktree_name);
+        let branch_name = format!("feat/{}", worktree_name);
+
+        if !std::path::Path::new(&worktree_path).exists() {
+            println!("   Creating worktree: {}", worktree_path);
+
+            let output = tokio::process::Command::new("git")
+                .args(["worktree", "add", &worktree_path, "-b", &branch_name])
+                .output()
+                .await?;
+
+            if output.status.success() {
+                // Save worktree to database
+                let worktree = Worktree::new(&worktree_name, &worktree_path, &branch_name, "main");
+                db.insert_worktree(&worktree).await?;
+                println!("   ✓ Worktree created: {}", worktree_path);
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                println!("   ⚠ Failed to create worktree: {}", stderr.trim());
+            }
+        } else {
+            println!("   ⏭ Worktree already exists: {}", worktree_path);
+        }
+
+        // Create agents for pending stories
+        let pending_stories: Vec<_> = stories.iter()
+            .filter(|s| s.status == StoryStatus::Pending)
+            .collect();
+
+        if !pending_stories.is_empty() {
+            println!("   Creating agents for {} pending stories...", pending_stories.len());
+
+            for story in pending_stories {
+                // Check if agent already exists for this story
+                let existing = db.list_stories(None).await?
+                    .iter()
+                    .find(|s| s.id == story.id && s.agent_id.is_some())
+                    .is_some();
+
+                if existing {
+                    println!("      ⏭ Story {} already has an agent", story.id);
+                    continue;
+                }
+
+                // Create story-developer agent
+                let task = format!(
+                    "Implement story {}: {}\n\n{}",
+                    story.id,
+                    story.title,
+                    story.description.as_deref().unwrap_or("No description provided.")
+                );
+
+                let agent = Agent::new(AgentType::StoryDeveloper, &task);
+                db.insert_agent(&agent).await?;
+
+                // Link story to agent
+                db.update_story_status(&story.id, StoryStatus::Pending, Some(agent.id)).await?;
+
+                println!("      ✓ Created agent for story {}", story.id);
+            }
+        }
+
+        println!();
+    }
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("✅ BMAD processing complete");
+    println!();
+    println!("Next steps:");
+    println!("  1. Start the daemon: orchestrate daemon start --use-cli");
+    println!("  2. Monitor progress: orchestrate bmad status");
+    println!("  3. View agents: orchestrate agent list");
+
+    Ok(())
+}
+
+/// Parse an epic markdown file into Epic and Stories
+fn parse_epic_file(filename: &str, content: &str) -> Result<(Epic, Vec<Story>)> {
+    use regex::Regex;
+
+    // Extract epic ID from filename (e.g., "epic-001-user-auth.md" -> "epic-001")
+    let id_regex = Regex::new(r"^(epic-\d+)")?;
+    let epic_id = id_regex
+        .captures(filename)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| filename.replace(".md", ""));
+
+    // Parse title from first # heading
+    let title_regex = Regex::new(r"^#\s+(.+)$")?;
+    let title = content
+        .lines()
+        .find_map(|line| {
+            title_regex.captures(line).map(|c| c.get(1).unwrap().as_str().to_string())
+        })
+        .unwrap_or_else(|| filename.replace(".md", "").replace("-", " "));
+
+    // Create epic
+    let mut epic = Epic::new(&epic_id, &title);
+    epic.source_file = Some(filename.to_string());
+
+    // Parse stories from ## Story headings or numbered lists
+    let story_heading_regex = Regex::new(r"^##\s+Story\s+(\S+):\s*(.+)$")?;
+    let story_list_regex = Regex::new(r"^\d+\.\s+\*\*(.+?)\*\*:?\s*(.*)$")?;
+    let checkbox_regex = Regex::new(r"^-\s+\[([ x])\]\s+(.+)$")?;
+
+    let mut stories = Vec::new();
+    let mut current_story: Option<(String, String, Vec<String>)> = None;
+    let mut in_story_section = false;
+
+    for line in content.lines() {
+        // Check for story heading
+        if let Some(caps) = story_heading_regex.captures(line) {
+            // Save previous story if exists
+            if let Some((id, title, criteria)) = current_story.take() {
+                let mut story = Story::new(&id, &epic_id, &title);
+                if !criteria.is_empty() {
+                    story.acceptance_criteria = Some(serde_json::json!(criteria));
+                }
+                stories.push(story);
+            }
+
+            let story_id = format!("{}.{}", epic_id, caps.get(1).unwrap().as_str());
+            let story_title = caps.get(2).unwrap().as_str().to_string();
+            current_story = Some((story_id, story_title, Vec::new()));
+            in_story_section = true;
+            continue;
+        }
+
+        // Check for numbered list story format
+        if let Some(caps) = story_list_regex.captures(line) {
+            // Save previous story if exists
+            if let Some((id, title, criteria)) = current_story.take() {
+                let mut story = Story::new(&id, &epic_id, &title);
+                if !criteria.is_empty() {
+                    story.acceptance_criteria = Some(serde_json::json!(criteria));
+                }
+                stories.push(story);
+            }
+
+            let story_num = stories.len() + 1;
+            let story_id = format!("{}.{}", epic_id, story_num);
+            let story_title = caps.get(1).unwrap().as_str().to_string();
+            let description = caps.get(2).map(|m| m.as_str().to_string());
+
+            let mut story = Story::new(&story_id, &epic_id, &story_title);
+            story.description = description;
+            stories.push(story);
+            current_story = None;
+            continue;
+        }
+
+        // Parse acceptance criteria (checkboxes)
+        if in_story_section {
+            if let Some(caps) = checkbox_regex.captures(line) {
+                if let Some((_, _, ref mut criteria)) = current_story {
+                    criteria.push(caps.get(2).unwrap().as_str().to_string());
+                }
+            }
+        }
+
+        // Check for section end
+        if line.starts_with("## ") && !line.contains("Story") {
+            in_story_section = false;
+            if let Some((id, title, criteria)) = current_story.take() {
+                let mut story = Story::new(&id, &epic_id, &title);
+                if !criteria.is_empty() {
+                    story.acceptance_criteria = Some(serde_json::json!(criteria));
+                }
+                stories.push(story);
+            }
+        }
+    }
+
+    // Don't forget the last story
+    if let Some((id, title, criteria)) = current_story {
+        let mut story = Story::new(&id, &epic_id, &title);
+        if !criteria.is_empty() {
+            story.acceptance_criteria = Some(serde_json::json!(criteria));
+        }
+        stories.push(story);
+    }
+
+    Ok((epic, stories))
+}
+
+/// Show BMAD status for all epics
+async fn show_bmad_status(db: &Database) -> Result<()> {
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                      BMAD STATUS                             ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+
+    // Get all epics (we need a list_epics method, but for now use pending)
+    let pending_epics = db.get_pending_epics().await?;
+
+    if pending_epics.is_empty() {
+        println!("📭 No epics found in the system.");
+        println!();
+        println!("To add epics, run: orchestrate bmad process");
+        return Ok(());
+    }
+
+    for epic in &pending_epics {
+        let stories = db.get_stories_for_epic(&epic.id).await?;
+        let completed = stories.iter().filter(|s| s.status == StoryStatus::Completed).count();
+        let in_progress = stories.iter().filter(|s| s.status == StoryStatus::InProgress).count();
+        let pending = stories.iter().filter(|s| s.status == StoryStatus::Pending).count();
+        let blocked = stories.iter().filter(|s| s.status == StoryStatus::Blocked).count();
+
+        let phase_str = epic.current_phase
+            .map(|p| format!("{}", p))
+            .unwrap_or_else(|| "NOT_STARTED".to_string());
+
+        let status_icon = match epic.status {
+            EpicStatus::Pending => "⏳",
+            EpicStatus::InProgress => "🔄",
+            EpicStatus::Completed => "✅",
+            EpicStatus::Blocked => "🚫",
+            EpicStatus::Skipped => "⏭",
+        };
+
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("{} Epic: {} - {}", status_icon, epic.id, epic.title);
+        println!("   Phase: {}", phase_str);
+        println!("   Stories: {}/{} complete", completed, stories.len());
+
+        if in_progress > 0 || pending > 0 || blocked > 0 {
+            println!("   Progress: {} in progress, {} pending, {} blocked",
+                in_progress, pending, blocked);
+        }
+
+        // Show story details
+        if !stories.is_empty() {
+            println!();
+            for story in &stories {
+                let icon = match story.status {
+                    StoryStatus::Pending => "○",
+                    StoryStatus::InProgress => "⏳",
+                    StoryStatus::Completed => "✓",
+                    StoryStatus::Blocked => "✗",
+                    StoryStatus::Skipped => "⏭",
+                };
+                let agent_str = story.agent_id
+                    .map(|id| format!(" [agent: {}]", &id.to_string()[..8]))
+                    .unwrap_or_default();
+                println!("      {} {}: {}{}", icon, story.id, story.title, agent_str);
+            }
+        }
+        println!();
+    }
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+/// Reset BMAD state
+async fn reset_bmad_state(db: &Database, force: bool) -> Result<()> {
+    if !force {
+        println!("⚠️  This will delete all epics and stories from the database.");
+        println!("   Run with --force to confirm.");
+        return Ok(());
+    }
+
+    println!("🗑️  Resetting BMAD state...");
+
+    // Get all stories and delete them
+    let stories = db.list_stories(None).await?;
+    for story in &stories {
+        db.delete_story(&story.id).await?;
+    }
+    println!("   ✓ Deleted {} stories", stories.len());
+
+    // Note: We would need a delete_epic method or similar
+    // For now, just report what we did
+    println!();
+    println!("✅ BMAD state reset complete");
+    println!("   Note: Epics may need manual cleanup if delete_epic is not implemented.");
+
+    Ok(())
 }

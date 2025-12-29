@@ -27,7 +27,7 @@ pub use message::{Message, MessageRole};
 pub use session::Session;
 pub use worktree::{Worktree, WorktreeStatus};
 pub use pr::{PullRequest, PrStatus, MergeStrategy};
-pub use epic::{Epic, Story, EpicStatus, StoryStatus};
+pub use epic::{Epic, Story, EpicStatus, StoryStatus, BmadPhase};
 
 // Re-export instruction types
 pub use instruction::{
