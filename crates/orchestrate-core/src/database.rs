@@ -122,14 +122,14 @@ impl Database {
             .execute(&self.pool)
             .await?;
         // Pipelines migration
-        sqlx::query(include_str!("../../../migrations/007_pipelines.sql"))
+        sqlx::query(include_str!("../../../migrations/008_pipelines.sql"))
             .execute(&self.pool)
             .await?;
-        sqlx::query(include_str!("../../../migrations/008_approvals.sql"))
+        sqlx::query(include_str!("../../../migrations/009_approvals.sql"))
             .execute(&self.pool)
             .await?;
         // Rollback events migration
-        sqlx::query(include_str!("../../../migrations/009_rollback_events.sql"))
+        sqlx::query(include_str!("../../../migrations/010_rollback_events.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
