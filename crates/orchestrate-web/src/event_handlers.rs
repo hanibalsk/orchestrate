@@ -922,6 +922,152 @@ pub async fn handle_push_to_main(
     Ok(())
 }
 
+/// Handle an issues.opened event
+///
+/// Spawns an issue-triager agent to analyze and triage the issue.
+///
+/// Returns Ok(()) if event was handled successfully, Err if processing should be retried.
+pub async fn handle_issue_opened(
+    database: Arc<Database>,
+    event: &WebhookEvent,
+) -> Result<()> {
+    info!(
+        delivery_id = %event.delivery_id,
+        "Processing issues.opened event"
+    );
+
+    // Parse payload
+    let payload: Value = serde_json::from_str(&event.payload)?;
+
+    // Extract action - must be "opened"
+    let action = payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing action field".to_string()))?;
+
+    if action != "opened" {
+        debug!(action = %action, "Skipping non-opened action");
+        return Ok(());
+    }
+
+    // Extract issue data
+    let issue = payload
+        .get("issue")
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing issue field".to_string()))?;
+
+    let issue_number = issue
+        .get("number")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing issue number".to_string()))?;
+
+    let issue_title = issue
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing issue title".to_string()))?
+        .to_string();
+
+    let issue_body = issue
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Extract repository info
+    let repo_full_name = payload
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| orchestrate_core::Error::Other("Missing repository name".to_string()))?
+        .to_string();
+
+    // Extract optional labels
+    let labels: Vec<String> = issue
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|label| label.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Extract optional assignees
+    let assignees: Vec<String> = issue
+        .get("assignees")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|assignee| assignee.get("login").and_then(|l| l.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    info!(
+        issue_number = issue_number,
+        issue_title = %issue_title,
+        repository = %repo_full_name,
+        labels_count = labels.len(),
+        assignees_count = assignees.len(),
+        "Spawning issue-triager agent for new issue"
+    );
+
+    // Build custom context with issue information
+    let mut custom = serde_json::json!({
+        "repository": repo_full_name,
+        "event_delivery_id": event.delivery_id,
+        "issue_number": issue_number,
+        "issue_title": issue_title.clone(),
+        "issue_body": issue_body,
+    });
+
+    if !labels.is_empty() {
+        custom["issue_labels"] = serde_json::json!(labels);
+    }
+
+    if !assignees.is_empty() {
+        custom["issue_assignees"] = serde_json::json!(assignees);
+    }
+
+    // Create agent context
+    let context = AgentContext {
+        pr_number: None,
+        branch_name: None,
+        working_directory: None,
+        custom,
+        ..Default::default()
+    };
+
+    // Create issue-triager agent
+    // Truncate title if too long for task description
+    let title_preview = if issue_title.len() > 80 {
+        format!("{}...", &issue_title[..80])
+    } else {
+        issue_title.clone()
+    };
+
+    let agent = Agent::new(
+        AgentType::IssueTriager,
+        format!(
+            "Triage issue #{} - {}",
+            issue_number, title_preview
+        ),
+    )
+    .with_context(context);
+
+    // Save agent to database
+    database.insert_agent(&agent).await?;
+
+    info!(
+        agent_id = %agent.id,
+        issue_number = issue_number,
+        "issue-triager agent created for new issue"
+    );
+
+    // TODO: Actually spawn the agent (call orchestrate CLI or spawn process)
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2146,6 +2292,251 @@ mod tests {
         assert_eq!(
             custom.get("event_delivery_id").unwrap().as_str().unwrap(),
             "delivery-push-repo"
+        );
+    }
+
+    // Issue Created Event Handler Tests
+
+    fn create_issue_opened_payload(
+        issue_number: i64,
+        title: &str,
+        body: &str,
+    ) -> String {
+        serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": issue_number,
+                "title": title,
+                "body": body,
+                "state": "open",
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_handle_issue_opened_creates_agent() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let issue_title = "Bug: Application crashes on startup";
+        let issue_body = "When I run the app, it immediately crashes with error XYZ";
+        let payload = create_issue_opened_payload(101, issue_title, issue_body);
+        let event = WebhookEvent::new(
+            "delivery-issue-1".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+
+        let result = handle_issue_opened(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // Verify issue-triager agent was created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        assert_eq!(agent.agent_type, AgentType::IssueTriager);
+        assert_eq!(agent.state, AgentState::Created);
+        assert!(agent.task.contains("101"));
+        assert!(agent.task.contains("Bug: Application crashes"));
+
+        // Verify context contains issue details
+        let custom = &agent.context.custom;
+        assert_eq!(custom.get("issue_number").unwrap().as_i64().unwrap(), 101);
+        assert_eq!(custom.get("issue_title").unwrap().as_str().unwrap(), issue_title);
+        assert_eq!(custom.get("issue_body").unwrap().as_str().unwrap(), issue_body);
+        assert_eq!(custom.get("repository").unwrap().as_str().unwrap(), "owner/repo");
+    }
+
+    #[tokio::test]
+    async fn test_handle_issue_opened_skips_non_opened_action() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = serde_json::json!({
+            "action": "closed",
+            "issue": {
+                "number": 102,
+                "title": "Some issue",
+                "body": "Issue body",
+                "state": "closed",
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-issue-closed".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+
+        let result = handle_issue_opened(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        // No agent should be created for closed action
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_issue_opened_handles_empty_body() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = create_issue_opened_payload(103, "Issue without body", "");
+        let event = WebhookEvent::new(
+            "delivery-issue-empty".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+
+        let result = handle_issue_opened(database.clone(), &event).await;
+        assert!(result.is_ok());
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        assert_eq!(agent.agent_type, AgentType::IssueTriager);
+        let custom = &agent.context.custom;
+        assert_eq!(custom.get("issue_body").unwrap().as_str().unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn test_handle_issue_opened_missing_fields() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Missing issue field
+        let payload = serde_json::json!({
+            "action": "opened",
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-issue-missing".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+
+        let result = handle_issue_opened(database.clone(), &event).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_issue_opened_with_labels() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 104,
+                "title": "Feature request",
+                "body": "Add support for feature X",
+                "state": "open",
+                "labels": [
+                    {"name": "enhancement"},
+                    {"name": "priority:high"}
+                ]
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-issue-labels".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+
+        handle_issue_opened(database.clone(), &event).await.unwrap();
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        let custom = &agent.context.custom;
+        let labels = custom.get("issue_labels").unwrap().as_array().unwrap();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].as_str().unwrap(), "enhancement");
+        assert_eq!(labels[1].as_str().unwrap(), "priority:high");
+    }
+
+    #[tokio::test]
+    async fn test_handle_issue_opened_with_assignees() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 105,
+                "title": "Fix bug",
+                "body": "Bug description",
+                "state": "open",
+                "assignees": [
+                    {"login": "dev1"},
+                    {"login": "dev2"}
+                ]
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        })
+        .to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-issue-assignees".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+
+        handle_issue_opened(database.clone(), &event).await.unwrap();
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        let custom = &agent.context.custom;
+        let assignees = custom.get("issue_assignees").unwrap().as_array().unwrap();
+        assert_eq!(assignees.len(), 2);
+        assert_eq!(assignees[0].as_str().unwrap(), "dev1");
+        assert_eq!(assignees[1].as_str().unwrap(), "dev2");
+    }
+
+    #[tokio::test]
+    async fn test_handle_issue_opened_extracts_repository_info() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        let payload = create_issue_opened_payload(
+            106,
+            "Test issue",
+            "Test body",
+        );
+        let event = WebhookEvent::new(
+            "delivery-issue-repo".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+
+        handle_issue_opened(database.clone(), &event).await.unwrap();
+
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        let agent = &agents[0];
+        let custom = &agent.context.custom;
+        assert_eq!(custom.get("repository").unwrap().as_str().unwrap(), "owner/repo");
+        assert_eq!(
+            custom.get("event_delivery_id").unwrap().as_str().unwrap(),
+            "delivery-issue-repo"
         );
     }
 }

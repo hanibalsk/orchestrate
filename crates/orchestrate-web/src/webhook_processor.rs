@@ -146,6 +146,9 @@ impl WebhookProcessor {
             "push" => {
                 crate::event_handlers::handle_push_to_main(self.database.clone(), event).await
             }
+            "issues" => {
+                crate::event_handlers::handle_issue_opened(self.database.clone(), event).await
+            }
             _ => {
                 // Unknown event type - not an error, just skip
                 debug!(event_type = %event.event_type, "No handler for event type");
@@ -373,6 +376,89 @@ mod tests {
         assert_eq!(completed.len(), 1);
 
         // No agent should be created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_processor_handles_issue_opened_events() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Insert issue opened event
+        let payload = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 999,
+                "title": "Test issue",
+                "body": "This is a test issue",
+                "state": "open",
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        }).to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-issue-test".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+        database.insert_webhook_event(&event).await.unwrap();
+
+        // Process event
+        let processor = WebhookProcessor::new(database.clone(), WebhookProcessorConfig::default());
+        processor.process_batch().await.unwrap();
+
+        // Event should be completed
+        let completed = database
+            .get_webhook_events_by_status(WebhookEventStatus::Completed, 10)
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+
+        // Verify issue-triager agent was created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_type, orchestrate_core::AgentType::IssueTriager);
+    }
+
+    #[tokio::test]
+    async fn test_processor_skips_issue_closed() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+
+        // Insert issue closed event
+        let payload = serde_json::json!({
+            "action": "closed",
+            "issue": {
+                "number": 1000,
+                "title": "Closed issue",
+                "body": "This issue was closed",
+                "state": "closed",
+            },
+            "repository": {
+                "full_name": "owner/repo"
+            }
+        }).to_string();
+
+        let event = WebhookEvent::new(
+            "delivery-issue-closed".to_string(),
+            "issues".to_string(),
+            payload,
+        );
+        database.insert_webhook_event(&event).await.unwrap();
+
+        // Process event
+        let processor = WebhookProcessor::new(database.clone(), WebhookProcessorConfig::default());
+        processor.process_batch().await.unwrap();
+
+        // Event should be completed (successfully skipped)
+        let completed = database
+            .get_webhook_events_by_status(WebhookEventStatus::Completed, 10)
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+
+        // No agent should be created for closed issue
         let agents = database.list_agents().await.unwrap();
         assert_eq!(agents.len(), 0);
     }

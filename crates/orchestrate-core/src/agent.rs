@@ -134,6 +134,9 @@ pub enum AgentType {
     // Testing agents
     RegressionTester,
 
+    // Issue management
+    IssueTriager,
+
     // System agents
     BackgroundController,
     Scheduler,
@@ -153,6 +156,7 @@ impl AgentType {
             AgentType::PrController => "pr_controller",
             AgentType::ConflictResolver => "conflict_resolver",
             AgentType::RegressionTester => "regression_tester",
+            AgentType::IssueTriager => "issue_triager",
             AgentType::BackgroundController => "background_controller",
             AgentType::Scheduler => "scheduler",
         }
@@ -171,6 +175,7 @@ impl AgentType {
             "pr_controller" => Ok(AgentType::PrController),
             "conflict_resolver" => Ok(AgentType::ConflictResolver),
             "regression_tester" => Ok(AgentType::RegressionTester),
+            "issue_triager" => Ok(AgentType::IssueTriager),
             "background_controller" => Ok(AgentType::BackgroundController),
             "scheduler" => Ok(AgentType::Scheduler),
             _ => Err(crate::Error::Other(format!("Unknown agent type: {}", s))),
@@ -206,6 +211,7 @@ impl AgentType {
             AgentType::RegressionTester => {
                 vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
             }
+            AgentType::IssueTriager => vec!["Bash", "Read", "Glob", "Grep"],
             AgentType::BackgroundController => {
                 vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
             }
@@ -221,6 +227,7 @@ impl AgentType {
             AgentType::IssueFixer => 40,
             AgentType::ConflictResolver => 30,
             AgentType::RegressionTester => 50,
+            AgentType::IssueTriager => 30,
             _ => 80,
         }
     }
