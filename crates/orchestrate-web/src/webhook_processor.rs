@@ -96,9 +96,8 @@ impl WebhookProcessor {
         event.mark_processing();
         self.database.update_webhook_event(&event).await?;
 
-        // TODO: Actual event processing logic will be added in future stories
-        // For now, just simulate processing and mark as completed
-        match Self::handle_event(&event).await {
+        // Process the event with the appropriate handler
+        match self.handle_event(&event).await {
             Ok(()) => {
                 event.mark_completed();
                 self.database.update_webhook_event(&event).await?;
@@ -132,16 +131,18 @@ impl WebhookProcessor {
         Ok(())
     }
 
-    /// Handle event processing (placeholder for actual logic)
-    async fn handle_event(_event: &WebhookEvent) -> orchestrate_core::Result<()> {
-        // TODO: This is a placeholder. Future stories will implement actual event handling:
-        // - Story 3: PR opened -> spawn pr-shepherd
-        // - Story 4: PR review -> spawn issue-fixer
-        // - Story 5: CI failure -> spawn issue-fixer
-        // - etc.
-
-        // For now, just succeed
-        Ok(())
+    /// Handle event processing
+    async fn handle_event(&self, event: &WebhookEvent) -> orchestrate_core::Result<()> {
+        match event.event_type.as_str() {
+            "pull_request" => {
+                crate::event_handlers::handle_pr_opened(self.database.clone(), event).await
+            }
+            _ => {
+                // Unknown event type - not an error, just skip
+                debug!(event_type = %event.event_type, "No handler for event type");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -153,12 +154,29 @@ mod tests {
     async fn test_processor_processes_events() {
         let database = Arc::new(Database::in_memory().await.unwrap());
 
-        // Insert test events
+        // Insert test events with a valid PR opened payload
         for i in 1..=3 {
+            let payload = serde_json::json!({
+                "action": "opened",
+                "number": i,
+                "pull_request": {
+                    "number": i,
+                    "head": {
+                        "ref": format!("feature/test-{}", i),
+                        "repo": {
+                            "fork": false
+                        }
+                    }
+                },
+                "repository": {
+                    "full_name": "owner/repo"
+                }
+            }).to_string();
+
             let event = WebhookEvent::new(
                 format!("delivery-{}", i),
                 "pull_request".to_string(),
-                r#"{"action":"opened"}"#.to_string(),
+                payload,
             );
             database.insert_webhook_event(&event).await.unwrap();
         }
@@ -179,6 +197,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.len(), 0);
+
+        // Verify agents were created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 3);
     }
 
     #[tokio::test]
@@ -187,10 +209,27 @@ mod tests {
 
         // Insert more events than batch size
         for i in 1..=15 {
+            let payload = serde_json::json!({
+                "action": "opened",
+                "number": i,
+                "pull_request": {
+                    "number": i,
+                    "head": {
+                        "ref": format!("feature/batch-{}", i),
+                        "repo": {
+                            "fork": false
+                        }
+                    }
+                },
+                "repository": {
+                    "full_name": "owner/repo"
+                }
+            }).to_string();
+
             let event = WebhookEvent::new(
                 format!("delivery-batch-{}", i),
                 "pull_request".to_string(),
-                r#"{"action":"opened"}"#.to_string(),
+                payload,
             );
             database.insert_webhook_event(&event).await.unwrap();
         }
@@ -225,6 +264,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed, 15);
+
+        // Verify all agents were created
+        let agents = database.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 15);
     }
 
     #[tokio::test]
