@@ -1531,6 +1531,201 @@ impl Database {
         Ok(())
     }
 
+    // ==================== Success Pattern Operations ====================
+
+    /// Upsert a success pattern (insert or update occurrence count and averages)
+    #[tracing::instrument(skip(self, pattern), level = "debug")]
+    pub async fn upsert_success_pattern(&self, pattern: &SuccessPattern) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let pattern_type_str = pattern.pattern_type.as_str();
+        let agent_type_str = pattern.agent_type.as_ref().map(|a| a.as_str());
+        let pattern_data_str = pattern.pattern_data.to_string();
+
+        // Try to find existing pattern by signature
+        let existing: Option<SuccessPatternRow> = sqlx::query_as(
+            "SELECT * FROM success_patterns WHERE pattern_signature = ?",
+        )
+        .bind(&pattern.pattern_signature)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(existing) = existing {
+            // Update with weighted averages
+            let new_count = existing.occurrence_count + 1;
+
+            // Calculate weighted average for completion time
+            let new_avg_time = match (existing.avg_completion_time_ms, pattern.avg_completion_time_ms)
+            {
+                (Some(old), Some(new)) => {
+                    Some((old * existing.occurrence_count + new) / new_count)
+                }
+                (Some(old), None) => Some(old),
+                (None, Some(new)) => Some(new),
+                (None, None) => None,
+            };
+
+            // Calculate weighted average for token usage
+            let new_avg_tokens = match (existing.avg_token_usage, pattern.avg_token_usage) {
+                (Some(old), Some(new)) => {
+                    Some((old * existing.occurrence_count + new) / new_count)
+                }
+                (Some(old), None) => Some(old),
+                (None, Some(new)) => Some(new),
+                (None, None) => None,
+            };
+
+            sqlx::query(
+                r#"
+                UPDATE success_patterns
+                SET occurrence_count = ?,
+                    avg_completion_time_ms = ?,
+                    avg_token_usage = ?,
+                    last_seen_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(new_count)
+            .bind(new_avg_time)
+            .bind(new_avg_tokens)
+            .bind(&now)
+            .bind(existing.id)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(existing.id)
+        } else {
+            // Insert new pattern
+            let result = sqlx::query(
+                r#"
+                INSERT INTO success_patterns (
+                    pattern_type, agent_type, task_type, pattern_signature,
+                    pattern_data, occurrence_count, avg_completion_time_ms,
+                    avg_token_usage, success_rate, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(pattern_type_str)
+            .bind(agent_type_str)
+            .bind(&pattern.task_type)
+            .bind(&pattern.pattern_signature)
+            .bind(&pattern_data_str)
+            .bind(pattern.occurrence_count)
+            .bind(pattern.avg_completion_time_ms)
+            .bind(pattern.avg_token_usage)
+            .bind(pattern.success_rate)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    /// Get a success pattern by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_success_pattern(&self, id: i64) -> Result<Option<SuccessPattern>> {
+        let row: Option<SuccessPatternRow> =
+            sqlx::query_as("SELECT * FROM success_patterns WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List success patterns with optional type filter
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_success_patterns(
+        &self,
+        pattern_type: Option<SuccessPatternType>,
+        limit: i64,
+    ) -> Result<Vec<SuccessPattern>> {
+        let rows: Vec<SuccessPatternRow> = match pattern_type {
+            Some(pt) => {
+                sqlx::query_as(
+                    "SELECT * FROM success_patterns WHERE pattern_type = ? ORDER BY occurrence_count DESC LIMIT ?",
+                )
+                .bind(pt.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT * FROM success_patterns ORDER BY occurrence_count DESC LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get success patterns for a specific agent type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_success_patterns_for_agent(
+        &self,
+        agent_type: AgentType,
+        limit: i64,
+    ) -> Result<Vec<SuccessPattern>> {
+        let rows: Vec<SuccessPatternRow> = sqlx::query_as(
+            r#"
+            SELECT * FROM success_patterns
+            WHERE agent_type = ? OR agent_type IS NULL
+            ORDER BY occurrence_count DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(agent_type.as_str())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get success patterns by task type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_success_patterns_by_task(
+        &self,
+        task_type: &str,
+        limit: i64,
+    ) -> Result<Vec<SuccessPattern>> {
+        let rows: Vec<SuccessPatternRow> = sqlx::query_as(
+            r#"
+            SELECT * FROM success_patterns
+            WHERE task_type = ? OR task_type IS NULL
+            ORDER BY occurrence_count DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(task_type)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Cleanup old success patterns that haven't been seen recently
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn cleanup_old_success_patterns(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let result = sqlx::query(
+            "DELETE FROM success_patterns WHERE last_seen_at < ? AND occurrence_count < 5",
+        )
+        .bind(&cutoff_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
     // ==================== Token Tracking Operations ====================
 
     /// Record token usage for a session turn
@@ -1977,6 +2172,13 @@ impl Database {
             "SELECT * FROM schedule_runs WHERE schedule_id = ? ORDER BY started_at DESC LIMIT ?",
         )
         .bind(schedule_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
     // ==================== Webhook Event Operations ====================
 
     /// Insert a new webhook event (idempotent by delivery_id)
@@ -3225,6 +3427,24 @@ impl TryFrom<ScheduleRow> for Schedule {
             enabled: row.enabled,
             last_run: row
                 .last_run
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            next_run: row
+                .next_run
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct WebhookEventRow {
     id: i64,
     delivery_id: String,
@@ -3262,8 +3482,6 @@ impl TryFrom<WebhookEventRow> for WebhookEvent {
                 .transpose()
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .map(Into::into),
-            next_run: row
-                .next_run
             received_at: chrono::DateTime::parse_from_rfc3339(&row.received_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
@@ -3274,6 +3492,9 @@ impl TryFrom<WebhookEventRow> for WebhookEvent {
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .map(Into::into),
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
         })
@@ -3312,9 +3533,6 @@ impl TryFrom<ScheduleRunRow> for ScheduleRun {
                 .map(Into::into),
             status: ScheduleRunStatus::from_str(&row.status)?,
             error_message: row.error_message,
-            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
-                .map_err(|e| crate::Error::Other(e.to_string()))?
-                .into(),
         })
     }
 }
@@ -3743,6 +3961,55 @@ impl TryFrom<ApprovalDecisionRow> for ApprovalDecision {
             decision: row.decision != 0,
             comment: row.comment,
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+// ==================== Success Pattern Row Struct ====================
+
+#[derive(sqlx::FromRow)]
+struct SuccessPatternRow {
+    id: i64,
+    pattern_type: String,
+    agent_type: Option<String>,
+    task_type: Option<String>,
+    pattern_signature: String,
+    pattern_data: String,
+    occurrence_count: i64,
+    avg_completion_time_ms: Option<i64>,
+    avg_token_usage: Option<i64>,
+    success_rate: f64,
+    first_seen_at: String,
+    last_seen_at: String,
+}
+
+impl TryFrom<SuccessPatternRow> for SuccessPattern {
+    type Error = crate::Error;
+
+    fn try_from(row: SuccessPatternRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(SuccessPattern {
+            id: row.id,
+            pattern_type: SuccessPatternType::from_str(&row.pattern_type)?,
+            agent_type: row
+                .agent_type
+                .map(|s| AgentType::from_str(&s))
+                .transpose()?,
+            task_type: row.task_type,
+            pattern_signature: row.pattern_signature,
+            pattern_data: serde_json::from_str(&row.pattern_data)
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
+            occurrence_count: row.occurrence_count,
+            avg_completion_time_ms: row.avg_completion_time_ms,
+            avg_token_usage: row.avg_token_usage,
+            success_rate: row.success_rate,
+            first_seen_at: chrono::DateTime::parse_from_rfc3339(&row.first_seen_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            last_seen_at: chrono::DateTime::parse_from_rfc3339(&row.last_seen_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
         })

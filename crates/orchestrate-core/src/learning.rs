@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{
     instruction::{
         penalties, CustomInstruction, LearningConfig, LearningPattern, PatternStatus, PatternType,
+        SuccessPattern, SuccessPatternType,
     },
     AgentType, Database, Message, MessageRole, Result,
 };
@@ -91,6 +92,377 @@ impl LearningEngine {
         }
 
         Ok(patterns)
+    }
+
+    /// Analyze a successful agent run for success patterns
+    ///
+    /// This method extracts patterns from successful runs including:
+    /// - Tool sequences that led to success
+    /// - Context size at completion
+    /// - Model choice effectiveness
+    /// - Timing patterns (e.g., duration)
+    #[tracing::instrument(skip(self, db, messages), level = "debug", fields(agent_id = %agent_id))]
+    pub async fn analyze_successful_run(
+        &self,
+        db: &Database,
+        agent_id: Uuid,
+        agent_type: AgentType,
+        messages: &[Message],
+        completion_time_ms: Option<i64>,
+        total_tokens: Option<i64>,
+        task_type: Option<&str>,
+    ) -> Result<Vec<SuccessPattern>> {
+        let mut patterns = Vec::new();
+
+        // Extract tool sequence pattern
+        if let Some(tool_pattern) =
+            self.extract_tool_sequence_pattern(messages, agent_type, task_type)
+        {
+            patterns.push(tool_pattern);
+        }
+
+        // Extract context size pattern
+        if let Some(context_pattern) =
+            self.extract_context_size_pattern(messages, agent_type, task_type, total_tokens)
+        {
+            patterns.push(context_pattern);
+        }
+
+        // Extract timing pattern if completion time is available
+        if let Some(timing_pattern) =
+            self.extract_timing_pattern(agent_type, task_type, completion_time_ms)
+        {
+            patterns.push(timing_pattern);
+        }
+
+        // Extract prompt structure pattern
+        if let Some(prompt_pattern) =
+            self.extract_prompt_structure_pattern(messages, agent_type, task_type)
+        {
+            patterns.push(prompt_pattern);
+        }
+
+        // Persist patterns to database
+        for pattern in &patterns {
+            db.upsert_success_pattern(pattern).await?;
+        }
+
+        Ok(patterns)
+    }
+
+    /// Extract tool sequence pattern from successful run
+    fn extract_tool_sequence_pattern(
+        &self,
+        messages: &[Message],
+        agent_type: AgentType,
+        task_type: Option<&str>,
+    ) -> Option<SuccessPattern> {
+        let mut tool_sequence: Vec<String> = Vec::new();
+
+        for msg in messages {
+            if let Some(ref calls) = msg.tool_calls {
+                for call in calls {
+                    tool_sequence.push(call.name.clone());
+                }
+            }
+        }
+
+        if tool_sequence.is_empty() {
+            return None;
+        }
+
+        // Create a normalized sequence (collapse repeated tools)
+        let normalized_sequence = self.normalize_tool_sequence(&tool_sequence);
+
+        // Create signature from the normalized sequence
+        let signature = self.create_signature(
+            &format!(
+                "tool_seq_{}_{:?}",
+                agent_type.as_str(),
+                normalized_sequence.join(",")
+            ),
+            "success_tool",
+        );
+
+        let pattern_data = serde_json::json!({
+            "tool_sequence": tool_sequence,
+            "normalized_sequence": normalized_sequence,
+            "total_calls": tool_sequence.len(),
+            "unique_tools": tool_sequence.iter().collect::<std::collections::HashSet<_>>().len(),
+        });
+
+        Some(
+            SuccessPattern::new(SuccessPatternType::ToolSequence, signature, pattern_data)
+                .with_agent_type(agent_type)
+                .with_task_type(task_type),
+        )
+    }
+
+    /// Normalize a tool sequence by collapsing repeated consecutive tools
+    fn normalize_tool_sequence(&self, sequence: &[String]) -> Vec<String> {
+        let mut normalized = Vec::new();
+        let mut prev: Option<&String> = None;
+
+        for tool in sequence {
+            if prev != Some(tool) {
+                normalized.push(tool.clone());
+                prev = Some(tool);
+            }
+        }
+
+        normalized
+    }
+
+    /// Extract context size pattern from successful run
+    fn extract_context_size_pattern(
+        &self,
+        messages: &[Message],
+        agent_type: AgentType,
+        task_type: Option<&str>,
+        total_tokens: Option<i64>,
+    ) -> Option<SuccessPattern> {
+        let message_count = messages.len();
+        let assistant_messages = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .count();
+        let user_messages = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count();
+
+        // Calculate approximate content size
+        let total_content_len: usize = messages.iter().map(|m| m.content.len()).sum();
+
+        let signature = self.create_signature(
+            &format!(
+                "context_{}_{}_{}",
+                agent_type.as_str(),
+                task_type.unwrap_or("general"),
+                message_count / 10 // Bucket by 10s
+            ),
+            "success_context",
+        );
+
+        let pattern_data = serde_json::json!({
+            "message_count": message_count,
+            "assistant_messages": assistant_messages,
+            "user_messages": user_messages,
+            "total_content_chars": total_content_len,
+            "avg_message_size": if message_count > 0 { total_content_len / message_count } else { 0 },
+        });
+
+        let mut pattern =
+            SuccessPattern::new(SuccessPatternType::ContextSize, signature, pattern_data)
+                .with_agent_type(agent_type)
+                .with_task_type(task_type);
+
+        pattern.avg_token_usage = total_tokens;
+
+        Some(pattern)
+    }
+
+    /// Extract timing pattern from successful run
+    fn extract_timing_pattern(
+        &self,
+        agent_type: AgentType,
+        task_type: Option<&str>,
+        completion_time_ms: Option<i64>,
+    ) -> Option<SuccessPattern> {
+        let completion_time = completion_time_ms?;
+
+        // Bucket completion time into categories
+        let time_bucket = if completion_time < 5000 {
+            "fast"
+        } else if completion_time < 30000 {
+            "medium"
+        } else if completion_time < 120000 {
+            "slow"
+        } else {
+            "very_slow"
+        };
+
+        let signature = self.create_signature(
+            &format!(
+                "timing_{}_{}_{}",
+                agent_type.as_str(),
+                task_type.unwrap_or("general"),
+                time_bucket
+            ),
+            "success_timing",
+        );
+
+        let pattern_data = serde_json::json!({
+            "time_bucket": time_bucket,
+            "completion_time_ms": completion_time,
+        });
+
+        let mut pattern =
+            SuccessPattern::new(SuccessPatternType::Timing, signature, pattern_data)
+                .with_agent_type(agent_type)
+                .with_task_type(task_type);
+
+        pattern.avg_completion_time_ms = Some(completion_time);
+
+        Some(pattern)
+    }
+
+    /// Extract prompt structure pattern from successful run
+    fn extract_prompt_structure_pattern(
+        &self,
+        messages: &[Message],
+        agent_type: AgentType,
+        task_type: Option<&str>,
+    ) -> Option<SuccessPattern> {
+        // Analyze the first user message (initial prompt) structure
+        let first_user_msg = messages.iter().find(|m| m.role == MessageRole::User)?;
+
+        // Extract prompt characteristics
+        let has_examples = first_user_msg.content.contains("example")
+            || first_user_msg.content.contains("Example")
+            || first_user_msg.content.contains("e.g.");
+        let has_constraints = first_user_msg.content.contains("must")
+            || first_user_msg.content.contains("should")
+            || first_user_msg.content.contains("don't")
+            || first_user_msg.content.contains("avoid");
+        let has_step_by_step = first_user_msg.content.contains("step by step")
+            || first_user_msg.content.contains("step-by-step")
+            || first_user_msg.content.contains("steps:");
+        let has_context = first_user_msg.content.contains("context:")
+            || first_user_msg.content.contains("background:");
+
+        let prompt_length_bucket = if first_user_msg.content.len() < 100 {
+            "short"
+        } else if first_user_msg.content.len() < 500 {
+            "medium"
+        } else if first_user_msg.content.len() < 2000 {
+            "long"
+        } else {
+            "very_long"
+        };
+
+        let signature = self.create_signature(
+            &format!(
+                "prompt_{}_{}_ex{}_con{}_step{}_ctx{}",
+                agent_type.as_str(),
+                task_type.unwrap_or("general"),
+                has_examples,
+                has_constraints,
+                has_step_by_step,
+                has_context
+            ),
+            "success_prompt",
+        );
+
+        let pattern_data = serde_json::json!({
+            "prompt_length": first_user_msg.content.len(),
+            "prompt_length_bucket": prompt_length_bucket,
+            "has_examples": has_examples,
+            "has_constraints": has_constraints,
+            "has_step_by_step": has_step_by_step,
+            "has_context": has_context,
+        });
+
+        Some(
+            SuccessPattern::new(SuccessPatternType::PromptStructure, signature, pattern_data)
+                .with_agent_type(agent_type)
+                .with_task_type(task_type),
+        )
+    }
+
+    /// Get recommendations for a new task based on success patterns
+    #[tracing::instrument(skip(self, db), level = "debug")]
+    pub async fn get_success_recommendations(
+        &self,
+        db: &Database,
+        agent_type: AgentType,
+        task_type: Option<&str>,
+    ) -> Result<SuccessRecommendations> {
+        // Get success patterns for this agent type
+        let patterns = db.get_success_patterns_for_agent(agent_type, 50).await?;
+
+        let mut recommendations = SuccessRecommendations::default();
+
+        // Analyze patterns to build recommendations
+        for pattern in &patterns {
+            match pattern.pattern_type {
+                SuccessPatternType::ToolSequence => {
+                    if let Some(seq) = pattern.pattern_data.get("normalized_sequence") {
+                        if let Some(arr) = seq.as_array() {
+                            let tools: Vec<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                            recommendations.recommended_tool_sequences.push(tools);
+                        }
+                    }
+                }
+                SuccessPatternType::ContextSize => {
+                    if let Some(count) = pattern.pattern_data.get("message_count") {
+                        if let Some(n) = count.as_i64() {
+                            recommendations.avg_message_counts.push(n);
+                        }
+                    }
+                }
+                SuccessPatternType::Timing => {
+                    if let Some(time) = pattern.avg_completion_time_ms {
+                        recommendations.avg_completion_times.push(time);
+                    }
+                }
+                SuccessPatternType::PromptStructure => {
+                    if pattern
+                        .pattern_data
+                        .get("has_examples")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        recommendations.successful_prompt_features.push("examples".to_string());
+                    }
+                    if pattern
+                        .pattern_data
+                        .get("has_constraints")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        recommendations.successful_prompt_features.push("constraints".to_string());
+                    }
+                    if pattern
+                        .pattern_data
+                        .get("has_step_by_step")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        recommendations
+                            .successful_prompt_features
+                            .push("step_by_step".to_string());
+                    }
+                }
+                SuccessPatternType::ModelChoice => {
+                    // Model choice patterns would be populated when we have model selection data
+                }
+            }
+        }
+
+        // Calculate averages
+        if !recommendations.avg_message_counts.is_empty() {
+            recommendations.recommended_message_count = Some(
+                recommendations.avg_message_counts.iter().sum::<i64>()
+                    / recommendations.avg_message_counts.len() as i64,
+            );
+        }
+
+        if !recommendations.avg_completion_times.is_empty() {
+            recommendations.expected_completion_time_ms = Some(
+                recommendations.avg_completion_times.iter().sum::<i64>()
+                    / recommendations.avg_completion_times.len() as i64,
+            );
+        }
+
+        // Deduplicate prompt features
+        recommendations.successful_prompt_features.sort();
+        recommendations.successful_prompt_features.dedup();
+
+        Ok(recommendations)
     }
 
     /// Detect error patterns from messages
@@ -634,6 +1006,23 @@ pub struct CleanupResult {
     pub deleted_names: Vec<String>,
 }
 
+/// Recommendations based on success patterns
+#[derive(Debug, Clone, Default)]
+pub struct SuccessRecommendations {
+    /// Recommended tool sequences that have led to success
+    pub recommended_tool_sequences: Vec<Vec<String>>,
+    /// Average message counts from successful runs (internal)
+    pub avg_message_counts: Vec<i64>,
+    /// Average completion times from successful runs (internal)
+    pub avg_completion_times: Vec<i64>,
+    /// Prompt features that appear in successful runs
+    pub successful_prompt_features: Vec<String>,
+    /// Recommended message count based on successful patterns
+    pub recommended_message_count: Option<i64>,
+    /// Expected completion time based on successful patterns
+    pub expected_completion_time_ms: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,5 +1157,331 @@ mod tests {
         assert!(config
             .enabled_pattern_types
             .contains(&PatternType::ErrorPattern));
+    }
+
+    #[test]
+    fn test_normalize_tool_sequence() {
+        let engine = LearningEngine::new();
+
+        // Empty sequence
+        let empty: Vec<String> = vec![];
+        assert_eq!(engine.normalize_tool_sequence(&empty), Vec::<String>::new());
+
+        // No repeats
+        let no_repeats = vec!["Read".to_string(), "Write".to_string(), "Bash".to_string()];
+        let normalized = engine.normalize_tool_sequence(&no_repeats);
+        assert_eq!(normalized, no_repeats);
+
+        // With repeats
+        let with_repeats = vec![
+            "Read".to_string(),
+            "Read".to_string(),
+            "Read".to_string(),
+            "Write".to_string(),
+            "Write".to_string(),
+            "Bash".to_string(),
+        ];
+        let normalized = engine.normalize_tool_sequence(&with_repeats);
+        assert_eq!(
+            normalized,
+            vec!["Read".to_string(), "Write".to_string(), "Bash".to_string()]
+        );
+
+        // Alternating (no collapse)
+        let alternating = vec![
+            "Read".to_string(),
+            "Write".to_string(),
+            "Read".to_string(),
+            "Write".to_string(),
+        ];
+        let normalized = engine.normalize_tool_sequence(&alternating);
+        assert_eq!(normalized, alternating);
+    }
+
+    #[test]
+    fn test_extract_tool_sequence_pattern() {
+        use crate::message::ToolCall;
+        use uuid::Uuid;
+
+        let engine = LearningEngine::new();
+
+        // Create messages with tool calls
+        let messages = vec![
+            Message {
+                id: 1,
+                agent_id: Uuid::new_v4(),
+                role: MessageRole::Assistant,
+                content: "Let me read the file".to_string(),
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "call1".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: "call2".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ]),
+                tool_results: None,
+                input_tokens: 100,
+                output_tokens: 50,
+                created_at: chrono::Utc::now(),
+            },
+            Message {
+                id: 2,
+                agent_id: Uuid::new_v4(),
+                role: MessageRole::Assistant,
+                content: "Now writing".to_string(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call3".to_string(),
+                    name: "Write".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                tool_results: None,
+                input_tokens: 100,
+                output_tokens: 50,
+                created_at: chrono::Utc::now(),
+            },
+        ];
+
+        let pattern =
+            engine.extract_tool_sequence_pattern(&messages, AgentType::StoryDeveloper, Some("test"));
+
+        assert!(pattern.is_some());
+        let p = pattern.unwrap();
+        assert_eq!(p.pattern_type, SuccessPatternType::ToolSequence);
+        assert_eq!(p.agent_type, Some(AgentType::StoryDeveloper));
+        assert_eq!(p.task_type, Some("test".to_string()));
+
+        // Check pattern data
+        let data = &p.pattern_data;
+        assert_eq!(data["total_calls"], 3);
+        assert_eq!(data["unique_tools"], 2);
+    }
+
+    #[test]
+    fn test_extract_context_size_pattern() {
+        use uuid::Uuid;
+
+        let engine = LearningEngine::new();
+
+        let messages = vec![
+            Message {
+                id: 1,
+                agent_id: Uuid::new_v4(),
+                role: MessageRole::User,
+                content: "Please do something".to_string(),
+                tool_calls: None,
+                tool_results: None,
+                input_tokens: 20,
+                output_tokens: 0,
+                created_at: chrono::Utc::now(),
+            },
+            Message {
+                id: 2,
+                agent_id: Uuid::new_v4(),
+                role: MessageRole::Assistant,
+                content: "Doing it now".to_string(),
+                tool_calls: None,
+                tool_results: None,
+                input_tokens: 100,
+                output_tokens: 50,
+                created_at: chrono::Utc::now(),
+            },
+            Message {
+                id: 3,
+                agent_id: Uuid::new_v4(),
+                role: MessageRole::User,
+                content: "Thanks".to_string(),
+                tool_calls: None,
+                tool_results: None,
+                input_tokens: 10,
+                output_tokens: 0,
+                created_at: chrono::Utc::now(),
+            },
+        ];
+
+        let pattern = engine.extract_context_size_pattern(
+            &messages,
+            AgentType::IssueFixer,
+            None,
+            Some(5000),
+        );
+
+        assert!(pattern.is_some());
+        let p = pattern.unwrap();
+        assert_eq!(p.pattern_type, SuccessPatternType::ContextSize);
+        assert_eq!(p.avg_token_usage, Some(5000));
+
+        let data = &p.pattern_data;
+        assert_eq!(data["message_count"], 3);
+        assert_eq!(data["assistant_messages"], 1);
+        assert_eq!(data["user_messages"], 2);
+    }
+
+    #[test]
+    fn test_extract_timing_pattern() {
+        let engine = LearningEngine::new();
+
+        // Fast completion
+        let pattern = engine.extract_timing_pattern(AgentType::CodeReviewer, Some("review"), Some(3000));
+        assert!(pattern.is_some());
+        let p = pattern.unwrap();
+        assert_eq!(p.pattern_type, SuccessPatternType::Timing);
+        assert_eq!(p.pattern_data["time_bucket"], "fast");
+        assert_eq!(p.avg_completion_time_ms, Some(3000));
+
+        // Medium completion
+        let pattern = engine.extract_timing_pattern(AgentType::CodeReviewer, None, Some(20000));
+        assert!(pattern.is_some());
+        assert_eq!(pattern.unwrap().pattern_data["time_bucket"], "medium");
+
+        // Slow completion
+        let pattern = engine.extract_timing_pattern(AgentType::CodeReviewer, None, Some(60000));
+        assert!(pattern.is_some());
+        assert_eq!(pattern.unwrap().pattern_data["time_bucket"], "slow");
+
+        // Very slow completion
+        let pattern = engine.extract_timing_pattern(AgentType::CodeReviewer, None, Some(180000));
+        assert!(pattern.is_some());
+        assert_eq!(pattern.unwrap().pattern_data["time_bucket"], "very_slow");
+
+        // No completion time
+        let pattern = engine.extract_timing_pattern(AgentType::CodeReviewer, None, None);
+        assert!(pattern.is_none());
+    }
+
+    #[test]
+    fn test_extract_prompt_structure_pattern() {
+        use uuid::Uuid;
+
+        let engine = LearningEngine::new();
+
+        // Test with examples and constraints
+        let messages = vec![Message {
+            id: 1,
+            agent_id: Uuid::new_v4(),
+            role: MessageRole::User,
+            content: "Please implement this feature. You must follow the existing patterns. For example, look at the other files. You should avoid changing the API.".to_string(),
+            tool_calls: None,
+            tool_results: None,
+            input_tokens: 50,
+            output_tokens: 0,
+            created_at: chrono::Utc::now(),
+        }];
+
+        let pattern = engine.extract_prompt_structure_pattern(
+            &messages,
+            AgentType::StoryDeveloper,
+            Some("feature"),
+        );
+
+        assert!(pattern.is_some());
+        let p = pattern.unwrap();
+        assert_eq!(p.pattern_type, SuccessPatternType::PromptStructure);
+        assert_eq!(p.pattern_data["has_examples"], true);
+        assert_eq!(p.pattern_data["has_constraints"], true);
+        assert_eq!(p.pattern_data["has_step_by_step"], false);
+        assert_eq!(p.pattern_data["has_context"], false);
+
+        // Test with no user message
+        let empty_messages: Vec<Message> = vec![];
+        let pattern = engine.extract_prompt_structure_pattern(
+            &empty_messages,
+            AgentType::StoryDeveloper,
+            None,
+        );
+        assert!(pattern.is_none());
+    }
+
+    #[test]
+    fn test_success_pattern_new() {
+        let pattern = SuccessPattern::new(
+            SuccessPatternType::ToolSequence,
+            "test_sig",
+            serde_json::json!({"key": "value"}),
+        );
+
+        assert_eq!(pattern.id, 0);
+        assert_eq!(pattern.pattern_type, SuccessPatternType::ToolSequence);
+        assert_eq!(pattern.agent_type, None);
+        assert_eq!(pattern.task_type, None);
+        assert_eq!(pattern.pattern_signature, "test_sig");
+        assert_eq!(pattern.occurrence_count, 1);
+        assert_eq!(pattern.success_rate, 1.0);
+        assert!(pattern.avg_completion_time_ms.is_none());
+        assert!(pattern.avg_token_usage.is_none());
+    }
+
+    #[test]
+    fn test_success_pattern_builder() {
+        use crate::AgentType;
+
+        let pattern = SuccessPattern::new(
+            SuccessPatternType::ContextSize,
+            "sig123",
+            serde_json::json!({}),
+        )
+        .with_agent_type(AgentType::IssueFixer)
+        .with_task_type(Some("bug_fix"))
+        .with_completion_time_ms(5000)
+        .with_token_usage(1000);
+
+        assert_eq!(pattern.agent_type, Some(AgentType::IssueFixer));
+        assert_eq!(pattern.task_type, Some("bug_fix".to_string()));
+        assert_eq!(pattern.avg_completion_time_ms, Some(5000));
+        assert_eq!(pattern.avg_token_usage, Some(1000));
+    }
+
+    #[test]
+    fn test_success_pattern_type_conversion() {
+        // Test as_str
+        assert_eq!(SuccessPatternType::ToolSequence.as_str(), "tool_sequence");
+        assert_eq!(
+            SuccessPatternType::PromptStructure.as_str(),
+            "prompt_structure"
+        );
+        assert_eq!(SuccessPatternType::ContextSize.as_str(), "context_size");
+        assert_eq!(SuccessPatternType::ModelChoice.as_str(), "model_choice");
+        assert_eq!(SuccessPatternType::Timing.as_str(), "timing");
+
+        // Test from_str
+        assert_eq!(
+            SuccessPatternType::from_str("tool_sequence").unwrap(),
+            SuccessPatternType::ToolSequence
+        );
+        assert_eq!(
+            SuccessPatternType::from_str("prompt_structure").unwrap(),
+            SuccessPatternType::PromptStructure
+        );
+        assert_eq!(
+            SuccessPatternType::from_str("context_size").unwrap(),
+            SuccessPatternType::ContextSize
+        );
+        assert_eq!(
+            SuccessPatternType::from_str("model_choice").unwrap(),
+            SuccessPatternType::ModelChoice
+        );
+        assert_eq!(
+            SuccessPatternType::from_str("timing").unwrap(),
+            SuccessPatternType::Timing
+        );
+
+        // Test invalid
+        assert!(SuccessPatternType::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_success_recommendations_default() {
+        let recommendations = SuccessRecommendations::default();
+
+        assert!(recommendations.recommended_tool_sequences.is_empty());
+        assert!(recommendations.avg_message_counts.is_empty());
+        assert!(recommendations.avg_completion_times.is_empty());
+        assert!(recommendations.successful_prompt_features.is_empty());
+        assert!(recommendations.recommended_message_count.is_none());
+        assert!(recommendations.expected_completion_time_ms.is_none());
     }
 }

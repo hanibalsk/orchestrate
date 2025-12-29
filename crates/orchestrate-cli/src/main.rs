@@ -410,6 +410,36 @@ enum LearnAction {
         /// Instruction ID or name
         id_or_name: String,
     },
+    /// List success patterns
+    Successes {
+        /// Filter by pattern type (tool_sequence, prompt_structure, context_size, model_choice, timing)
+        #[arg(short = 't', long)]
+        pattern_type: Option<String>,
+        /// Filter by agent type
+        #[arg(short = 'a', long)]
+        agent_type: Option<String>,
+        /// Show detailed pattern data
+        #[arg(long)]
+        detailed: bool,
+    },
+    /// Get success recommendations for an agent type
+    Recommend {
+        /// Agent type to get recommendations for
+        #[arg(short = 't', long)]
+        agent_type: String,
+        /// Task type to filter recommendations
+        #[arg(long)]
+        task_type: Option<String>,
+    },
+    /// Cleanup old success patterns
+    CleanupSuccesses {
+        /// Remove patterns older than this many days
+        #[arg(short, long, default_value = "90")]
+        days: i64,
+        /// Skip confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1490,6 +1520,131 @@ async fn main() -> Result<()> {
                     "Reset penalty for instruction: {} (ID: {})",
                     instruction.name, instruction.id
                 );
+            }
+            LearnAction::Successes {
+                pattern_type,
+                agent_type,
+                detailed,
+            } => {
+                use orchestrate_core::SuccessPatternType;
+
+                let type_filter = pattern_type
+                    .as_ref()
+                    .map(|t| SuccessPatternType::from_str(t))
+                    .transpose()?;
+
+                let patterns = db.list_success_patterns(type_filter).await?;
+
+                // Filter by agent type if specified
+                let patterns: Vec<_> = if let Some(ref at) = agent_type {
+                    let agent_type_filter = parse_agent_type(at)?;
+                    patterns
+                        .into_iter()
+                        .filter(|p| p.agent_type == Some(agent_type_filter))
+                        .collect()
+                } else {
+                    patterns
+                };
+
+                if patterns.is_empty() {
+                    println!("No success patterns found");
+                    return Ok(());
+                }
+
+                println!("Success Patterns");
+                println!("{}", "=".repeat(80));
+                println!(
+                    "{:<6} {:<18} {:<15} {:<10} {:<8} {:<8} {:<12}",
+                    "ID", "TYPE", "AGENT_TYPE", "TASK", "COUNT", "RATE", "AVG_TIME"
+                );
+                println!("{}", "-".repeat(80));
+
+                for pattern in &patterns {
+                    let task_type = pattern
+                        .task_type
+                        .as_ref()
+                        .map(|s| if s.len() > 10 { &s[..10] } else { s })
+                        .unwrap_or("-");
+                    let agent_type_str = pattern
+                        .agent_type
+                        .map(|t| t.as_str().to_string())
+                        .unwrap_or_else(|| "global".to_string());
+                    let avg_time = pattern
+                        .avg_completion_time_ms
+                        .map(|t| format!("{}ms", t))
+                        .unwrap_or_else(|| "-".to_string());
+
+                    println!(
+                        "{:<6} {:<18} {:<15} {:<10} {:<8} {:<8.2} {:<12}",
+                        pattern.id,
+                        pattern.pattern_type.as_str(),
+                        agent_type_str,
+                        task_type,
+                        pattern.occurrence_count,
+                        pattern.success_rate,
+                        avg_time
+                    );
+
+                    if detailed {
+                        println!("  Data: {}", serde_json::to_string(&pattern.pattern_data)?);
+                    }
+                }
+            }
+            LearnAction::Recommend {
+                agent_type,
+                task_type,
+            } => {
+                let agent_type_parsed = parse_agent_type(&agent_type)?;
+                let engine = LearningEngine::new();
+                let recommendations = engine
+                    .get_success_recommendations(&db, agent_type_parsed, task_type.as_deref())
+                    .await?;
+
+                println!("Success Recommendations for {}", agent_type);
+                println!("{}", "=".repeat(60));
+
+                if let Some(msg_count) = recommendations.recommended_message_count {
+                    println!("Recommended message count: {}", msg_count);
+                }
+                if let Some(time) = recommendations.expected_completion_time_ms {
+                    let seconds = time / 1000;
+                    if seconds > 60 {
+                        println!("Expected completion time: {}m {}s", seconds / 60, seconds % 60);
+                    } else {
+                        println!("Expected completion time: {}s", seconds);
+                    }
+                }
+
+                if !recommendations.successful_prompt_features.is_empty() {
+                    println!("\nSuccessful prompt features:");
+                    for feature in &recommendations.successful_prompt_features {
+                        println!("  - {}", feature);
+                    }
+                }
+
+                if !recommendations.recommended_tool_sequences.is_empty() {
+                    println!("\nCommon tool sequences:");
+                    for (i, seq) in recommendations.recommended_tool_sequences.iter().take(5).enumerate() {
+                        println!("  {}. {}", i + 1, seq.join(" → "));
+                    }
+                }
+            }
+            LearnAction::CleanupSuccesses { days, force } => {
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+                let cutoff_str = cutoff.to_rfc3339();
+
+                if !force {
+                    println!(
+                        "This will delete success patterns older than {} days with < 5 occurrences.",
+                        days
+                    );
+                    println!("Use --force to skip this confirmation.");
+                    // In a real CLI we'd prompt for confirmation here
+                    return Ok(());
+                }
+
+                let deleted = db.cleanup_old_success_patterns(&cutoff_str).await?;
+                println!("Deleted {} old success patterns", deleted);
             }
         },
 

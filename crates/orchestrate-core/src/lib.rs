@@ -55,7 +55,7 @@ pub use instruction::{
 };
 
 // Re-export learning types
-pub use learning::{CleanupResult, LearningEngine};
+pub use learning::{CleanupResult, LearningEngine, SuccessRecommendations};
 
 // Re-export network types
 pub use network::{

@@ -1665,18 +1665,23 @@ async fn run_schedule(
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
         .ok_or_else(|| ApiError::not_found("Schedule"))?;
 
-    let run = ScheduleRun::new(schedule.id, "manual");
+    let run = ScheduleRun::new(schedule.id);
     let run_id = state
         .db
         .insert_schedule_run(&run)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    let run = state
+    // Retrieve the created run from the list of runs
+    let runs = state
         .db
-        .get_schedule_run(run_id)
+        .get_schedule_runs(schedule.id, 1)
         .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let run = runs
+        .into_iter()
+        .find(|r| r.id == run_id)
         .ok_or_else(|| ApiError::internal("Failed to retrieve created run".to_string()))?;
 
     Ok(Json(run.into()))
@@ -1747,7 +1752,6 @@ struct ScheduleResponse {
     next_run_at: Option<String>,
     last_run_at: Option<String>,
     created_at: String,
-    updated_at: String,
 }
 
 impl From<Schedule> for ScheduleResponse {
@@ -1759,10 +1763,9 @@ impl From<Schedule> for ScheduleResponse {
             agent_type: schedule.agent_type,
             task: schedule.task,
             enabled: schedule.enabled,
-            next_run_at: schedule.next_run_at.map(|dt| dt.to_rfc3339()),
-            last_run_at: schedule.last_run_at.map(|dt| dt.to_rfc3339()),
+            next_run_at: schedule.next_run.map(|dt| dt.to_rfc3339()),
+            last_run_at: schedule.last_run.map(|dt| dt.to_rfc3339()),
             created_at: schedule.created_at.to_rfc3339(),
-            updated_at: schedule.updated_at.to_rfc3339(),
         }
     }
 }
@@ -1772,12 +1775,10 @@ struct ScheduleRunResponse {
     id: i64,
     schedule_id: i64,
     status: String,
-    trigger_type: String,
     agent_id: Option<String>,
     error_message: Option<String>,
-    started_at: Option<String>,
+    started_at: String,
     completed_at: Option<String>,
-    created_at: String,
 }
 
 impl From<ScheduleRun> for ScheduleRunResponse {
@@ -1786,12 +1787,10 @@ impl From<ScheduleRun> for ScheduleRunResponse {
             id: run.id,
             schedule_id: run.schedule_id,
             status: run.status.as_str().to_string(),
-            trigger_type: run.trigger_type,
-            agent_id: run.agent_id.map(|id| id.to_string()),
+            agent_id: run.agent_id,
             error_message: run.error_message,
-            started_at: run.started_at.map(|dt| dt.to_rfc3339()),
+            started_at: run.started_at.to_rfc3339(),
             completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
-            created_at: run.created_at.to_rfc3339(),
         }
     }
 }

@@ -540,8 +540,8 @@ impl SuccessPattern {
     }
 
     /// Set task type
-    pub fn with_task_type(mut self, task_type: impl Into<String>) -> Self {
-        self.task_type = Some(task_type.into());
+    pub fn with_task_type(mut self, task_type: Option<impl Into<String>>) -> Self {
+        self.task_type = task_type.map(|t| t.into());
         self
     }
 
