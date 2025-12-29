@@ -4,16 +4,15 @@
 //! detects recurring patterns (errors, tool usage, behaviors), and generates
 //! custom instructions to prevent future issues.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use sha2::{Sha256, Digest};
 use uuid::Uuid;
 
 use crate::{
-    AgentType, Database, Message, MessageRole, Result,
     instruction::{
-        CustomInstruction, LearningConfig, LearningPattern,
-        PatternStatus, PatternType, penalties,
+        penalties, CustomInstruction, LearningConfig, LearningPattern, PatternStatus, PatternType,
     },
+    AgentType, Database, Message, MessageRole, Result,
 };
 
 /// Learning engine for automatic pattern detection
@@ -57,19 +56,31 @@ impl LearningEngine {
         }
 
         // Detect error patterns
-        if self.config.enabled_pattern_types.contains(&PatternType::ErrorPattern) {
+        if self
+            .config
+            .enabled_pattern_types
+            .contains(&PatternType::ErrorPattern)
+        {
             let error_patterns = self.detect_error_patterns(messages, agent_type);
             patterns.extend(error_patterns);
         }
 
         // Detect tool usage patterns
-        if self.config.enabled_pattern_types.contains(&PatternType::ToolUsagePattern) {
+        if self
+            .config
+            .enabled_pattern_types
+            .contains(&PatternType::ToolUsagePattern)
+        {
             let tool_patterns = self.detect_tool_patterns(messages, agent_type);
             patterns.extend(tool_patterns);
         }
 
         // Detect behavior patterns
-        if self.config.enabled_pattern_types.contains(&PatternType::BehaviorPattern) {
+        if self
+            .config
+            .enabled_pattern_types
+            .contains(&PatternType::BehaviorPattern)
+        {
             let behavior_patterns = self.detect_behavior_patterns(messages, agent_type);
             patterns.extend(behavior_patterns);
         }
@@ -83,7 +94,11 @@ impl LearningEngine {
     }
 
     /// Detect error patterns from messages
-    fn detect_error_patterns(&self, messages: &[Message], agent_type: AgentType) -> Vec<LearningPattern> {
+    fn detect_error_patterns(
+        &self,
+        messages: &[Message],
+        agent_type: AgentType,
+    ) -> Vec<LearningPattern> {
         let mut patterns = Vec::new();
 
         for msg in messages {
@@ -91,7 +106,9 @@ impl LearningEngine {
             if let Some(ref results) = msg.tool_results {
                 for result in results {
                     if result.is_error {
-                        if let Some(pattern) = self.create_error_pattern(&result.content, agent_type) {
+                        if let Some(pattern) =
+                            self.create_error_pattern(&result.content, agent_type)
+                        {
                             patterns.push(pattern);
                         }
                     }
@@ -110,7 +127,11 @@ impl LearningEngine {
     }
 
     /// Create an error pattern from error text
-    fn create_error_pattern(&self, error_text: &str, agent_type: AgentType) -> Option<LearningPattern> {
+    fn create_error_pattern(
+        &self,
+        error_text: &str,
+        agent_type: AgentType,
+    ) -> Option<LearningPattern> {
         // Normalize error text for deduplication
         let normalized = self.normalize_error_text(error_text);
         if normalized.is_empty() {
@@ -126,12 +147,18 @@ impl LearningEngine {
             "category": self.categorize_error(&normalized),
         });
 
-        Some(LearningPattern::new(PatternType::ErrorPattern, signature, pattern_data)
-            .with_agent_type(agent_type))
+        Some(
+            LearningPattern::new(PatternType::ErrorPattern, signature, pattern_data)
+                .with_agent_type(agent_type),
+        )
     }
 
     /// Create a status pattern from blocked/failed status
-    fn create_status_pattern(&self, content: &str, agent_type: AgentType) -> Option<LearningPattern> {
+    fn create_status_pattern(
+        &self,
+        content: &str,
+        agent_type: AgentType,
+    ) -> Option<LearningPattern> {
         // Extract the reason for blocking
         let reason = if let Some(pos) = content.find("Reason:") {
             content[pos..].lines().next().unwrap_or("")
@@ -152,12 +179,18 @@ impl LearningEngine {
             "is_failed": content.contains("FAILED"),
         });
 
-        Some(LearningPattern::new(PatternType::ErrorPattern, signature, pattern_data)
-            .with_agent_type(agent_type))
+        Some(
+            LearningPattern::new(PatternType::ErrorPattern, signature, pattern_data)
+                .with_agent_type(agent_type),
+        )
     }
 
     /// Detect tool usage patterns
-    fn detect_tool_patterns(&self, messages: &[Message], agent_type: AgentType) -> Vec<LearningPattern> {
+    fn detect_tool_patterns(
+        &self,
+        messages: &[Message],
+        agent_type: AgentType,
+    ) -> Vec<LearningPattern> {
         let mut patterns = Vec::new();
         let mut tool_usage: HashMap<String, usize> = HashMap::new();
         let mut failed_tools: HashMap<String, usize> = HashMap::new();
@@ -175,7 +208,9 @@ impl LearningEngine {
                 for result in results {
                     if result.is_error {
                         // Try to find the tool name from previous messages
-                        if let Some(tool_name) = self.find_tool_name_for_call_id(messages, &result.tool_call_id) {
+                        if let Some(tool_name) =
+                            self.find_tool_name_for_call_id(messages, &result.tool_call_id)
+                        {
                             *failed_tools.entry(tool_name).or_insert(0) += 1;
                         }
                     }
@@ -194,8 +229,10 @@ impl LearningEngine {
                     "category": "excessive_retry",
                 });
 
-                patterns.push(LearningPattern::new(PatternType::ToolUsagePattern, signature, pattern_data)
-                    .with_agent_type(agent_type));
+                patterns.push(
+                    LearningPattern::new(PatternType::ToolUsagePattern, signature, pattern_data)
+                        .with_agent_type(agent_type),
+                );
             }
         }
 
@@ -217,17 +254,22 @@ impl LearningEngine {
     }
 
     /// Detect behavior patterns (clarification requests, retries, etc.)
-    fn detect_behavior_patterns(&self, messages: &[Message], agent_type: AgentType) -> Vec<LearningPattern> {
+    fn detect_behavior_patterns(
+        &self,
+        messages: &[Message],
+        agent_type: AgentType,
+    ) -> Vec<LearningPattern> {
         let mut patterns = Vec::new();
 
         // Count clarification patterns
-        let clarification_count = messages.iter()
+        let clarification_count = messages
+            .iter()
             .filter(|m| m.role == MessageRole::Assistant)
             .filter(|m| {
-                m.content.contains("Could you please clarify") ||
-                m.content.contains("I need more information") ||
-                m.content.contains("Can you provide more details") ||
-                m.content.contains("What do you mean by")
+                m.content.contains("Could you please clarify")
+                    || m.content.contains("I need more information")
+                    || m.content.contains("Can you provide more details")
+                    || m.content.contains("What do you mean by")
             })
             .count();
 
@@ -239,8 +281,10 @@ impl LearningEngine {
                 "category": "excessive_clarification",
             });
 
-            patterns.push(LearningPattern::new(PatternType::BehaviorPattern, signature, pattern_data)
-                .with_agent_type(agent_type));
+            patterns.push(
+                LearningPattern::new(PatternType::BehaviorPattern, signature, pattern_data)
+                    .with_agent_type(agent_type),
+            );
         }
 
         // Detect repetitive actions
@@ -257,7 +301,8 @@ impl LearningEngine {
         if action_sequence.len() >= 5 {
             for window in action_sequence.windows(5) {
                 if window.iter().all(|t| t == &window[0]) {
-                    let signature = self.create_signature(&format!("repetitive_{}", window[0]), "behavior");
+                    let signature =
+                        self.create_signature(&format!("repetitive_{}", window[0]), "behavior");
 
                     let pattern_data = serde_json::json!({
                         "tool_name": window[0],
@@ -265,8 +310,10 @@ impl LearningEngine {
                         "category": "repetitive_action",
                     });
 
-                    patterns.push(LearningPattern::new(PatternType::BehaviorPattern, signature, pattern_data)
-                        .with_agent_type(agent_type));
+                    patterns.push(
+                        LearningPattern::new(PatternType::BehaviorPattern, signature, pattern_data)
+                            .with_agent_type(agent_type),
+                    );
                     break;
                 }
             }
@@ -281,16 +328,19 @@ impl LearningEngine {
         let mut normalized = text.to_string();
 
         // Remove file paths
-        let path_re = regex::Regex::new(r"/[\w/.-]+").unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
+        let path_re =
+            regex::Regex::new(r"/[\w/.-]+").unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
         normalized = path_re.replace_all(&normalized, "<PATH>").to_string();
 
         // Remove line numbers
-        let line_re = regex::Regex::new(r":\d+:\d+").unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
+        let line_re =
+            regex::Regex::new(r":\d+:\d+").unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
         normalized = line_re.replace_all(&normalized, ":<LINE>").to_string();
 
         // Remove UUIDs
-        let uuid_re = regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-            .unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
+        let uuid_re =
+            regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+                .unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
         normalized = uuid_re.replace_all(&normalized, "<UUID>").to_string();
 
         // Remove timestamps
@@ -341,17 +391,14 @@ impl LearningEngine {
     }
 
     /// Generate an instruction from a pattern
-    pub fn generate_instruction_from_pattern(&self, pattern: &LearningPattern) -> Option<CustomInstruction> {
+    pub fn generate_instruction_from_pattern(
+        &self,
+        pattern: &LearningPattern,
+    ) -> Option<CustomInstruction> {
         let content = match pattern.pattern_type {
-            PatternType::ErrorPattern => {
-                self.generate_error_instruction(pattern)
-            }
-            PatternType::ToolUsagePattern => {
-                self.generate_tool_instruction(pattern)
-            }
-            PatternType::BehaviorPattern => {
-                self.generate_behavior_instruction(pattern)
-            }
+            PatternType::ErrorPattern => self.generate_error_instruction(pattern),
+            PatternType::ToolUsagePattern => self.generate_tool_instruction(pattern),
+            PatternType::BehaviorPattern => self.generate_behavior_instruction(pattern),
         };
 
         content.map(|c| {
@@ -369,11 +416,15 @@ impl LearningEngine {
 
     /// Generate instruction content for error pattern
     fn generate_error_instruction(&self, pattern: &LearningPattern) -> Option<String> {
-        let category = pattern.pattern_data.get("category")
+        let category = pattern
+            .pattern_data
+            .get("category")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let error_text = pattern.pattern_data.get("error_text")
+        let error_text = pattern
+            .pattern_data
+            .get("error_text")
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
@@ -392,13 +443,22 @@ impl LearningEngine {
                 format!("IMPORTANT: Set appropriate timeouts and handle timeout errors gracefully. Pattern observed: '{}'", error_text)
             }
             "network_error" => {
-                format!("IMPORTANT: Handle network errors with retries and fallbacks. Pattern: '{}'", error_text)
+                format!(
+                    "IMPORTANT: Handle network errors with retries and fallbacks. Pattern: '{}'",
+                    error_text
+                )
             }
             "command_error" => {
-                format!("IMPORTANT: Verify command availability before execution. Error seen: '{}'", error_text)
+                format!(
+                    "IMPORTANT: Verify command availability before execution. Error seen: '{}'",
+                    error_text
+                )
             }
             _ => {
-                format!("IMPORTANT: Avoid this recurring error pattern: '{}'", error_text)
+                format!(
+                    "IMPORTANT: Avoid this recurring error pattern: '{}'",
+                    error_text
+                )
             }
         };
 
@@ -407,10 +467,14 @@ impl LearningEngine {
 
     /// Generate instruction content for tool usage pattern
     fn generate_tool_instruction(&self, pattern: &LearningPattern) -> Option<String> {
-        let tool_name = pattern.pattern_data.get("tool_name")
+        let tool_name = pattern
+            .pattern_data
+            .get("tool_name")
             .and_then(|v| v.as_str())?;
 
-        let category = pattern.pattern_data.get("category")
+        let category = pattern
+            .pattern_data
+            .get("category")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
@@ -428,7 +492,9 @@ impl LearningEngine {
 
     /// Generate instruction content for behavior pattern
     fn generate_behavior_instruction(&self, pattern: &LearningPattern) -> Option<String> {
-        let category = pattern.pattern_data.get("category")
+        let category = pattern
+            .pattern_data
+            .get("category")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
@@ -457,9 +523,9 @@ impl LearningEngine {
 
         // Adjust based on pattern type
         let type_modifier = match pattern.pattern_type {
-            PatternType::ErrorPattern => 0.3,      // Errors are reliable signals
-            PatternType::ToolUsagePattern => 0.2,  // Tool patterns are somewhat reliable
-            PatternType::BehaviorPattern => 0.1,   // Behavior patterns need more validation
+            PatternType::ErrorPattern => 0.3,     // Errors are reliable signals
+            PatternType::ToolUsagePattern => 0.2, // Tool patterns are somewhat reliable
+            PatternType::BehaviorPattern => 0.1,  // Behavior patterns need more validation
         };
 
         (base + type_modifier).min(0.9) // Cap at 0.9, never fully confident for learned
@@ -471,7 +537,9 @@ impl LearningEngine {
         let mut created_instructions = Vec::new();
 
         // Get patterns ready for instruction generation
-        let patterns = db.get_patterns_for_review(self.config.min_occurrences).await?;
+        let patterns = db
+            .get_patterns_for_review(self.config.min_occurrences)
+            .await?;
 
         for pattern in patterns {
             // Skip patterns that already have instructions
@@ -496,7 +564,8 @@ impl LearningEngine {
                 instruction.id = instruction_id;
 
                 // Update pattern status
-                db.update_pattern_status(pattern.id, status, Some(instruction_id)).await?;
+                db.update_pattern_status(pattern.id, status, Some(instruction_id))
+                    .await?;
 
                 created_instructions.push(instruction);
             }
@@ -509,7 +578,9 @@ impl LearningEngine {
     #[tracing::instrument(skip(self, db), level = "debug")]
     pub async fn cleanup(&self, db: &Database) -> Result<CleanupResult> {
         // Auto-disable high-penalty instructions
-        let disabled = db.auto_disable_penalized(self.config.penalty_disable_threshold).await?;
+        let disabled = db
+            .auto_disable_penalized(self.config.penalty_disable_threshold)
+            .await?;
 
         // Delete ineffective learned instructions
         let deleted = db.delete_ineffective_instructions().await?;
@@ -535,10 +606,12 @@ impl LearningEngine {
                 db.decay_penalty(id, penalties::DECAY_ON_SUCCESS).await?;
             } else if was_blocked {
                 // Higher penalty for blocked
-                db.apply_penalty(id, penalties::BLOCKED, "agent_blocked").await?;
+                db.apply_penalty(id, penalties::BLOCKED, "agent_blocked")
+                    .await?;
             } else {
                 // Standard failure penalty
-                db.apply_penalty(id, penalties::FAILURE, "agent_failed").await?;
+                db.apply_penalty(id, penalties::FAILURE, "agent_failed")
+                    .await?;
             }
         }
 
@@ -593,17 +666,38 @@ mod tests {
     fn test_categorize_error() {
         let engine = LearningEngine::new();
 
-        assert_eq!(engine.categorize_error("Permission denied"), "permission_error");
+        assert_eq!(
+            engine.categorize_error("Permission denied"),
+            "permission_error"
+        );
         assert_eq!(engine.categorize_error("File not found"), "not_found_error");
-        assert_eq!(engine.categorize_error("Connection timeout"), "timeout_error");
-        assert_eq!(engine.categorize_error("Network error occurred"), "network_error");
-        assert_eq!(engine.categorize_error("Syntax error in code"), "syntax_error");
+        assert_eq!(
+            engine.categorize_error("Connection timeout"),
+            "timeout_error"
+        );
+        assert_eq!(
+            engine.categorize_error("Network error occurred"),
+            "network_error"
+        );
+        assert_eq!(
+            engine.categorize_error("Syntax error in code"),
+            "syntax_error"
+        );
         // Note: "Command not found" also contains "not found", but the check order matters
         // In the actual implementation, "not found" is checked before "command not found"
         // so "Command not found: xyz" returns "not_found_error"
-        assert_eq!(engine.categorize_error("Command not found: xyz"), "not_found_error");
-        assert_eq!(engine.categorize_error("unknown command: foo"), "command_error");
-        assert_eq!(engine.categorize_error("Some random error"), "unknown_error");
+        assert_eq!(
+            engine.categorize_error("Command not found: xyz"),
+            "not_found_error"
+        );
+        assert_eq!(
+            engine.categorize_error("unknown command: foo"),
+            "command_error"
+        );
+        assert_eq!(
+            engine.categorize_error("Some random error"),
+            "unknown_error"
+        );
     }
 
     #[test]
@@ -627,21 +721,15 @@ mod tests {
         let engine = LearningEngine::new();
 
         // Low occurrence count
-        let pattern1 = LearningPattern::new(
-            PatternType::ErrorPattern,
-            "sig1",
-            serde_json::json!({}),
-        );
+        let pattern1 =
+            LearningPattern::new(PatternType::ErrorPattern, "sig1", serde_json::json!({}));
         let conf1 = engine.calculate_confidence(&pattern1);
         assert!(conf1 > 0.0);
         assert!(conf1 < 0.5);
 
         // High occurrence count
-        let mut pattern2 = LearningPattern::new(
-            PatternType::ErrorPattern,
-            "sig2",
-            serde_json::json!({}),
-        );
+        let mut pattern2 =
+            LearningPattern::new(PatternType::ErrorPattern, "sig2", serde_json::json!({}));
         pattern2.occurrence_count = 100;
         let conf2 = engine.calculate_confidence(&pattern2);
         assert!(conf2 > conf1);
@@ -677,6 +765,8 @@ mod tests {
         assert_eq!(config.min_occurrences, 3);
         assert_eq!(config.auto_approve_threshold, 0.9);
         assert!(!config.auto_enable);
-        assert!(config.enabled_pattern_types.contains(&PatternType::ErrorPattern));
+        assert!(config
+            .enabled_pattern_types
+            .contains(&PatternType::ErrorPattern));
     }
 }

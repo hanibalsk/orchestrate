@@ -182,8 +182,14 @@ mod tests {
     #[test]
     fn test_message_role_from_str() {
         assert_eq!(MessageRole::from_str("user").unwrap(), MessageRole::User);
-        assert_eq!(MessageRole::from_str("assistant").unwrap(), MessageRole::Assistant);
-        assert_eq!(MessageRole::from_str("system").unwrap(), MessageRole::System);
+        assert_eq!(
+            MessageRole::from_str("assistant").unwrap(),
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            MessageRole::from_str("system").unwrap(),
+            MessageRole::System
+        );
         assert_eq!(MessageRole::from_str("tool").unwrap(), MessageRole::Tool);
         assert!(MessageRole::from_str("invalid").is_err());
     }
@@ -252,16 +258,14 @@ mod tests {
     #[test]
     fn test_message_with_tool_calls() {
         let agent_id = Uuid::new_v4();
-        let tool_calls = vec![
-            ToolCall {
-                id: "call_123".to_string(),
-                name: "Read".to_string(),
-                input: serde_json::json!({"file_path": "/tmp/test.txt"}),
-            },
-        ];
+        let tool_calls = vec![ToolCall {
+            id: "call_123".to_string(),
+            name: "Read".to_string(),
+            input: serde_json::json!({"file_path": "/tmp/test.txt"}),
+        }];
 
-        let msg = Message::assistant(agent_id, "Let me read that file.")
-            .with_tool_calls(tool_calls);
+        let msg =
+            Message::assistant(agent_id, "Let me read that file.").with_tool_calls(tool_calls);
 
         assert!(msg.tool_calls.is_some());
         let calls = msg.tool_calls.unwrap();
@@ -272,8 +276,7 @@ mod tests {
     #[test]
     fn test_message_with_tokens() {
         let agent_id = Uuid::new_v4();
-        let msg = Message::assistant(agent_id, "Response")
-            .with_tokens(100, 50);
+        let msg = Message::assistant(agent_id, "Response").with_tokens(100, 50);
 
         assert_eq!(msg.input_tokens, 100);
         assert_eq!(msg.output_tokens, 50);

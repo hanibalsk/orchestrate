@@ -113,11 +113,11 @@ impl AgentLoop {
 
             // Record instruction usage
             for inst in &insts {
-                if let Err(e) = self.db.record_instruction_usage(
-                    inst.id,
-                    agent.id,
-                    agent.session_id.as_deref(),
-                ).await {
+                if let Err(e) = self
+                    .db
+                    .record_instruction_usage(inst.id, agent.id, agent.session_id.as_deref())
+                    .await
+                {
                     warn!("Failed to record instruction usage: {}", e);
                 }
             }
@@ -127,7 +127,11 @@ impl AgentLoop {
             (Vec::new(), Vec::new())
         };
 
-        debug!("Loaded {} custom instructions for agent {}", instructions.len(), agent.id);
+        debug!(
+            "Loaded {} custom instructions for agent {}",
+            instructions.len(),
+            agent.id
+        );
 
         // Load message history
         let mut messages = self.db.get_messages(agent.id).await?;
@@ -145,9 +149,9 @@ impl AgentLoop {
 
         let mut turn = 0;
         let mut was_blocked = false;
-        let mut idle_turns = 0;  // Turns without tool calls or status signal
-        let mut consecutive_errors = 0;  // Consecutive API or tool errors
-        let mut last_tool_error: Option<String> = None;  // Track repeated errors
+        let mut idle_turns = 0; // Turns without tool calls or status signal
+        let mut consecutive_errors = 0; // Consecutive API or tool errors
+        let mut last_tool_error: Option<String> = None; // Track repeated errors
         let mut total_input_tokens = 0i64;
         let mut total_output_tokens = 0i64;
         let mut total_cache_read_tokens = 0i64;
@@ -169,7 +173,9 @@ impl AgentLoop {
 
         info!(
             "[AGENT {}] Starting loop | Type: {:?} | Max turns: {} | Task: {}",
-            agent.id, agent.agent_type, self.config.max_turns,
+            agent.id,
+            agent.agent_type,
+            self.config.max_turns,
             agent.task.chars().take(100).collect::<String>()
         );
 
@@ -179,9 +185,13 @@ impl AgentLoop {
 
             info!(
                 "[AGENT {}] Turn {}/{} | Idle: {}/{} | Errors: {}/{} | Messages: {}",
-                agent.id, turn, self.config.max_turns,
-                idle_turns, self.config.max_idle_turns,
-                consecutive_errors, self.config.max_consecutive_errors,
+                agent.id,
+                turn,
+                self.config.max_turns,
+                idle_turns,
+                self.config.max_idle_turns,
+                consecutive_errors,
+                self.config.max_consecutive_errors,
                 messages.len()
             );
 
@@ -194,7 +204,10 @@ impl AgentLoop {
                 error!(
                     "[AGENT {}] Last message: {}",
                     agent.id,
-                    messages.last().map(|m| m.content.chars().take(200).collect::<String>()).unwrap_or_default()
+                    messages
+                        .last()
+                        .map(|m| m.content.chars().take(200).collect::<String>())
+                        .unwrap_or_default()
                 );
                 agent.fail("Max turns reached - agent may be stuck in a loop")?;
                 break;
@@ -209,7 +222,10 @@ impl AgentLoop {
                 error!(
                     "[AGENT {}] Last response: {}",
                     agent.id,
-                    messages.last().map(|m| m.content.chars().take(500).collect::<String>()).unwrap_or_default()
+                    messages
+                        .last()
+                        .map(|m| m.content.chars().take(500).collect::<String>())
+                        .unwrap_or_default()
                 );
                 agent.fail(&format!(
                     "Agent stuck: {} turns without progress. Last response had no tool calls or status signals.",
@@ -253,7 +269,10 @@ impl AgentLoop {
 
                 debug!(
                     "[AGENT {}] Windowed messages: {} -> {} (summarized: {})",
-                    agent.id, windowed.original_count, windowed.messages.len(), windowed.summarized_count
+                    agent.id,
+                    windowed.original_count,
+                    windowed.messages.len(),
+                    windowed.summarized_count
                 );
 
                 (msgs, Some(windowed))
@@ -264,7 +283,8 @@ impl AgentLoop {
             // Calculate dynamic max_tokens based on context usage
             let estimated_context = self.token_estimator.estimate_messages(&messages);
             let max_tokens = if self.config.enable_token_optimization {
-                self.context_manager.calculate_output_tokens(estimated_context) as u32
+                self.context_manager
+                    .calculate_output_tokens(estimated_context) as u32
             } else {
                 4096
             };
@@ -274,7 +294,8 @@ impl AgentLoop {
             let tools = self.tool_executor.get_tool_definitions(&agent.agent_type);
 
             // Build request - use caching if client supports it
-            let request = if self.client.caching_enabled() && self.config.enable_token_optimization {
+            let request = if self.client.caching_enabled() && self.config.enable_token_optimization
+            {
                 CreateMessageRequest::new(self.config.model.clone(), max_tokens, api_messages)
                     .with_cached_system(&base_prompt, Some(&dynamic_suffix))
                     .with_tools(tools)
@@ -292,7 +313,7 @@ impl AgentLoop {
             // Call Claude API with error handling
             let response = match self.client.create_message(request).await {
                 Ok(resp) => {
-                    consecutive_errors = 0;  // Reset on success
+                    consecutive_errors = 0; // Reset on success
                     resp
                 }
                 Err(e) => {
@@ -302,7 +323,7 @@ impl AgentLoop {
                         "[AGENT {}] API error (attempt {}/{}): {}",
                         agent.id, consecutive_errors, self.config.max_consecutive_errors, e
                     );
-                    continue;  // Retry
+                    continue; // Retry
                 }
             };
 
@@ -313,7 +334,9 @@ impl AgentLoop {
             total_cache_write_tokens += response.usage.cache_creation_input_tokens as i64;
 
             // Log cache efficiency
-            if response.usage.cache_read_input_tokens > 0 || response.usage.cache_creation_input_tokens > 0 {
+            if response.usage.cache_read_input_tokens > 0
+                || response.usage.cache_creation_input_tokens > 0
+            {
                 debug!(
                     "[AGENT {}] Cache stats: read={} write={} hit_rate={:.1}%",
                     agent.id,
@@ -331,30 +354,38 @@ impl AgentLoop {
                     (messages.len() as i32, 0)
                 };
 
-                if let Err(e) = self.db.record_session_tokens(
-                    sid,
-                    agent.id,
-                    turn as i32,
-                    response.usage.input_tokens as i64,
-                    response.usage.output_tokens as i64,
-                    response.usage.cache_read_input_tokens as i64,
-                    response.usage.cache_creation_input_tokens as i64,
-                    estimated_context as i64,
-                    msgs_included,
-                    msgs_summarized,
-                ).await {
+                if let Err(e) = self
+                    .db
+                    .record_session_tokens(
+                        sid,
+                        agent.id,
+                        turn as i32,
+                        response.usage.input_tokens as i64,
+                        response.usage.output_tokens as i64,
+                        response.usage.cache_read_input_tokens as i64,
+                        response.usage.cache_creation_input_tokens as i64,
+                        estimated_context as i64,
+                        msgs_included,
+                        msgs_summarized,
+                    )
+                    .await
+                {
                     warn!("Failed to record session tokens: {}", e);
                 }
             }
 
             // Update daily token usage
-            if let Err(e) = self.db.update_daily_token_usage(
-                &self.config.model,
-                response.usage.input_tokens as i64,
-                response.usage.output_tokens as i64,
-                response.usage.cache_read_input_tokens as i64,
-                response.usage.cache_creation_input_tokens as i64,
-            ).await {
+            if let Err(e) = self
+                .db
+                .update_daily_token_usage(
+                    &self.config.model,
+                    response.usage.input_tokens as i64,
+                    response.usage.output_tokens as i64,
+                    response.usage.cache_read_input_tokens as i64,
+                    response.usage.cache_creation_input_tokens as i64,
+                )
+                .await
+            {
                 warn!("Failed to update daily token usage: {}", e);
             }
 
@@ -379,7 +410,10 @@ impl AgentLoop {
 
             debug!(
                 "[AGENT {}] Response: {} chars, {} tool calls, stop_reason: {:?}",
-                agent.id, text_content.len(), tool_calls.len(), response.stop_reason
+                agent.id,
+                text_content.len(),
+                tool_calls.len(),
+                response.stop_reason
             );
 
             // Store assistant message
@@ -424,15 +458,20 @@ impl AgentLoop {
 
             // Execute tool calls if any
             if !tool_calls.is_empty() {
-                idle_turns = 0;  // Reset idle counter - we're making progress
+                idle_turns = 0; // Reset idle counter - we're making progress
                 let mut results = Vec::new();
                 let mut had_error = false;
 
                 for tool_call in &tool_calls {
                     debug!(
                         "[AGENT {}] Executing tool: {} with input: {}",
-                        agent.id, tool_call.name,
-                        serde_json::to_string(&tool_call.input).unwrap_or_default().chars().take(200).collect::<String>()
+                        agent.id,
+                        tool_call.name,
+                        serde_json::to_string(&tool_call.input)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
                     );
 
                     let result = self
@@ -446,13 +485,16 @@ impl AgentLoop {
                         last_tool_error = Some(result.clone());
                         warn!(
                             "[AGENT {}] Tool '{}' error: {}",
-                            agent.id, tool_call.name,
+                            agent.id,
+                            tool_call.name,
                             result.chars().take(200).collect::<String>()
                         );
                     } else {
                         debug!(
                             "[AGENT {}] Tool '{}' success: {} chars",
-                            agent.id, tool_call.name, result.len()
+                            agent.id,
+                            tool_call.name,
+                            result.len()
                         );
                     }
 
@@ -512,7 +554,11 @@ impl AgentLoop {
             }
 
             // Update session total tokens
-            if let Err(e) = self.db.update_session_tokens(sid, (total_input_tokens + total_output_tokens) as i64).await {
+            if let Err(e) = self
+                .db
+                .update_session_tokens(sid, (total_input_tokens + total_output_tokens) as i64)
+                .await
+            {
                 warn!("Failed to update session tokens: {}", e);
             }
         }
@@ -524,29 +570,36 @@ impl AgentLoop {
         if self.config.enable_instructions && !instruction_ids.is_empty() {
             // Record outcomes for each instruction
             for &id in &instruction_ids {
-                if let Err(e) = self.db.record_instruction_outcome(id, success, Some(completion_time)).await {
+                if let Err(e) = self
+                    .db
+                    .record_instruction_outcome(id, success, Some(completion_time))
+                    .await
+                {
                     warn!("Failed to record instruction outcome: {}", e);
                 }
 
                 // Track tokens per instruction
-                if let Err(e) = self.db.update_instruction_tokens(
-                    id,
-                    total_input_tokens,
-                    total_output_tokens,
-                    total_cache_read_tokens,
-                    total_cache_write_tokens,
-                ).await {
+                if let Err(e) = self
+                    .db
+                    .update_instruction_tokens(
+                        id,
+                        total_input_tokens,
+                        total_output_tokens,
+                        total_cache_read_tokens,
+                        total_cache_write_tokens,
+                    )
+                    .await
+                {
                     warn!("Failed to update instruction tokens: {}", e);
                 }
             }
 
             // Apply penalties/decay based on outcome
-            if let Err(e) = self.learning_engine.apply_outcome_penalties(
-                &self.db,
-                &instruction_ids,
-                success,
-                was_blocked,
-            ).await {
+            if let Err(e) = self
+                .learning_engine
+                .apply_outcome_penalties(&self.db, &instruction_ids, success, was_blocked)
+                .await
+            {
                 warn!("Failed to apply outcome penalties: {}", e);
             }
         }
@@ -556,13 +609,11 @@ impl AgentLoop {
             // Reload messages for analysis
             let all_messages = self.db.get_messages(agent.id).await?;
 
-            if let Err(e) = self.learning_engine.analyze_agent_run(
-                &self.db,
-                agent.id,
-                agent.agent_type,
-                &all_messages,
-                success,
-            ).await {
+            if let Err(e) = self
+                .learning_engine
+                .analyze_agent_run(&self.db, agent.id, agent.agent_type, &all_messages, success)
+                .await
+            {
                 warn!("Failed to analyze agent run for learning: {}", e);
             }
         }
@@ -579,7 +630,7 @@ impl AgentLoop {
                     orchestrate_core::message::MessageRole::User => "user",
                     orchestrate_core::message::MessageRole::Assistant => "assistant",
                     orchestrate_core::message::MessageRole::System => "user", // System messages as user
-                    orchestrate_core::message::MessageRole::Tool => "user",   // Tool results as user
+                    orchestrate_core::message::MessageRole::Tool => "user", // Tool results as user
                 };
 
                 let content = if let Some(tool_results) = &msg.tool_results {
@@ -606,6 +657,7 @@ impl AgentLoop {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn get_system_prompt(&self, agent: &Agent) -> String {
         let (base, suffix) = self.get_system_prompt_parts(agent, &[]);
         if suffix.is_empty() {
@@ -619,7 +671,11 @@ impl AgentLoop {
     ///
     /// The base prompt (agent identity, tools, status signals) is static and cacheable.
     /// The suffix (current task, custom instructions) changes per run.
-    fn get_system_prompt_parts(&self, agent: &Agent, instructions: &[CustomInstruction]) -> (String, String) {
+    fn get_system_prompt_parts(
+        &self,
+        agent: &Agent,
+        instructions: &[CustomInstruction],
+    ) -> (String, String) {
         // Try to load agent prompt from .claude/agents/ file
         let agent_prompt = self.load_agent_prompt(&agent.agent_type);
 

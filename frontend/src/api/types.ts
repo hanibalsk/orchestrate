@@ -1,10 +1,20 @@
 // Agent types matching Rust API
 export type AgentType =
+  // Development agents
   | 'story_developer'
   | 'code_reviewer'
   | 'issue_fixer'
   | 'explorer'
-  | 'pr_shepherd';
+  // BMAD agents
+  | 'bmad_orchestrator'
+  | 'bmad_planner'
+  // PR management
+  | 'pr_shepherd'
+  | 'pr_controller'
+  | 'conflict_resolver'
+  // System agents
+  | 'background_controller'
+  | 'scheduler';
 
 export type AgentState =
   | 'created'

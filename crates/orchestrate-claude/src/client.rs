@@ -96,7 +96,7 @@ impl Default for ClaudeClientConfig {
             base_url: "https://api.anthropic.com/v1".to_string(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             connect_timeout_secs: 30,
-            enable_caching: true,  // Enabled by default for cost savings
+            enable_caching: true, // Enabled by default for cost savings
         }
     }
 }
@@ -217,7 +217,11 @@ pub struct Tool {
 
 impl Tool {
     /// Create a new tool
-    pub fn new(name: impl Into<String>, description: impl Into<String>, input_schema: serde_json::Value) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -271,9 +275,10 @@ impl Usage {
     /// Calculate effective input tokens (accounting for cache savings)
     /// Cached tokens cost 90% less, so effective = regular + (cached * 0.1)
     pub fn effective_input_tokens(&self) -> f64 {
-        let regular = self.input_tokens - self.cache_read_input_tokens - self.cache_creation_input_tokens;
-        let cache_read = self.cache_read_input_tokens as f64 * 0.1;  // 90% discount
-        let cache_write = self.cache_creation_input_tokens as f64 * 1.25;  // 25% premium for writing
+        let regular =
+            self.input_tokens - self.cache_read_input_tokens - self.cache_creation_input_tokens;
+        let cache_read = self.cache_read_input_tokens as f64 * 0.1; // 90% discount
+        let cache_write = self.cache_creation_input_tokens as f64 * 1.25; // 25% premium for writing
         regular as f64 + cache_read + cache_write
     }
 
@@ -330,8 +335,10 @@ impl ClaudeCliClient {
         // Build command
         let mut cmd = Command::new("claude");
         cmd.arg("-p")
-            .arg("--output-format").arg("json")
-            .arg("--model").arg(&self.model);
+            .arg("--output-format")
+            .arg("json")
+            .arg("--model")
+            .arg(&self.model);
 
         // Add system prompt if present
         if let Some(ref system) = request.system {
@@ -342,9 +349,7 @@ impl ClaudeCliClient {
 
         // Add tools if present
         if let Some(ref tools) = request.tools {
-            let tool_names: Vec<&str> = tools.iter()
-                .map(|t| t.name.as_str())
-                .collect();
+            let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
             if !tool_names.is_empty() {
                 // Map our tool names to Claude CLI tool names
                 let cli_tools = self.map_tools_to_cli(&tool_names);
@@ -417,8 +422,9 @@ impl ClaudeCliClient {
 
     /// Map our tool names to Claude CLI tool names
     fn map_tools_to_cli(&self, tools: &[&str]) -> Vec<String> {
-        tools.iter().filter_map(|t| {
-            match *t {
+        tools
+            .iter()
+            .filter_map(|t| match *t {
                 "bash" => Some("Bash".to_string()),
                 "read" => Some("Read".to_string()),
                 "write" => Some("Write".to_string()),
@@ -427,8 +433,8 @@ impl ClaudeCliClient {
                 "grep" => Some("Grep".to_string()),
                 "task" => Some("Task".to_string()),
                 _ => None,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Parse CLI JSON response into MessageResponse
@@ -436,6 +442,7 @@ impl ClaudeCliClient {
         #[derive(Deserialize)]
         struct CliResponse {
             #[serde(rename = "type")]
+            #[allow(dead_code)]
             response_type: String,
             result: Option<String>,
             is_error: bool,
@@ -461,12 +468,15 @@ impl ClaudeCliClient {
         }
 
         let content = cli_resp.result.unwrap_or_default();
-        let usage = cli_resp.usage.map(|u| Usage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cache_read_input_tokens: u.cache_read_input_tokens,
-            cache_creation_input_tokens: u.cache_creation_input_tokens,
-        }).unwrap_or_default();
+        let usage = cli_resp
+            .usage
+            .map(|u| Usage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_read_input_tokens: u.cache_read_input_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens,
+            })
+            .unwrap_or_default();
 
         Ok(MessageResponse {
             id: cli_resp.session_id,

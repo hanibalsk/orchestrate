@@ -54,7 +54,9 @@ impl StateTransition {
 
     /// Check if this transition can be taken given current dependency states
     pub fn can_take(&self, dependency_states: &HashMap<AgentId, (AgentType, AgentState)>) -> bool {
-        self.requires.iter().all(|cond| cond.is_satisfied(dependency_states))
+        self.requires
+            .iter()
+            .all(|cond| cond.is_satisfied(dependency_states))
     }
 }
 
@@ -135,7 +137,10 @@ impl StateGraph {
 
     /// Get all possible transitions from a state
     pub fn transitions_from(&self, state: AgentState) -> &[StateTransition] {
-        self.transitions.get(&state).map(|v| v.as_slice()).unwrap_or(&[])
+        self.transitions
+            .get(&state)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Find a valid transition from one state to another

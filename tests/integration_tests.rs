@@ -2,17 +2,17 @@
 //!
 //! These tests verify end-to-end behavior across multiple crates
 
-use orchestrate_core::{
-    Agent, AgentContext, AgentState, AgentType, Database, Epic,
-    Message, PrStatus, PullRequest, MergeStrategy,
-    network::{AgentId, StepOutput, StepOutputType},
-};
-use orchestrate_web::api::{AppState, create_api_router};
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
 use http_body_util::BodyExt;
+use orchestrate_core::{
+    network::{AgentId, StepOutput, StepOutputType},
+    Agent, AgentContext, AgentState, AgentType, Database, Epic, MergeStrategy, Message, PrStatus,
+    PullRequest,
+};
+use orchestrate_web::api::{create_api_router, AppState};
 use std::sync::Arc;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -78,14 +78,16 @@ mod database {
             ..Default::default()
         };
 
-        let agent = Agent::new(AgentType::CodeReviewer, "Review PR #42")
-            .with_context(context);
+        let agent = Agent::new(AgentType::CodeReviewer, "Review PR #42").with_context(context);
 
         db.insert_agent(&agent).await.unwrap();
 
         let fetched = db.get_agent(agent.id).await.unwrap().unwrap();
         assert_eq!(fetched.context.pr_number, Some(42));
-        assert_eq!(fetched.context.branch_name, Some("feature/auth".to_string()));
+        assert_eq!(
+            fetched.context.branch_name,
+            Some("feature/auth".to_string())
+        );
     }
 
     #[tokio::test]
@@ -97,8 +99,7 @@ mod database {
         db.insert_agent(&parent).await.unwrap();
 
         // Create child agent
-        let child = Agent::new(AgentType::StoryDeveloper, "Develop story 1")
-            .with_parent(parent.id);
+        let child = Agent::new(AgentType::StoryDeveloper, "Develop story 1").with_parent(parent.id);
         db.insert_agent(&child).await.unwrap();
 
         let fetched_child = db.get_agent(child.id).await.unwrap().unwrap();
@@ -143,12 +144,18 @@ mod database {
 
         // First update should succeed
         agent.transition_to(AgentState::Initializing).unwrap();
-        let updated = db.update_agent_with_version(&agent, &original_updated_at).await.unwrap();
+        let updated = db
+            .update_agent_with_version(&agent, &original_updated_at)
+            .await
+            .unwrap();
         assert!(updated);
 
         // Second update with same version should fail
         agent.transition_to(AgentState::Running).unwrap();
-        let updated = db.update_agent_with_version(&agent, &original_updated_at).await.unwrap();
+        let updated = db
+            .update_agent_with_version(&agent, &original_updated_at)
+            .await
+            .unwrap();
         assert!(!updated);
     }
 
@@ -161,8 +168,8 @@ mod database {
 
         // Insert messages
         let user_msg = Message::user(agent.id, "Please implement the login form");
-        let assistant_msg = Message::assistant(agent.id, "I'll implement the login form now.")
-            .with_tokens(100, 50);
+        let assistant_msg =
+            Message::assistant(agent.id, "I'll implement the login form now.").with_tokens(100, 50);
 
         db.insert_message(&user_msg).await.unwrap();
         db.insert_message(&assistant_msg).await.unwrap();
@@ -247,7 +254,8 @@ mod database {
                 "file": "src/login.rs",
                 "content": "pub fn login() {}"
             }),
-        ).unwrap();
+        )
+        .unwrap();
 
         let output_id = db.insert_step_output(&output).await.unwrap();
         assert!(output_id > 0);
@@ -278,13 +286,15 @@ mod database {
             "analyzer",
             StepOutputType::SkillResult,
             serde_json::json!({"analysis": "done"}),
-        ).unwrap();
+        )
+        .unwrap();
         let output2 = StepOutput::new(
             producer_id,
             "analyzer",
             StepOutputType::SkillResult,
             serde_json::json!({"analysis": "pending"}),
-        ).unwrap();
+        )
+        .unwrap();
 
         db.insert_step_output(&output1).await.unwrap();
         let output2_id = db.insert_step_output(&output2).await.unwrap();
@@ -294,7 +304,9 @@ mod database {
         assert_eq!(unconsumed.len(), 2);
 
         // Mark one as consumed
-        db.mark_outputs_consumed(&[output2_id], consumer_id).await.unwrap();
+        db.mark_outputs_consumed(&[output2_id], consumer_id)
+            .await
+            .unwrap();
 
         // Only one should be unconsumed
         let unconsumed = db.get_dependency_outputs(&[producer_id]).await.unwrap();
@@ -319,13 +331,16 @@ mod api {
         let (router, state) = setup_api().await;
 
         // Step 1: Create agent via API
-        let create_response = router.clone()
+        let create_response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri("/api/agents")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"agent_type":"story_developer","task":"Build feature"}"#))
+                    .body(Body::from(
+                        r#"{"agent_type":"story_developer","task":"Build feature"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -337,7 +352,11 @@ mod api {
         let agent_id = created["id"].as_str().unwrap();
 
         // Verify in database
-        let db_agent = state.db.get_agent(Uuid::parse_str(agent_id).unwrap()).await.unwrap();
+        let db_agent = state
+            .db
+            .get_agent(Uuid::parse_str(agent_id).unwrap())
+            .await
+            .unwrap();
         assert!(db_agent.is_some());
 
         // Step 2: Transition agent to running in database (simulating agent execution)
@@ -347,7 +366,8 @@ mod api {
         state.db.update_agent(&agent).await.unwrap();
 
         // Step 3: Pause agent via API
-        let pause_response = router.clone()
+        let pause_response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -361,11 +381,17 @@ mod api {
         assert_eq!(pause_response.status(), StatusCode::OK);
 
         // Verify paused in database
-        let paused_agent = state.db.get_agent(Uuid::parse_str(agent_id).unwrap()).await.unwrap().unwrap();
+        let paused_agent = state
+            .db
+            .get_agent(Uuid::parse_str(agent_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(paused_agent.state, AgentState::Paused);
 
         // Step 4: Resume agent via API
-        let resume_response = router.clone()
+        let resume_response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -379,7 +405,12 @@ mod api {
         assert_eq!(resume_response.status(), StatusCode::OK);
 
         // Verify running again
-        let running_agent = state.db.get_agent(Uuid::parse_str(agent_id).unwrap()).await.unwrap().unwrap();
+        let running_agent = state
+            .db
+            .get_agent(Uuid::parse_str(agent_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(running_agent.state, AgentState::Running);
 
         // Step 5: Terminate agent
@@ -397,7 +428,12 @@ mod api {
         assert_eq!(terminate_response.status(), StatusCode::OK);
 
         // Verify terminated
-        let terminated_agent = state.db.get_agent(Uuid::parse_str(agent_id).unwrap()).await.unwrap().unwrap();
+        let terminated_agent = state
+            .db
+            .get_agent(Uuid::parse_str(agent_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(terminated_agent.state, AgentState::Terminated);
     }
 
@@ -498,14 +534,16 @@ mod api {
 
         // Create multiple agents concurrently
         let db = state.db.clone();
-        let handles: Vec<_> = (0..10).map(|i| {
-            let db = db.clone();
-            tokio::spawn(async move {
-                let agent = Agent::new(AgentType::StoryDeveloper, format!("Task {}", i));
-                db.insert_agent(&agent).await.unwrap();
-                agent.id
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    let agent = Agent::new(AgentType::StoryDeveloper, format!("Task {}", i));
+                    db.insert_agent(&agent).await.unwrap();
+                    agent.id
+                })
             })
-        }).collect();
+            .collect();
 
         // Wait for all to complete
         let ids: Vec<Uuid> = futures::future::join_all(handles)
@@ -552,8 +590,8 @@ mod workflow {
             epic_id: Some("AUTH-1".to_string()),
             ..Default::default()
         };
-        let mut story_dev = Agent::new(AgentType::StoryDeveloper, "Implement OAuth2 flow")
-            .with_context(context);
+        let mut story_dev =
+            Agent::new(AgentType::StoryDeveloper, "Implement OAuth2 flow").with_context(context);
         story_dev.transition_to(AgentState::Initializing).unwrap();
         story_dev.transition_to(AgentState::Running).unwrap();
         db.insert_agent(&story_dev).await.unwrap();
@@ -567,7 +605,8 @@ mod workflow {
                 "files": ["src/oauth.rs", "src/auth/mod.rs"],
                 "tests_passing": true
             }),
-        ).unwrap();
+        )
+        .unwrap();
         db.insert_step_output(&code_output).await.unwrap();
 
         // Story developer completes
@@ -604,18 +643,19 @@ mod workflow {
         let db = setup_db().await;
 
         // Create orchestrator (parent)
-        let mut orchestrator = Agent::new(AgentType::BmadOrchestrator, "Manage epic implementation");
-        orchestrator.transition_to(AgentState::Initializing).unwrap();
+        let mut orchestrator =
+            Agent::new(AgentType::BmadOrchestrator, "Manage epic implementation");
+        orchestrator
+            .transition_to(AgentState::Initializing)
+            .unwrap();
         orchestrator.transition_to(AgentState::Running).unwrap();
         db.insert_agent(&orchestrator).await.unwrap();
 
         // Create child agents
-        let child1 = Agent::new(AgentType::StoryDeveloper, "Story 1")
-            .with_parent(orchestrator.id);
-        let child2 = Agent::new(AgentType::StoryDeveloper, "Story 2")
-            .with_parent(orchestrator.id);
-        let child3 = Agent::new(AgentType::CodeReviewer, "Review all stories")
-            .with_parent(orchestrator.id);
+        let child1 = Agent::new(AgentType::StoryDeveloper, "Story 1").with_parent(orchestrator.id);
+        let child2 = Agent::new(AgentType::StoryDeveloper, "Story 2").with_parent(orchestrator.id);
+        let child3 =
+            Agent::new(AgentType::CodeReviewer, "Review all stories").with_parent(orchestrator.id);
 
         db.insert_agent(&child1).await.unwrap();
         db.insert_agent(&child2).await.unwrap();
@@ -652,7 +692,8 @@ mod workflow {
             "analyzer",
             StepOutputType::SkillResult,
             serde_json::json!({"findings": ["issue1", "issue2"]}),
-        ).unwrap();
+        )
+        .unwrap();
         let output_id = db.insert_step_output(&output).await.unwrap();
 
         // Verify output is unconsumed
@@ -660,7 +701,9 @@ mod workflow {
         assert_eq!(unconsumed.len(), 1);
 
         // Agent B consumes the output
-        db.mark_outputs_consumed(&[output_id], agent_b).await.unwrap();
+        db.mark_outputs_consumed(&[output_id], agent_b)
+            .await
+            .unwrap();
 
         // Verify output is now consumed
         let unconsumed = db.get_dependency_outputs(&[agent_a]).await.unwrap();
@@ -679,8 +722,8 @@ mod workflow {
 mod instructions {
     use super::*;
     use orchestrate_core::{
-        CustomInstruction, InstructionSource, LearningEngine, LearningPattern,
-        PatternStatus, PatternType,
+        CustomInstruction, InstructionSource, LearningEngine, LearningPattern, PatternStatus,
+        PatternType,
     };
 
     #[tokio::test]
@@ -691,7 +734,8 @@ mod instructions {
         let instruction = CustomInstruction::global(
             "no-force-push",
             "Never use git push --force without explicit user approval",
-        ).with_priority(150);
+        )
+        .with_priority(150);
 
         let id = db.insert_instruction(&instruction).await.unwrap();
         assert!(id > 0);
@@ -703,7 +747,11 @@ mod instructions {
         assert!(fetched.enabled);
 
         // Retrieve by name
-        let fetched_by_name = db.get_instruction_by_name("no-force-push").await.unwrap().unwrap();
+        let fetched_by_name = db
+            .get_instruction_by_name("no-force-push")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched_by_name.id, id);
 
         // Update
@@ -732,10 +780,7 @@ mod instructions {
         let db = setup_db().await;
 
         // Create global instruction
-        let global = CustomInstruction::global(
-            "global-rule",
-            "This applies to all agents",
-        );
+        let global = CustomInstruction::global("global-rule", "This applies to all agents");
         db.insert_instruction(&global).await.unwrap();
 
         // Create instruction for StoryDeveloper
@@ -755,14 +800,20 @@ mod instructions {
         db.insert_instruction(&code_rev).await.unwrap();
 
         // Story developer should get global + story-dev-rule
-        let story_insts = db.get_instructions_for_agent(AgentType::StoryDeveloper).await.unwrap();
+        let story_insts = db
+            .get_instructions_for_agent(AgentType::StoryDeveloper)
+            .await
+            .unwrap();
         assert_eq!(story_insts.len(), 2);
         assert!(story_insts.iter().any(|i| i.name == "global-rule"));
         assert!(story_insts.iter().any(|i| i.name == "story-dev-rule"));
         assert!(!story_insts.iter().any(|i| i.name == "code-rev-rule"));
 
         // Code reviewer should get global + code-rev-rule
-        let code_insts = db.get_instructions_for_agent(AgentType::CodeReviewer).await.unwrap();
+        let code_insts = db
+            .get_instructions_for_agent(AgentType::CodeReviewer)
+            .await
+            .unwrap();
         assert_eq!(code_insts.len(), 2);
         assert!(code_insts.iter().any(|i| i.name == "global-rule"));
         assert!(code_insts.iter().any(|i| i.name == "code-rev-rule"));
@@ -782,12 +833,20 @@ mod instructions {
         db.insert_agent(&agent).await.unwrap();
 
         // Record usage
-        db.record_instruction_usage(id, agent.id, None).await.unwrap();
-        db.record_instruction_usage(id, agent.id, None).await.unwrap();
+        db.record_instruction_usage(id, agent.id, None)
+            .await
+            .unwrap();
+        db.record_instruction_usage(id, agent.id, None)
+            .await
+            .unwrap();
 
         // Record outcomes
-        db.record_instruction_outcome(id, true, Some(10.5)).await.unwrap();
-        db.record_instruction_outcome(id, false, Some(5.0)).await.unwrap();
+        db.record_instruction_outcome(id, true, Some(10.5))
+            .await
+            .unwrap();
+        db.record_instruction_outcome(id, false, Some(5.0))
+            .await
+            .unwrap();
 
         // Check effectiveness
         let eff = db.get_instruction_effectiveness(id).await.unwrap().unwrap();
@@ -863,7 +922,8 @@ mod instructions {
                 "error_text": "Permission denied",
                 "category": "permission_error",
             }),
-        ).with_agent_type(AgentType::StoryDeveloper);
+        )
+        .with_agent_type(AgentType::StoryDeveloper);
 
         db.upsert_learning_pattern(&pattern).await.unwrap();
 
@@ -900,16 +960,23 @@ mod instructions {
 
         db.upsert_learning_pattern(&pattern).await.unwrap();
 
-        let patterns = db.list_patterns(Some(PatternStatus::Observed)).await.unwrap();
+        let patterns = db
+            .list_patterns(Some(PatternStatus::Observed))
+            .await
+            .unwrap();
         let pattern_id = patterns[0].id;
 
         // Generate instruction from pattern
         let engine = LearningEngine::new();
-        let instruction = engine.generate_instruction_from_pattern(&patterns[0]).unwrap();
+        let instruction = engine
+            .generate_instruction_from_pattern(&patterns[0])
+            .unwrap();
 
         // Insert instruction and update pattern status
         let instruction_id = db.insert_instruction(&instruction).await.unwrap();
-        db.update_pattern_status(pattern_id, PatternStatus::Approved, Some(instruction_id)).await.unwrap();
+        db.update_pattern_status(pattern_id, PatternStatus::Approved, Some(instruction_id))
+            .await
+            .unwrap();
 
         // Verify pattern is now approved
         let pattern = db.get_pattern(pattern_id).await.unwrap().unwrap();
@@ -950,7 +1017,10 @@ mod instructions {
 
         // Pattern should now be pending_review (confidence < auto_approve_threshold)
         // because 5 occurrences gives confidence of 0.8 < 0.9
-        let patterns = db.list_patterns(Some(PatternStatus::PendingReview)).await.unwrap();
+        let patterns = db
+            .list_patterns(Some(PatternStatus::PendingReview))
+            .await
+            .unwrap();
         assert_eq!(patterns.len(), 1);
         assert!(patterns[0].instruction_id.is_some());
     }
@@ -964,24 +1034,29 @@ mod instructions {
         db.insert_agent(&agent).await.unwrap();
 
         // Create a learned instruction with high penalty and low success
-        let instruction = CustomInstruction::learned(
-            "ineffective-learned",
-            "This instruction doesn't help",
-            0.5,
-        );
+        let instruction =
+            CustomInstruction::learned("ineffective-learned", "This instruction doesn't help", 0.5);
         let id = db.insert_instruction(&instruction).await.unwrap();
 
         // Simulate lots of usage with low success
         // Need to record usage (increments usage_count) and outcomes
         for _ in 0..15 {
-            db.record_instruction_usage(id, agent.id, None).await.unwrap();
-            db.record_instruction_outcome(id, false, None).await.unwrap();
+            db.record_instruction_usage(id, agent.id, None)
+                .await
+                .unwrap();
+            db.record_instruction_outcome(id, false, None)
+                .await
+                .unwrap();
         }
-        db.record_instruction_usage(id, agent.id, None).await.unwrap();
+        db.record_instruction_usage(id, agent.id, None)
+            .await
+            .unwrap();
         db.record_instruction_outcome(id, true, None).await.unwrap();
 
         // Apply high penalty
-        db.apply_penalty(id, 1.0, "high_failure_rate").await.unwrap();
+        db.apply_penalty(id, 1.0, "high_failure_rate")
+            .await
+            .unwrap();
 
         // Verify metrics before deletion
         let eff = db.get_instruction_effectiveness(id).await.unwrap().unwrap();
@@ -1022,28 +1097,21 @@ mod token_tracking {
         db.record_session_tokens(
             &session.id,
             agent.id,
-            1,      // turn
-            1000,   // input_tokens
-            500,    // output_tokens
-            800,    // cache_read_tokens
-            200,    // cache_write_tokens
-            5000,   // context_window_used
-            10,     // messages_included
-            2,      // messages_summarized
-        ).await.unwrap();
+            1,    // turn
+            1000, // input_tokens
+            500,  // output_tokens
+            800,  // cache_read_tokens
+            200,  // cache_write_tokens
+            5000, // context_window_used
+            10,   // messages_included
+            2,    // messages_summarized
+        )
+        .await
+        .unwrap();
 
-        db.record_session_tokens(
-            &session.id,
-            agent.id,
-            2,
-            1200,
-            600,
-            1000,
-            100,
-            6000,
-            12,
-            3,
-        ).await.unwrap();
+        db.record_session_tokens(&session.id, agent.id, 2, 1200, 600, 1000, 100, 6000, 12, 3)
+            .await
+            .unwrap();
 
         // Get session stats
         let stats = db.get_session_token_stats(&session.id).await.unwrap();
@@ -1082,7 +1150,9 @@ mod token_tracking {
             10000,
             20,
             5,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         // Get stats by agent ID
         let stats = db.get_agent_token_stats(agent.id).await.unwrap();
@@ -1098,29 +1168,17 @@ mod token_tracking {
         let db = setup_db().await;
 
         // Record usage for different models
-        db.update_daily_token_usage(
-            "claude-sonnet-4-20250514",
-            5000,
-            2000,
-            3000,
-            1000,
-        ).await.unwrap();
+        db.update_daily_token_usage("claude-sonnet-4-20250514", 5000, 2000, 3000, 1000)
+            .await
+            .unwrap();
 
-        db.update_daily_token_usage(
-            "claude-sonnet-4-20250514",
-            3000,
-            1500,
-            2000,
-            500,
-        ).await.unwrap();
+        db.update_daily_token_usage("claude-sonnet-4-20250514", 3000, 1500, 2000, 500)
+            .await
+            .unwrap();
 
-        db.update_daily_token_usage(
-            "claude-haiku-3-20240307",
-            1000,
-            500,
-            800,
-            200,
-        ).await.unwrap();
+        db.update_daily_token_usage("claude-haiku-3-20240307", 1000, 500, 800, 200)
+            .await
+            .unwrap();
 
         // Get daily usage
         let usage = db.get_daily_token_usage(1).await.unwrap();
@@ -1129,9 +1187,7 @@ mod token_tracking {
         assert_eq!(usage.len(), 2);
 
         // Find sonnet entry
-        let sonnet = usage.iter()
-            .find(|u| u.model.contains("sonnet"))
-            .unwrap();
+        let sonnet = usage.iter().find(|u| u.model.contains("sonnet")).unwrap();
 
         assert_eq!(sonnet.total_input_tokens, 8000);
         assert_eq!(sonnet.total_output_tokens, 3500);
@@ -1167,12 +1223,19 @@ mod token_tracking {
         let db = setup_db().await;
 
         // Create instruction
-        let instruction = orchestrate_core::CustomInstruction::global("token-test", "Test instruction for token tracking");
+        let instruction = orchestrate_core::CustomInstruction::global(
+            "token-test",
+            "Test instruction for token tracking",
+        );
         let id = db.insert_instruction(&instruction).await.unwrap();
 
         // Record token usage - this should not fail
-        db.update_instruction_tokens(id, 5000, 2000, 3000, 1000).await.unwrap();
-        db.update_instruction_tokens(id, 3000, 1500, 2000, 500).await.unwrap();
+        db.update_instruction_tokens(id, 5000, 2000, 3000, 1000)
+            .await
+            .unwrap();
+        db.update_instruction_tokens(id, 3000, 1500, 2000, 500)
+            .await
+            .unwrap();
 
         // Verify instruction still exists and can be retrieved
         let inst = db.get_instruction(id).await.unwrap();

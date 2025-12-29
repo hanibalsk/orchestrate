@@ -209,7 +209,10 @@ impl NetworkValidator {
                     errors.push(
                         ValidationError::new(
                             ValidationErrorCode::MissingDependency,
-                            format!("Agent {} depends on non-existent agent {}", agent_id, dep_id),
+                            format!(
+                                "Agent {} depends on non-existent agent {}",
+                                agent_id, dep_id
+                            ),
                         )
                         .for_agent(*agent_id),
                     );
@@ -277,7 +280,10 @@ impl NetworkValidator {
                                 ),
                             )
                             .for_agent(agent.id)
-                            .with_suggestion(format!("Pause agent {} or restart dependency {}", agent.id, dep_id)),
+                            .with_suggestion(format!(
+                                "Pause agent {} or restart dependency {}",
+                                agent.id, dep_id
+                            )),
                         );
                     }
                     // Dependency should not be terminated
@@ -291,7 +297,10 @@ impl NetworkValidator {
                                 ),
                             )
                             .for_agent(agent.id)
-                            .with_suggestion(format!("Terminate agent {} or restart dependency {}", agent.id, dep_id)),
+                            .with_suggestion(format!(
+                                "Terminate agent {} or restart dependency {}",
+                                agent.id, dep_id
+                            )),
                         );
                     }
                 }
@@ -325,13 +334,14 @@ impl NetworkValidator {
                 for dep_id in &agent.dependencies {
                     if let Some(state) = dependency_states.get(dep_id) {
                         if *state == AgentState::Failed || *state == AgentState::Terminated {
-                            return Err(
-                                ValidationError::new(
-                                    ValidationErrorCode::DependencyStateInvalid,
-                                    format!("Cannot run: dependency {} is in state {:?}", dep_id, state),
-                                )
-                                .for_agent(agent.id),
-                            );
+                            return Err(ValidationError::new(
+                                ValidationErrorCode::DependencyStateInvalid,
+                                format!(
+                                    "Cannot run: dependency {} is in state {:?}",
+                                    dep_id, state
+                                ),
+                            )
+                            .for_agent(agent.id));
                         }
                     }
                 }
@@ -339,13 +349,11 @@ impl NetworkValidator {
             AgentState::Completed => {
                 // Can only complete if currently running
                 if agent.state != AgentState::Running {
-                    return Err(
-                        ValidationError::new(
-                            ValidationErrorCode::InvalidTransition,
-                            format!("Cannot complete from state {:?}", agent.state),
-                        )
-                        .for_agent(agent.id),
-                    );
+                    return Err(ValidationError::new(
+                        ValidationErrorCode::InvalidTransition,
+                        format!("Cannot complete from state {:?}", agent.state),
+                    )
+                    .for_agent(agent.id));
                 }
             }
             _ => {}
@@ -381,7 +389,10 @@ impl NetworkInvariant for NoCyclesInvariant {
             .topological_order()
             .map(|_| ())
             .map_err(|_| {
-                ValidationError::new(ValidationErrorCode::CyclicDependency, "Dependency cycle detected")
+                ValidationError::new(
+                    ValidationErrorCode::CyclicDependency,
+                    "Dependency cycle detected",
+                )
             })
     }
 
@@ -404,13 +415,14 @@ impl NetworkInvariant for NoFailedDependenciesInvariant {
                 for dep_id in &agent.dependencies {
                     if let Some(dep) = agents.get(dep_id) {
                         if dep.state == AgentState::Failed {
-                            return Err(
-                                ValidationError::new(
-                                    ValidationErrorCode::DependencyStateInvalid,
-                                    format!("Running agent {} has failed dependency {}", agent_id, dep_id),
-                                )
-                                .for_agent(*agent_id),
-                            );
+                            return Err(ValidationError::new(
+                                ValidationErrorCode::DependencyStateInvalid,
+                                format!(
+                                    "Running agent {} has failed dependency {}",
+                                    agent_id, dep_id
+                                ),
+                            )
+                            .for_agent(*agent_id));
                         }
                     }
                 }
@@ -437,8 +449,14 @@ mod tests {
         let a = AgentId::new();
         let b = AgentId::new();
 
-        agents.insert(a, AgentHandle::new(a, AgentType::StoryDeveloper, AgentState::Running));
-        agents.insert(b, AgentHandle::new(b, AgentType::CodeReviewer, AgentState::Running));
+        agents.insert(
+            a,
+            AgentHandle::new(a, AgentType::StoryDeveloper, AgentState::Running),
+        );
+        agents.insert(
+            b,
+            AgentHandle::new(b, AgentType::CodeReviewer, AgentState::Running),
+        );
 
         graph.register_agent(a, AgentType::StoryDeveloper);
         graph.register_agent(b, AgentType::CodeReviewer);
@@ -463,7 +481,10 @@ mod tests {
         let b = AgentId::new();
 
         // a is failed, b is running
-        agents.insert(a, AgentHandle::new(a, AgentType::StoryDeveloper, AgentState::Failed));
+        agents.insert(
+            a,
+            AgentHandle::new(a, AgentType::StoryDeveloper, AgentState::Failed),
+        );
         let mut b_handle = AgentHandle::new(b, AgentType::CodeReviewer, AgentState::Running);
         b_handle.add_dependency(a);
         agents.insert(b, b_handle);
@@ -476,6 +497,9 @@ mod tests {
         let result = validator.validate(&agents, &graph);
 
         assert!(!result.is_valid);
-        assert!(result.errors.iter().any(|e| e.code == ValidationErrorCode::DependencyStateInvalid));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::DependencyStateInvalid));
     }
 }

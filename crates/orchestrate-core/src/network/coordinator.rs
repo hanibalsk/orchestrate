@@ -6,13 +6,13 @@
 //! - Network-wide validation
 //! - Self-healing capabilities
 
-use super::{
-    AgentHandle, AgentId, DependencyGraph, SkillRegistry,
-    StateGraph, StateMachine, StatePropagation, ValidationResult,
-};
-use super::state::default_agent_state_graph;
 use super::skills::default_skill_registry;
+use super::state::default_agent_state_graph;
 use super::validation::{NetworkValidator, ValidationErrorCode};
+use super::{
+    AgentHandle, AgentId, DependencyGraph, SkillRegistry, StateGraph, StateMachine,
+    StatePropagation, ValidationResult,
+};
 use crate::{AgentState, AgentType};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,9 +27,7 @@ pub enum NetworkEvent {
         agent_type: AgentType,
     },
     /// Agent removed from the network
-    AgentRemoved {
-        agent_id: AgentId,
-    },
+    AgentRemoved { agent_id: AgentId },
     /// Agent state changed
     StateChanged {
         agent_id: AgentId,
@@ -37,38 +35,22 @@ pub enum NetworkEvent {
         to: AgentState,
     },
     /// Dependency added
-    DependencyAdded {
-        from: AgentId,
-        to: AgentId,
-    },
+    DependencyAdded { from: AgentId, to: AgentId },
     /// Validation completed
-    ValidationCompleted {
-        result: ValidationResult,
-    },
+    ValidationCompleted { result: ValidationResult },
     /// Self-healing action taken
-    SelfHealingAction {
-        action: RecoveryAction,
-    },
+    SelfHealingAction { action: RecoveryAction },
 }
 
 /// Recovery action for self-healing
 #[derive(Debug, Clone)]
 pub enum RecoveryAction {
     /// Restart a failed agent
-    RestartAgent {
-        agent_id: AgentId,
-        reason: String,
-    },
+    RestartAgent { agent_id: AgentId, reason: String },
     /// Pause an agent waiting for dependencies
-    PauseAgent {
-        agent_id: AgentId,
-        reason: String,
-    },
+    PauseAgent { agent_id: AgentId, reason: String },
     /// Terminate a stuck agent
-    TerminateAgent {
-        agent_id: AgentId,
-        reason: String,
-    },
+    TerminateAgent { agent_id: AgentId, reason: String },
     /// Spawn a missing dependency
     SpawnDependency {
         for_agent: AgentId,
@@ -220,14 +202,11 @@ impl NetworkCoordinator {
     }
 
     /// Add a dependency between agents
-    pub async fn add_dependency(
-        &self,
-        from: AgentId,
-        to: AgentId,
-    ) -> Result<(), CoordinatorError> {
+    pub async fn add_dependency(&self, from: AgentId, to: AgentId) -> Result<(), CoordinatorError> {
         {
             let mut graph = self.dependency_graph.write().await;
-            graph.add_dependency(from, to)
+            graph
+                .add_dependency(from, to)
                 .map_err(|e| CoordinatorError::DependencyError(e.to_string()))?;
         }
 
@@ -241,7 +220,9 @@ impl NetworkCoordinator {
             }
         }
 
-        let _ = self.event_tx.send(NetworkEvent::DependencyAdded { from, to });
+        let _ = self
+            .event_tx
+            .send(NetworkEvent::DependencyAdded { from, to });
 
         Ok(())
     }
@@ -400,7 +381,6 @@ impl NetworkCoordinator {
         &self,
         error: &super::validation::ValidationError,
     ) -> RecoveryAction {
-
         let agent_id = match error.agent_id {
             Some(id) => id,
             None => return RecoveryAction::None,
@@ -426,18 +406,14 @@ impl NetworkCoordinator {
         }
 
         match error.code {
-            ValidationErrorCode::DependencyStateInvalid => {
-                RecoveryAction::PauseAgent {
-                    agent_id,
-                    reason: error.message.clone(),
-                }
-            }
-            ValidationErrorCode::InvalidState => {
-                RecoveryAction::RestartAgent {
-                    agent_id,
-                    reason: error.message.clone(),
-                }
-            }
+            ValidationErrorCode::DependencyStateInvalid => RecoveryAction::PauseAgent {
+                agent_id,
+                reason: error.message.clone(),
+            },
+            ValidationErrorCode::InvalidState => RecoveryAction::RestartAgent {
+                agent_id,
+                reason: error.message.clone(),
+            },
             ValidationErrorCode::MissingDependency => {
                 // Try to determine what type of agent is needed
                 RecoveryAction::SpawnDependency {
@@ -446,12 +422,10 @@ impl NetworkCoordinator {
                     reason: error.message.clone(),
                 }
             }
-            ValidationErrorCode::TimeoutExceeded => {
-                RecoveryAction::TerminateAgent {
-                    agent_id,
-                    reason: error.message.clone(),
-                }
-            }
+            ValidationErrorCode::TimeoutExceeded => RecoveryAction::TerminateAgent {
+                agent_id,
+                reason: error.message.clone(),
+            },
             _ => RecoveryAction::None,
         }
     }
@@ -461,23 +435,44 @@ impl NetworkCoordinator {
         match action {
             RecoveryAction::RestartAgent { agent_id, .. } => {
                 // Transition to Created state and then to Initializing
-                self.transition_state(*agent_id, AgentState::Created, Some("recovery".to_string())).await?;
-                self.transition_state(*agent_id, AgentState::Initializing, Some("recovery".to_string())).await?;
+                self.transition_state(*agent_id, AgentState::Created, Some("recovery".to_string()))
+                    .await?;
+                self.transition_state(
+                    *agent_id,
+                    AgentState::Initializing,
+                    Some("recovery".to_string()),
+                )
+                .await?;
             }
             RecoveryAction::PauseAgent { agent_id, .. } => {
-                self.transition_state(*agent_id, AgentState::Paused, Some("recovery".to_string())).await?;
+                self.transition_state(*agent_id, AgentState::Paused, Some("recovery".to_string()))
+                    .await?;
             }
             RecoveryAction::TerminateAgent { agent_id, .. } => {
-                self.transition_state(*agent_id, AgentState::Terminated, Some("recovery".to_string())).await?;
+                self.transition_state(
+                    *agent_id,
+                    AgentState::Terminated,
+                    Some("recovery".to_string()),
+                )
+                .await?;
             }
-            RecoveryAction::SpawnDependency { for_agent, agent_type, .. } => {
+            RecoveryAction::SpawnDependency {
+                for_agent,
+                agent_type,
+                ..
+            } => {
                 // Create and register a new agent
                 let new_id = AgentId::new();
-                self.register_agent(new_id, *agent_type, AgentState::Created).await?;
+                self.register_agent(new_id, *agent_type, AgentState::Created)
+                    .await?;
                 self.add_dependency(*for_agent, new_id).await?;
             }
-            RecoveryAction::RetryTransition { agent_id, target_state } => {
-                self.transition_state(*agent_id, *target_state, Some("retry".to_string())).await?;
+            RecoveryAction::RetryTransition {
+                agent_id,
+                target_state,
+            } => {
+                self.transition_state(*agent_id, *target_state, Some("retry".to_string()))
+                    .await?;
             }
             RecoveryAction::None => {}
         }
@@ -512,7 +507,9 @@ impl NetworkCoordinator {
             .dependencies
             .iter()
             .filter_map(|dep_id| {
-                agents.get(dep_id).map(|dep| (*dep_id, (dep.agent_type, dep.state)))
+                agents
+                    .get(dep_id)
+                    .map(|dep| (*dep_id, (dep.agent_type, dep.state)))
             })
             .collect();
 
@@ -633,7 +630,10 @@ mod tests {
             .unwrap();
 
         // Reviewer depends on developer
-        coordinator.add_dependency(reviewer_id, dev_id).await.unwrap();
+        coordinator
+            .add_dependency(reviewer_id, dev_id)
+            .await
+            .unwrap();
 
         let stats = coordinator.stats().await;
         assert_eq!(stats.total_agents, 2);

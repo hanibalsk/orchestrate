@@ -21,12 +21,22 @@ import {
 } from '@/components/ui/select';
 import { Plus } from 'lucide-react';
 
-const agentTypes: { value: AgentType; label: string }[] = [
-  { value: 'story_developer', label: 'Story Developer' },
-  { value: 'code_reviewer', label: 'Code Reviewer' },
-  { value: 'issue_fixer', label: 'Issue Fixer' },
-  { value: 'explorer', label: 'Explorer' },
-  { value: 'pr_shepherd', label: 'PR Shepherd' },
+const agentTypes: { value: AgentType; label: string; description: string }[] = [
+  // Development agents
+  { value: 'story_developer', label: 'Story Developer', description: 'Implements user stories and features' },
+  { value: 'code_reviewer', label: 'Code Reviewer', description: 'Reviews code for quality and issues' },
+  { value: 'issue_fixer', label: 'Issue Fixer', description: 'Fixes bugs and issues' },
+  { value: 'explorer', label: 'Explorer', description: 'Explores codebase and answers questions' },
+  // BMAD agents
+  { value: 'bmad_orchestrator', label: 'BMAD Orchestrator', description: 'Orchestrates BMAD workflow for epics' },
+  { value: 'bmad_planner', label: 'BMAD Planner', description: 'Plans epics and stories using BMAD' },
+  // PR management
+  { value: 'pr_shepherd', label: 'PR Shepherd', description: 'Monitors and manages pull requests' },
+  { value: 'pr_controller', label: 'PR Controller', description: 'Controls PR lifecycle and merging' },
+  { value: 'conflict_resolver', label: 'Conflict Resolver', description: 'Resolves merge conflicts' },
+  // System agents
+  { value: 'background_controller', label: 'Background Controller', description: 'Controls background tasks' },
+  { value: 'scheduler', label: 'Scheduler', description: 'Schedules and coordinates tasks' },
 ];
 
 export function CreateAgentDialog() {

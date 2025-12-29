@@ -9,10 +9,10 @@
 //! - `.orchestrate/shepherd-*.lock` - Lock files for shepherd processes
 
 use anyhow::{anyhow, Result};
-use std::path::{Path, PathBuf};
-use std::fs;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Default state directory relative to project root
 const DEFAULT_STATE_DIR: &str = ".orchestrate";
@@ -202,7 +202,8 @@ impl ShellState {
                 .iter()
                 .map(|e| e.to_line())
                 .collect::<Vec<_>>()
-                .join("\n") + "\n";
+                .join("\n")
+                + "\n";
             fs::write(&path, content)?;
         }
 
@@ -232,7 +233,9 @@ impl ShellState {
         }
 
         let content = fs::read_to_string(&path)?;
-        let pr_num: i32 = content.trim().parse()
+        let pr_num: i32 = content
+            .trim()
+            .parse()
             .map_err(|_| anyhow!("Invalid PR number in current-pr file"))?;
 
         Ok(Some(pr_num))

@@ -48,23 +48,26 @@ impl DependencyCondition {
     /// Check if this condition is satisfied given current dependency states
     pub fn is_satisfied(&self, states: &HashMap<AgentId, (AgentType, AgentState)>) -> bool {
         match self {
-            DependencyCondition::AgentInState { agent_id, state } => {
-                states.get(agent_id).map(|(_, s)| s == state).unwrap_or(false)
-            }
+            DependencyCondition::AgentInState { agent_id, state } => states
+                .get(agent_id)
+                .map(|(_, s)| s == state)
+                .unwrap_or(false),
             DependencyCondition::AllOfType { agent_type, state } => {
-                let matching: Vec<_> = states
-                    .values()
-                    .filter(|(t, _)| t == agent_type)
-                    .collect();
+                let matching: Vec<_> = states.values().filter(|(t, _)| t == agent_type).collect();
                 !matching.is_empty() && matching.iter().all(|(_, s)| s == state)
             }
-            DependencyCondition::AnyOfType { agent_type, states: required_states } => {
-                states
-                    .values()
-                    .filter(|(t, _)| t == agent_type)
-                    .any(|(_, s)| required_states.contains(s))
-            }
-            DependencyCondition::AtLeastN { agent_type, state, count } => {
+            DependencyCondition::AnyOfType {
+                agent_type,
+                states: required_states,
+            } => states
+                .values()
+                .filter(|(t, _)| t == agent_type)
+                .any(|(_, s)| required_states.contains(s)),
+            DependencyCondition::AtLeastN {
+                agent_type,
+                state,
+                count,
+            } => {
                 states
                     .values()
                     .filter(|(t, s)| t == agent_type && s == state)
@@ -72,9 +75,7 @@ impl DependencyCondition {
                     >= *count
             }
             DependencyCondition::NoneOfType { agent_type, state } => {
-                !states
-                    .values()
-                    .any(|(t, s)| t == agent_type && s == state)
+                !states.values().any(|(t, s)| t == agent_type && s == state)
             }
             DependencyCondition::And(conditions) => {
                 conditions.iter().all(|c| c.is_satisfied(states))

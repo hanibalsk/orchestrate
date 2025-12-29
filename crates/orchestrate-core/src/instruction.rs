@@ -4,9 +4,9 @@
 //! injected into agent system prompts. Instructions can be global (apply to
 //! all agents) or scoped to specific agent types.
 
+use crate::AgentType;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use crate::AgentType;
 
 /// Scope of instruction application
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -32,7 +32,10 @@ impl InstructionScope {
         match s {
             "global" => Ok(InstructionScope::Global),
             "agent_type" => Ok(InstructionScope::AgentType),
-            _ => Err(crate::Error::Other(format!("Unknown instruction scope: {}", s))),
+            _ => Err(crate::Error::Other(format!(
+                "Unknown instruction scope: {}",
+                s
+            ))),
         }
     }
 }
@@ -65,7 +68,10 @@ impl InstructionSource {
             "manual" => Ok(InstructionSource::Manual),
             "learned" => Ok(InstructionSource::Learned),
             "imported" => Ok(InstructionSource::Imported),
-            _ => Err(crate::Error::Other(format!("Unknown instruction source: {}", s))),
+            _ => Err(crate::Error::Other(format!(
+                "Unknown instruction source: {}",
+                s
+            ))),
         }
     }
 }
@@ -135,11 +141,7 @@ impl CustomInstruction {
     }
 
     /// Create a learned instruction (lower default confidence, starts disabled)
-    pub fn learned(
-        name: impl Into<String>,
-        content: impl Into<String>,
-        confidence: f64,
-    ) -> Self {
+    pub fn learned(name: impl Into<String>, content: impl Into<String>, confidence: f64) -> Self {
         let mut inst = Self::global(name, content);
         inst.source = InstructionSource::Learned;
         inst.confidence = confidence.clamp(0.0, 1.0);
@@ -339,7 +341,10 @@ impl PatternStatus {
             "pending_review" => Ok(PatternStatus::PendingReview),
             "approved" => Ok(PatternStatus::Approved),
             "rejected" => Ok(PatternStatus::Rejected),
-            _ => Err(crate::Error::Other(format!("Unknown pattern status: {}", s))),
+            _ => Err(crate::Error::Other(format!(
+                "Unknown pattern status: {}",
+                s
+            ))),
         }
     }
 }
@@ -423,10 +428,7 @@ impl Default for LearningConfig {
             min_occurrences: 3,
             auto_approve_threshold: 0.9,
             auto_enable: false,
-            enabled_pattern_types: vec![
-                PatternType::ErrorPattern,
-                PatternType::ToolUsagePattern,
-            ],
+            enabled_pattern_types: vec![PatternType::ErrorPattern, PatternType::ToolUsagePattern],
             penalty_disable_threshold: penalties::DISABLE_THRESHOLD,
             min_usage_for_deletion: 10,
             deletion_success_rate_threshold: 0.3,
@@ -442,8 +444,14 @@ mod tests {
     fn test_instruction_scope_conversion() {
         assert_eq!(InstructionScope::Global.as_str(), "global");
         assert_eq!(InstructionScope::AgentType.as_str(), "agent_type");
-        assert_eq!(InstructionScope::from_str("global").unwrap(), InstructionScope::Global);
-        assert_eq!(InstructionScope::from_str("agent_type").unwrap(), InstructionScope::AgentType);
+        assert_eq!(
+            InstructionScope::from_str("global").unwrap(),
+            InstructionScope::Global
+        );
+        assert_eq!(
+            InstructionScope::from_str("agent_type").unwrap(),
+            InstructionScope::AgentType
+        );
         assert!(InstructionScope::from_str("invalid").is_err());
     }
 
@@ -452,7 +460,10 @@ mod tests {
         assert_eq!(InstructionSource::Manual.as_str(), "manual");
         assert_eq!(InstructionSource::Learned.as_str(), "learned");
         assert_eq!(InstructionSource::Imported.as_str(), "imported");
-        assert_eq!(InstructionSource::from_str("manual").unwrap(), InstructionSource::Manual);
+        assert_eq!(
+            InstructionSource::from_str("manual").unwrap(),
+            InstructionSource::Manual
+        );
         assert!(InstructionSource::from_str("invalid").is_err());
     }
 
@@ -493,7 +504,8 @@ mod tests {
     #[test]
     fn test_instruction_applies_to() {
         let global = CustomInstruction::global("global", "content");
-        let scoped = CustomInstruction::for_agent_type("scoped", "content", AgentType::CodeReviewer);
+        let scoped =
+            CustomInstruction::for_agent_type("scoped", "content", AgentType::CodeReviewer);
         let disabled = CustomInstruction::global("disabled", "content").disabled();
 
         assert!(global.applies_to(AgentType::StoryDeveloper));
@@ -553,7 +565,10 @@ mod tests {
     fn test_pattern_type_conversion() {
         assert_eq!(PatternType::ErrorPattern.as_str(), "error_pattern");
         assert_eq!(PatternType::ToolUsagePattern.as_str(), "tool_usage_pattern");
-        assert_eq!(PatternType::from_str("error_pattern").unwrap(), PatternType::ErrorPattern);
+        assert_eq!(
+            PatternType::from_str("error_pattern").unwrap(),
+            PatternType::ErrorPattern
+        );
         assert!(PatternType::from_str("invalid").is_err());
     }
 
@@ -563,7 +578,10 @@ mod tests {
         assert_eq!(PatternStatus::PendingReview.as_str(), "pending_review");
         assert_eq!(PatternStatus::Approved.as_str(), "approved");
         assert_eq!(PatternStatus::Rejected.as_str(), "rejected");
-        assert_eq!(PatternStatus::from_str("approved").unwrap(), PatternStatus::Approved);
+        assert_eq!(
+            PatternStatus::from_str("approved").unwrap(),
+            PatternStatus::Approved
+        );
         assert!(PatternStatus::from_str("invalid").is_err());
     }
 
@@ -573,7 +591,8 @@ mod tests {
             PatternType::ErrorPattern,
             "abc123",
             serde_json::json!({"error": "test error"}),
-        ).with_agent_type(AgentType::StoryDeveloper);
+        )
+        .with_agent_type(AgentType::StoryDeveloper);
 
         assert_eq!(pattern.pattern_type, PatternType::ErrorPattern);
         assert_eq!(pattern.pattern_signature, "abc123");
@@ -589,6 +608,8 @@ mod tests {
         assert_eq!(config.min_occurrences, 3);
         assert_eq!(config.auto_approve_threshold, 0.9);
         assert!(!config.auto_enable);
-        assert!(config.enabled_pattern_types.contains(&PatternType::ErrorPattern));
+        assert!(config
+            .enabled_pattern_types
+            .contains(&PatternType::ErrorPattern));
     }
 }

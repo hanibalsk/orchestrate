@@ -63,11 +63,21 @@ export function AgentStateBadge({ state }: { state: AgentState }) {
 // Helper component for agent type badges
 export function AgentTypeBadge({ type }: { type: AgentType }) {
   const labels: Record<AgentType, string> = {
+    // Development agents
     story_developer: 'Story Developer',
     code_reviewer: 'Code Reviewer',
     issue_fixer: 'Issue Fixer',
     explorer: 'Explorer',
+    // BMAD agents
+    bmad_orchestrator: 'BMAD Orchestrator',
+    bmad_planner: 'BMAD Planner',
+    // PR management
     pr_shepherd: 'PR Shepherd',
+    pr_controller: 'PR Controller',
+    conflict_resolver: 'Conflict Resolver',
+    // System agents
+    background_controller: 'Background Controller',
+    scheduler: 'Scheduler',
   };
 
   return <Badge variant="secondary">{labels[type]}</Badge>;

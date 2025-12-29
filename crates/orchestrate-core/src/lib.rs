@@ -9,25 +9,25 @@
 
 pub mod agent;
 pub mod database;
+pub mod epic;
 pub mod error;
 pub mod instruction;
 pub mod learning;
 pub mod message;
 pub mod network;
+pub mod pr;
 pub mod session;
 pub mod shell_state;
 pub mod worktree;
-pub mod pr;
-pub mod epic;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
-pub use database::{Database, AgentStats, TokenStats, DailyTokenUsage};
+pub use database::{AgentStats, DailyTokenUsage, Database, TokenStats};
+pub use epic::{BmadPhase, Epic, EpicStatus, Story, StoryStatus};
 pub use error::{Error, Result};
 pub use message::{Message, MessageRole};
+pub use pr::{MergeStrategy, PrStatus, PullRequest};
 pub use session::Session;
 pub use worktree::{Worktree, WorktreeStatus};
-pub use pr::{PullRequest, PrStatus, MergeStrategy};
-pub use epic::{Epic, Story, EpicStatus, StoryStatus, BmadPhase};
 
 // Re-export instruction types
 pub use instruction::{
@@ -36,17 +36,15 @@ pub use instruction::{
 };
 
 // Re-export learning types
-pub use learning::{LearningEngine, CleanupResult};
+pub use learning::{CleanupResult, LearningEngine};
 
 // Re-export network types
 pub use network::{
-    AgentCapability, AgentHandle, AgentId, DependencyCondition, DependencyGraph,
-    DependencySet, NetworkCoordinator, NetworkEvent, NetworkValidator,
-    RecoveryAction, Skill, SkillDefinition, SkillRegistry, StateGraph,
-    StateMachine, StatePropagation, StateRequirement, StateTransition,
-    StepOutput, StepOutputType, ValidationError, ValidationResult,
-    MAX_STEP_OUTPUT_DATA_SIZE,
+    AgentCapability, AgentHandle, AgentId, DependencyCondition, DependencyGraph, DependencySet,
+    NetworkCoordinator, NetworkEvent, NetworkValidator, RecoveryAction, Skill, SkillDefinition,
+    SkillRegistry, StateGraph, StateMachine, StatePropagation, StateRequirement, StateTransition,
+    StepOutput, StepOutputType, ValidationError, ValidationResult, MAX_STEP_OUTPUT_DATA_SIZE,
 };
 
 // Re-export shell state types
-pub use shell_state::{ShellState, QueueEntry, ShepherdLock};
+pub use shell_state::{QueueEntry, ShellState, ShepherdLock};

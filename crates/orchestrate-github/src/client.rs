@@ -20,7 +20,10 @@ impl GitHubClient {
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to get repo info: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to get repo info: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         #[derive(Deserialize)]
@@ -44,11 +47,16 @@ impl GitHubClient {
     /// Create a PR
     pub fn create_pr(&self, title: &str, body: &str, base: &str) -> Result<i32> {
         let output = Command::new("gh")
-            .args(["pr", "create", "--title", title, "--body", body, "--base", base])
+            .args([
+                "pr", "create", "--title", title, "--body", body, "--base", base,
+            ])
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to create PR: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to create PR: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         // Get PR number
@@ -64,14 +72,19 @@ impl GitHubClient {
     pub fn get_pr_state(&self, number: i32) -> Result<PrState> {
         let output = Command::new("gh")
             .args([
-                "pr", "view",
+                "pr",
+                "view",
                 &number.to_string(),
-                "--json", "state,mergeable,reviewDecision",
+                "--json",
+                "state,mergeable,reviewDecision",
             ])
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to get PR state: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to get PR state: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         Ok(serde_json::from_slice(&output.stdout)?)
@@ -81,14 +94,19 @@ impl GitHubClient {
     pub fn get_checks(&self, number: i32) -> Result<Vec<Check>> {
         let output = Command::new("gh")
             .args([
-                "pr", "checks",
+                "pr",
+                "checks",
                 &number.to_string(),
-                "--json", "name,conclusion,status",
+                "--json",
+                "name,conclusion,status",
             ])
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to get checks: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to get checks: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         Ok(serde_json::from_slice(&output.stdout)?)
@@ -105,7 +123,8 @@ impl GitHubClient {
 
         let output = Command::new("gh")
             .args([
-                "pr", "merge",
+                "pr",
+                "merge",
                 &number.to_string(),
                 strategy_arg,
                 "--delete-branch",
@@ -113,7 +132,10 @@ impl GitHubClient {
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to merge PR: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to merge PR: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         Ok(())
@@ -152,7 +174,10 @@ impl GitHubClient {
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to get threads: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to get threads: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         #[derive(Deserialize)]
@@ -254,7 +279,10 @@ impl GitHubClient {
             .output()?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to resolve thread: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to resolve thread: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         Ok(())

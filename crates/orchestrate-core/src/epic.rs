@@ -234,7 +234,11 @@ pub struct Story {
 
 impl Story {
     /// Create a new story
-    pub fn new(id: impl Into<String>, epic_id: impl Into<String>, title: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        epic_id: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: id.into(),
@@ -287,9 +291,18 @@ mod tests {
 
     #[test]
     fn test_epic_status_from_str() {
-        assert_eq!(EpicStatus::from_str("pending").unwrap(), EpicStatus::Pending);
-        assert_eq!(EpicStatus::from_str("in_progress").unwrap(), EpicStatus::InProgress);
-        assert_eq!(EpicStatus::from_str("completed").unwrap(), EpicStatus::Completed);
+        assert_eq!(
+            EpicStatus::from_str("pending").unwrap(),
+            EpicStatus::Pending
+        );
+        assert_eq!(
+            EpicStatus::from_str("in_progress").unwrap(),
+            EpicStatus::InProgress
+        );
+        assert_eq!(
+            EpicStatus::from_str("completed").unwrap(),
+            EpicStatus::Completed
+        );
         assert!(EpicStatus::from_str("invalid").is_err());
     }
 
@@ -319,8 +332,7 @@ mod tests {
 
     #[test]
     fn test_epic_with_source() {
-        let epic = Epic::new("7A", "Auth")
-            .with_source("docs/epics/auth.md");
+        let epic = Epic::new("7A", "Auth").with_source("docs/epics/auth.md");
 
         assert_eq!(epic.source_file, Some("docs/epics/auth.md".to_string()));
     }
@@ -394,8 +406,7 @@ mod tests {
             "Form validates input"
         ]);
 
-        let story = Story::new("7A-1", "7A", "Add login form")
-            .with_criteria(criteria.clone());
+        let story = Story::new("7A-1", "7A", "Add login form").with_criteria(criteria.clone());
 
         assert_eq!(story.acceptance_criteria, Some(criteria));
     }

@@ -2,17 +2,16 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use orchestrate_claude::{AgentLoop, ClaudeCliClient, ClaudeClient};
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CustomInstruction, Database,
-    Epic, EpicStatus, Story, StoryStatus, BmadPhase,
-    LearningEngine, PatternStatus, ShellState, Worktree,
+    Agent, AgentState, AgentType, CustomInstruction, Database, Epic, EpicStatus,
+    LearningEngine, PatternStatus, ShellState, Story, StoryStatus, Worktree,
 };
-use orchestrate_claude::{AgentLoop, ClaudeClient, ClaudeCliClient};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tracing::{info, warn, error, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
 /// Initialize logging with the specified verbosity level
@@ -28,13 +27,13 @@ fn init_logging(verbose: u8, quiet: bool, json: bool) -> Result<()> {
         }
     };
 
-    let filter = EnvFilter::from_default_env()
-        .add_directive(format!("orchestrate={}", level).parse()?);
+    let filter =
+        EnvFilter::from_default_env().add_directive(format!("orchestrate={}", level).parse()?);
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(verbose >= 2)      // Show module path at debug+
-        .with_file(verbose >= 3)        // Show file:line at trace
+        .with_target(verbose >= 2) // Show module path at debug+
+        .with_file(verbose >= 3) // Show file:line at trace
         .with_line_number(verbose >= 3);
 
     if json {
@@ -55,7 +54,11 @@ struct Cli {
     command: Commands,
 
     /// Database path
-    #[arg(long, env = "ORCHESTRATE_DB_PATH", default_value = "~/.orchestrate/orchestrate.db")]
+    #[arg(
+        long,
+        env = "ORCHESTRATE_DB_PATH",
+        default_value = "~/.orchestrate/orchestrate.db"
+    )]
     db_path: String,
 
     /// Increase verbosity (-v: info, -vv: debug, -vvv: trace)
@@ -138,11 +141,6 @@ enum Commands {
         #[command(subcommand)]
         action: TokensAction,
     },
-    /// Story management
-    Story {
-        #[command(subcommand)]
-        action: StoryAction,
-    },
 }
 
 #[derive(Subcommand)]
@@ -188,21 +186,13 @@ enum AgentAction {
         state: Option<String>,
     },
     /// Show agent details
-    Show {
-        id: String,
-    },
+    Show { id: String },
     /// Pause an agent
-    Pause {
-        id: String,
-    },
+    Pause { id: String },
     /// Resume an agent
-    Resume {
-        id: String,
-    },
+    Resume { id: String },
     /// Terminate an agent
-    Terminate {
-        id: String,
-    },
+    Terminate { id: String },
 }
 
 #[derive(Subcommand)]
@@ -240,9 +230,7 @@ enum WtAction {
     /// List worktrees
     List,
     /// Remove a worktree
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -283,6 +271,18 @@ enum StoryAction {
     Show {
         /// Story ID (e.g., epic-001.1)
         id: String,
+    },
+    /// Create a new story
+    Create {
+        /// Epic ID
+        #[arg(short, long)]
+        epic_id: String,
+        /// Story title
+        #[arg(short, long)]
+        title: String,
+        /// Story description
+        #[arg(short, long)]
+        description: Option<String>,
     },
 }
 
@@ -479,36 +479,6 @@ enum TokensAction {
     },
 }
 
-#[derive(Subcommand)]
-enum StoryAction {
-    /// List stories
-    List {
-        /// Filter by epic ID
-        #[arg(short, long)]
-        epic: Option<String>,
-        /// Filter by status
-        #[arg(short, long)]
-        status: Option<String>,
-    },
-    /// Show story details
-    Show {
-        /// Story ID
-        id: String,
-    },
-    /// Create a new story
-    Create {
-        /// Epic ID
-        #[arg(short, long)]
-        epic_id: String,
-        /// Story title
-        #[arg(short, long)]
-        title: String,
-        /// Story description
-        #[arg(short, long)]
-        description: Option<String>,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -529,7 +499,13 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Daemon { action } => match action {
-            DaemonAction::Start { port, max_concurrent, poll_interval, model, use_cli } => {
+            DaemonAction::Start {
+                port,
+                max_concurrent,
+                poll_interval,
+                model,
+                use_cli,
+            } => {
                 run_daemon(db, port, max_concurrent, poll_interval, model, use_cli).await?;
             }
             DaemonAction::Stop => {
@@ -544,7 +520,11 @@ async fn main() -> Result<()> {
         },
 
         Commands::Agent { action } => match action {
-            AgentAction::Spawn { agent_type, task, worktree } => {
+            AgentAction::Spawn {
+                agent_type,
+                task,
+                worktree,
+            } => {
                 let agent_type = parse_agent_type(&agent_type)?;
                 let mut agent = Agent::new(agent_type, task);
 
@@ -629,7 +609,10 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            PrAction::Create { worktree: _, title: _ } => {
+            PrAction::Create {
+                worktree: _,
+                title: _,
+            } => {
                 println!("Creating PR... (not implemented)");
             }
             PrAction::Merge { number, strategy } => {
@@ -656,11 +639,19 @@ async fn main() -> Result<()> {
                     println!("  PR #{} (checking status...)", pr_num);
                     // Try to get more info from gh
                     if let Ok(output) = std::process::Command::new("gh")
-                        .args(["pr", "view", &pr_num.to_string(), "--json", "title,state,url"])
+                        .args([
+                            "pr",
+                            "view",
+                            &pr_num.to_string(),
+                            "--json",
+                            "title,state,url",
+                        ])
                         .output()
                     {
                         if output.status.success() {
-                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                            if let Ok(json) =
+                                serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            {
                                 println!("  Title: {}", json["title"].as_str().unwrap_or("-"));
                                 println!("  State: {}", json["state"].as_str().unwrap_or("-"));
                                 println!("  URL: {}", json["url"].as_str().unwrap_or("-"));
@@ -698,7 +689,11 @@ async fn main() -> Result<()> {
         },
 
         Commands::Bmad { action } => match action {
-            BmadAction::Process { pattern, dir, dry_run } => {
+            BmadAction::Process {
+                pattern,
+                dir,
+                dry_run,
+            } => {
                 process_bmad_epics(&db, &dir, pattern.as_deref(), dry_run).await?;
             }
             BmadAction::Status => {
@@ -706,6 +701,73 @@ async fn main() -> Result<()> {
             }
             BmadAction::Reset { force } => {
                 reset_bmad_state(&db, force).await?;
+            }
+        },
+
+        Commands::Story { action } => match action {
+            StoryAction::List { epic, status } => {
+                let status_filter = status.as_ref().map(|s| parse_story_status(s)).transpose()?;
+                let epic_filter = epic.as_deref();
+
+                let stories = if let Some(epic_id) = epic_filter {
+                    db.get_stories_for_epic(epic_id).await?
+                } else {
+                    db.list_stories(None).await?
+                };
+
+                // Filter by status
+                let stories: Vec<_> = if let Some(filter_status) = status_filter {
+                    stories
+                        .into_iter()
+                        .filter(|s| s.status == filter_status)
+                        .collect()
+                } else {
+                    stories
+                };
+
+                if stories.is_empty() {
+                    println!("No stories found");
+                    return Ok(());
+                }
+
+                println!("{:<20} {:<15} {:<15} {}", "ID", "EPIC", "STATUS", "TITLE");
+                println!("{}", "-".repeat(100));
+                for story in stories {
+                    println!(
+                        "{:<20} {:<15} {:<15} {}",
+                        story.id,
+                        story.epic_id,
+                        format!("{:?}", story.status),
+                        &story.title[..story.title.len().min(40)]
+                    );
+                }
+            }
+            StoryAction::Show { id } => {
+                show_story(&db, &id).await?;
+            }
+            StoryAction::Create {
+                epic_id,
+                title,
+                description,
+            } => {
+                // Generate story ID
+                let stories = db.get_stories_for_epic(&epic_id).await?;
+                let story_num = stories.len() + 1;
+                let story_id = format!("{}.{}", epic_id, story_num);
+
+                // Create story
+                let mut story = Story::new(&story_id, &epic_id, &title);
+                story.description = description.clone();
+
+                // Save to database
+                db.upsert_story(&story).await?;
+
+                println!("✓ Story created: {}", story_id);
+                println!("  Epic: {}", epic_id);
+                println!("  Title: {}", title);
+                if let Some(ref desc) = description {
+                    println!("  Description: {}", desc);
+                }
             }
         },
 
@@ -753,7 +815,9 @@ async fn main() -> Result<()> {
                     running,
                     paused,
                     queue.len(),
-                    current_pr.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string()),
+                    current_pr
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "null".to_string()),
                     active_shepherds.len()
                 );
             } else {
@@ -761,12 +825,23 @@ async fn main() -> Result<()> {
                 println!("║              ORCHESTRATE STATUS                  ║");
                 println!("╠══════════════════════════════════════════════════╣");
                 println!("║ Database Agents                                  ║");
-                println!("║   Total: {:3}  Running: {:3}  Paused: {:3}         ║", agents.len(), running, paused);
+                println!(
+                    "║   Total: {:3}  Running: {:3}  Paused: {:3}         ║",
+                    agents.len(),
+                    running,
+                    paused
+                );
                 println!("╠══════════════════════════════════════════════════╣");
                 println!("║ PR Queue                                         ║");
-                println!("║   Queued: {:3}                                    ║", queue.len());
+                println!(
+                    "║   Queued: {:3}                                    ║",
+                    queue.len()
+                );
                 if let Some(pr_num) = current_pr {
-                    println!("║   Current PR: #{}                                ║", pr_num);
+                    println!(
+                        "║   Current PR: #{}                                ║",
+                        pr_num
+                    );
                 } else {
                     println!("║   Current PR: (none)                             ║");
                 }
@@ -776,7 +851,10 @@ async fn main() -> Result<()> {
                     println!("║   (none)                                         ║");
                 } else {
                     for lock in &active_shepherds {
-                        println!("║   PR #{} (PID: {})                            ║", lock.pr_number, lock.pid);
+                        println!(
+                            "║   PR #{} (PID: {})                            ║",
+                            lock.pr_number, lock.pid
+                        );
                     }
                 }
                 println!("╚══════════════════════════════════════════════════╝");
@@ -809,7 +887,10 @@ async fn main() -> Result<()> {
                 println!("Verbosity: {}", cli.verbose);
                 println!("Quiet mode: {}", cli.quiet);
                 println!("JSON logging: {}", cli.log_json);
-                println!("RUST_LOG: {}", std::env::var("RUST_LOG").unwrap_or_else(|_| "(not set)".to_string()));
+                println!(
+                    "RUST_LOG: {}",
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| "(not set)".to_string())
+                );
             }
             DebugAction::Dump { target } => {
                 match target.as_str() {
@@ -819,7 +900,9 @@ async fn main() -> Result<()> {
                         for agent in &agents {
                             println!("{:#?}", agent);
                         }
-                        if target == "agents" { return Ok(()); }
+                        if target == "agents" {
+                            return Ok(());
+                        }
                     }
                     _ => {}
                 }
@@ -830,7 +913,9 @@ async fn main() -> Result<()> {
                         for pr in &prs {
                             println!("{:#?}", pr);
                         }
-                        if target == "prs" { return Ok(()); }
+                        if target == "prs" {
+                            return Ok(());
+                        }
                     }
                     _ => {}
                 }
@@ -841,18 +926,26 @@ async fn main() -> Result<()> {
                         for epic in &epics {
                             println!("{:#?}", epic);
                         }
-                        if target == "epics" { return Ok(()); }
+                        if target == "epics" {
+                            return Ok(());
+                        }
                     }
                     _ => {}
                 }
                 if !["agents", "prs", "epics", "all"].contains(&target.as_str()) {
-                    anyhow::bail!("Unknown dump target: {}. Use: agents, prs, epics, all", target);
+                    anyhow::bail!(
+                        "Unknown dump target: {}. Use: agents, prs, epics, all",
+                        target
+                    );
                 }
             }
         },
 
         Commands::Instructions { action } => match action {
-            InstructionAction::List { enabled_only, learned_only } => {
+            InstructionAction::List {
+                enabled_only,
+                learned_only,
+            } => {
                 let source = if learned_only {
                     Some(orchestrate_core::InstructionSource::Learned)
                 } else {
@@ -865,7 +958,10 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                println!("{:<6} {:<25} {:<10} {:<8} {:<10} {}", "ID", "NAME", "SCOPE", "ENABLED", "SOURCE", "CONTENT");
+                println!(
+                    "{:<6} {:<25} {:<10} {:<8} {:<10} {}",
+                    "ID", "NAME", "SCOPE", "ENABLED", "SOURCE", "CONTENT"
+                );
                 println!("{}", "-".repeat(100));
                 for inst in instructions {
                     let content_preview = if inst.content.len() > 40 {
@@ -876,7 +972,11 @@ async fn main() -> Result<()> {
                     println!(
                         "{:<6} {:<25} {:<10} {:<8} {:<10} {}",
                         inst.id,
-                        if inst.name.len() > 25 { format!("{}...", &inst.name[..22]) } else { inst.name },
+                        if inst.name.len() > 25 {
+                            format!("{}...", &inst.name[..22])
+                        } else {
+                            inst.name
+                        },
                         inst.scope.as_str(),
                         if inst.enabled { "yes" } else { "no" },
                         inst.source.as_str(),
@@ -910,16 +1010,22 @@ async fn main() -> Result<()> {
                 println!("{}", "-".repeat(40));
                 println!("{}", instruction.content);
             }
-            InstructionAction::Create { name, content, scope, agent_type, priority } => {
+            InstructionAction::Create {
+                name,
+                content,
+                scope,
+                agent_type,
+                priority,
+            } => {
                 let instruction = if scope == "agent_type" {
-                    let agent_type = agent_type
-                        .ok_or_else(|| anyhow::anyhow!("--agent-type required for scope=agent_type"))?;
+                    let agent_type = agent_type.ok_or_else(|| {
+                        anyhow::anyhow!("--agent-type required for scope=agent_type")
+                    })?;
                     let agent_type = parse_agent_type(&agent_type)?;
                     CustomInstruction::for_agent_type(&name, &content, agent_type)
                         .with_priority(priority)
                 } else {
-                    CustomInstruction::global(&name, &content)
-                        .with_priority(priority)
+                    CustomInstruction::global(&name, &content).with_priority(priority)
                 };
 
                 let id = db.insert_instruction(&instruction).await?;
@@ -928,18 +1034,27 @@ async fn main() -> Result<()> {
             InstructionAction::Enable { id_or_name } => {
                 let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
                 db.set_instruction_enabled(instruction.id, true).await?;
-                println!("Enabled instruction: {} (ID: {})", instruction.name, instruction.id);
+                println!(
+                    "Enabled instruction: {} (ID: {})",
+                    instruction.name, instruction.id
+                );
             }
             InstructionAction::Disable { id_or_name } => {
                 let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
                 db.set_instruction_enabled(instruction.id, false).await?;
-                println!("Disabled instruction: {} (ID: {})", instruction.name, instruction.id);
+                println!(
+                    "Disabled instruction: {} (ID: {})",
+                    instruction.name, instruction.id
+                );
             }
             InstructionAction::Delete { id_or_name, force } => {
                 let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
 
                 if !force {
-                    print!("Delete instruction '{}' (ID: {})? [y/N] ", instruction.name, instruction.id);
+                    print!(
+                        "Delete instruction '{}' (ID: {})? [y/N] ",
+                        instruction.name, instruction.id
+                    );
                     use std::io::{self, Write};
                     io::stdout().flush()?;
                     let mut input = String::new();
@@ -951,7 +1066,10 @@ async fn main() -> Result<()> {
                 }
 
                 db.delete_instruction(instruction.id).await?;
-                println!("Deleted instruction: {} (ID: {})", instruction.name, instruction.id);
+                println!(
+                    "Deleted instruction: {} (ID: {})",
+                    instruction.name, instruction.id
+                );
             }
             InstructionAction::Stats { id_or_name } => {
                 if let Some(ref id_or_name) = id_or_name {
@@ -974,7 +1092,10 @@ async fn main() -> Result<()> {
                             println!("Last failure: {}", dt);
                         }
                     } else {
-                        println!("No effectiveness data for instruction: {}", instruction.name);
+                        println!(
+                            "No effectiveness data for instruction: {}",
+                            instruction.name
+                        );
                     }
                 } else {
                     let instructions = db.list_instructions(false, None, None).await?;
@@ -983,14 +1104,21 @@ async fn main() -> Result<()> {
                         return Ok(());
                     }
 
-                    println!("{:<6} {:<25} {:<8} {:<8} {:<8} {:<10}", "ID", "NAME", "USAGE", "SUCCESS", "FAILURE", "PENALTY");
+                    println!(
+                        "{:<6} {:<25} {:<8} {:<8} {:<8} {:<10}",
+                        "ID", "NAME", "USAGE", "SUCCESS", "FAILURE", "PENALTY"
+                    );
                     println!("{}", "-".repeat(80));
                     for inst in instructions {
                         if let Some(eff) = db.get_instruction_effectiveness(inst.id).await? {
                             println!(
                                 "{:<6} {:<25} {:<8} {:<8} {:<8} {:<10.2}",
                                 inst.id,
-                                if inst.name.len() > 25 { format!("{}...", &inst.name[..22]) } else { inst.name },
+                                if inst.name.len() > 25 {
+                                    format!("{}...", &inst.name[..22])
+                                } else {
+                                    inst.name
+                                },
                                 eff.usage_count,
                                 eff.success_count,
                                 eff.failure_count,
@@ -1016,37 +1144,55 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                println!("{:<6} {:<20} {:<15} {:<8} {:<15}", "ID", "TYPE", "AGENT_TYPE", "COUNT", "STATUS");
+                println!(
+                    "{:<6} {:<20} {:<15} {:<8} {:<15}",
+                    "ID", "TYPE", "AGENT_TYPE", "COUNT", "STATUS"
+                );
                 println!("{}", "-".repeat(80));
                 for pattern in patterns {
                     println!(
                         "{:<6} {:<20} {:<15} {:<8} {:<15}",
                         pattern.id,
                         pattern.pattern_type.as_str(),
-                        pattern.agent_type.map(|t| t.as_str().to_string()).unwrap_or_else(|| "global".to_string()),
+                        pattern
+                            .agent_type
+                            .map(|t| t.as_str().to_string())
+                            .unwrap_or_else(|| "global".to_string()),
                         pattern.occurrence_count,
                         pattern.status.as_str()
                     );
                 }
             }
             LearnAction::Approve { pattern_id } => {
-                let pattern = db.get_pattern(pattern_id).await?
+                let pattern = db
+                    .get_pattern(pattern_id)
+                    .await?
                     .ok_or_else(|| anyhow::anyhow!("Pattern not found: {}", pattern_id))?;
 
                 let engine = LearningEngine::new();
-                let instruction = engine.generate_instruction_from_pattern(&pattern)
-                    .ok_or_else(|| anyhow::anyhow!("Could not generate instruction from pattern"))?;
+                let instruction = engine
+                    .generate_instruction_from_pattern(&pattern)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Could not generate instruction from pattern")
+                    })?;
 
                 let instruction_id = db.insert_instruction(&instruction).await?;
-                db.update_pattern_status(pattern_id, PatternStatus::Approved, Some(instruction_id)).await?;
+                db.update_pattern_status(pattern_id, PatternStatus::Approved, Some(instruction_id))
+                    .await?;
 
-                println!("Approved pattern {} and created instruction {}", pattern_id, instruction_id);
+                println!(
+                    "Approved pattern {} and created instruction {}",
+                    pattern_id, instruction_id
+                );
             }
             LearnAction::Reject { pattern_id } => {
-                let _ = db.get_pattern(pattern_id).await?
+                let _ = db
+                    .get_pattern(pattern_id)
+                    .await?
                     .ok_or_else(|| anyhow::anyhow!("Pattern not found: {}", pattern_id))?;
 
-                db.update_pattern_status(pattern_id, PatternStatus::Rejected, None).await?;
+                db.update_pattern_status(pattern_id, PatternStatus::Rejected, None)
+                    .await?;
                 println!("Rejected pattern {}", pattern_id);
             }
             LearnAction::Analyze => {
@@ -1069,9 +1215,15 @@ async fn main() -> Result<()> {
                 println!("Min occurrences: {}", config.min_occurrences);
                 println!("Auto-approve threshold: {}", config.auto_approve_threshold);
                 println!("Auto-enable: {}", config.auto_enable);
-                println!("Penalty disable threshold: {}", config.penalty_disable_threshold);
+                println!(
+                    "Penalty disable threshold: {}",
+                    config.penalty_disable_threshold
+                );
                 println!("Min usage for deletion: {}", config.min_usage_for_deletion);
-                println!("Deletion success rate threshold: {}", config.deletion_success_rate_threshold);
+                println!(
+                    "Deletion success rate threshold: {}",
+                    config.deletion_success_rate_threshold
+                );
                 println!("Enabled pattern types: {:?}", config.enabled_pattern_types);
             }
             LearnAction::Cleanup => {
@@ -1089,16 +1241,29 @@ async fn main() -> Result<()> {
             LearnAction::ResetPenalty { id_or_name } => {
                 let instruction = get_instruction_by_id_or_name(&db, &id_or_name).await?;
                 db.reset_penalty(instruction.id).await?;
-                println!("Reset penalty for instruction: {} (ID: {})", instruction.name, instruction.id);
+                println!(
+                    "Reset penalty for instruction: {} (ID: {})",
+                    instruction.name, instruction.id
+                );
             }
         },
 
         Commands::History { action } => match action {
-            HistoryAction::Agents { state, agent_type, limit, offset } => {
+            HistoryAction::Agents {
+                state,
+                agent_type,
+                limit,
+                offset,
+            } => {
                 let state_filter = state.as_ref().map(|s| parse_agent_state(s)).transpose()?;
-                let type_filter = agent_type.as_ref().map(|t| parse_agent_type(t)).transpose()?;
+                let type_filter = agent_type
+                    .as_ref()
+                    .map(|t| parse_agent_type(t))
+                    .transpose()?;
 
-                let agents = db.list_agents_paginated(limit, offset, state_filter, type_filter).await?;
+                let agents = db
+                    .list_agents_paginated(limit, offset, state_filter, type_filter)
+                    .await?;
                 let total = db.count_agents().await?;
 
                 if agents.is_empty() {
@@ -1106,9 +1271,17 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                println!("Showing {} of {} agents (offset {})", agents.len(), total, offset);
+                println!(
+                    "Showing {} of {} agents (offset {})",
+                    agents.len(),
+                    total,
+                    offset
+                );
                 println!();
-                println!("{:<36} {:<18} {:<12} {:<20}", "ID", "TYPE", "STATE", "CREATED");
+                println!(
+                    "{:<36} {:<18} {:<12} {:<20}",
+                    "ID", "TYPE", "STATE", "CREATED"
+                );
                 println!("{}", "-".repeat(90));
                 for agent in agents {
                     println!(
@@ -1124,7 +1297,12 @@ async fn main() -> Result<()> {
                     println!("Use --offset {} to see more", offset + limit);
                 }
             }
-            HistoryAction::Messages { agent_id, limit, offset, full } => {
+            HistoryAction::Messages {
+                agent_id,
+                limit,
+                offset,
+                full,
+            } => {
                 let uuid = uuid::Uuid::parse_str(&agent_id)?;
                 let messages = db.get_messages_paginated(uuid, limit, offset).await?;
                 let total = db.count_messages(uuid).await?;
@@ -1141,7 +1319,12 @@ async fn main() -> Result<()> {
                     println!();
                 }
 
-                println!("Showing {} of {} messages (offset {})", messages.len(), total, offset);
+                println!(
+                    "Showing {} of {} messages (offset {})",
+                    messages.len(),
+                    total,
+                    offset
+                );
                 println!();
 
                 for (i, msg) in messages.iter().enumerate() {
@@ -1197,7 +1380,10 @@ async fn main() -> Result<()> {
                     println!("Type: {:?}", agent.agent_type);
                     println!("State: {:?}", agent.state);
                     println!("Task: {}", agent.task);
-                    println!("Worktree: {}", agent.worktree_id.as_deref().unwrap_or("(none)"));
+                    println!(
+                        "Worktree: {}",
+                        agent.worktree_id.as_deref().unwrap_or("(none)")
+                    );
                     println!("Created: {}", agent.created_at);
                     println!("Updated: {}", agent.updated_at);
                     println!();
@@ -1263,13 +1449,15 @@ async fn main() -> Result<()> {
                     let state_str = format!("{:?}", agent.state);
 
                     println!("║ {} ║", agent.id);
-                    println!("║   Type: {:<15} State: {:<12} Msgs: {:<6} Tokens: {:<10} ║",
+                    println!(
+                        "║   Type: {:<15} State: {:<12} Msgs: {:<6} Tokens: {:<10} ║",
                         &type_str[..type_str.len().min(15)],
                         &state_str[..state_str.len().min(12)],
                         stats.message_count,
                         stats.total_tokens
                     );
-                    println!("║   Task: {:<68} ║",
+                    println!(
+                        "║   Task: {:<68} ║",
                         if agent.task.len() > 68 {
                             format!("{}...", &agent.task[..65])
                         } else {
@@ -1299,20 +1487,24 @@ async fn main() -> Result<()> {
 
                 println!("Daily Token Usage (Last {} Days)", days);
                 println!("{}", "=".repeat(110));
-                println!("{:<12} {:<25} {:>12} {:>12} {:>12} {:>10} {:>12}",
-                    "DATE", "MODEL", "INPUT", "OUTPUT", "CACHE_READ", "REQUESTS", "EST. COST");
+                println!(
+                    "{:<12} {:<25} {:>12} {:>12} {:>12} {:>10} {:>12}",
+                    "DATE", "MODEL", "INPUT", "OUTPUT", "CACHE_READ", "REQUESTS", "EST. COST"
+                );
                 println!("{}", "-".repeat(110));
 
                 let mut total_cost = 0.0;
                 for day in &usage {
-                    let cost_str = day.estimated_cost_usd
+                    let cost_str = day
+                        .estimated_cost_usd
                         .map(|c| format!("${:.4}", c))
                         .unwrap_or_else(|| "-".to_string());
                     if let Some(c) = day.estimated_cost_usd {
                         total_cost += c;
                     }
 
-                    println!("{:<12} {:<25} {:>12} {:>12} {:>12} {:>10} {:>12}",
+                    println!(
+                        "{:<12} {:<25} {:>12} {:>12} {:>12} {:>10} {:>12}",
                         day.date,
                         &day.model[..day.model.len().min(25)],
                         format_tokens(day.total_input_tokens),
@@ -1341,32 +1533,56 @@ async fn main() -> Result<()> {
                     println!("{}", "=".repeat(50));
                     println!("Type: {:?}", agent.agent_type);
                     println!("State: {:?}", agent.state);
-                    println!("Task: {}", if agent.task.len() > 60 {
-                        format!("{}...", &agent.task[..57])
-                    } else {
-                        agent.task.clone()
-                    });
+                    println!(
+                        "Task: {}",
+                        if agent.task.len() > 60 {
+                            format!("{}...", &agent.task[..57])
+                        } else {
+                            agent.task.clone()
+                        }
+                    );
                     println!();
                 }
 
                 println!("Token Usage");
                 println!("{}", "-".repeat(50));
                 println!("Turns:                  {:>12}", stats.turn_count);
-                println!("Input tokens:           {:>12}", format_tokens(stats.total_input_tokens));
-                println!("Output tokens:          {:>12}", format_tokens(stats.total_output_tokens));
-                println!("Total tokens:           {:>12}", format_tokens(stats.total_input_tokens + stats.total_output_tokens));
+                println!(
+                    "Input tokens:           {:>12}",
+                    format_tokens(stats.total_input_tokens)
+                );
+                println!(
+                    "Output tokens:          {:>12}",
+                    format_tokens(stats.total_output_tokens)
+                );
+                println!(
+                    "Total tokens:           {:>12}",
+                    format_tokens(stats.total_input_tokens + stats.total_output_tokens)
+                );
                 println!();
                 println!("Cache Performance");
                 println!("{}", "-".repeat(50));
-                println!("Cache reads:            {:>12}", format_tokens(stats.total_cache_read_tokens));
-                println!("Cache writes:           {:>12}", format_tokens(stats.total_cache_write_tokens));
+                println!(
+                    "Cache reads:            {:>12}",
+                    format_tokens(stats.total_cache_read_tokens)
+                );
+                println!(
+                    "Cache writes:           {:>12}",
+                    format_tokens(stats.total_cache_write_tokens)
+                );
                 println!("Cache hit rate:         {:>11.1}%", stats.cache_hit_rate);
                 println!();
                 println!("Context Usage");
                 println!("{}", "-".repeat(50));
                 println!("Avg context used:       {:>12.0}", stats.avg_context_used);
-                println!("Avg messages included:  {:>12.1}", stats.avg_messages_included);
-                println!("Messages summarized:    {:>12}", stats.total_messages_summarized);
+                println!(
+                    "Avg messages included:  {:>12.1}",
+                    stats.avg_messages_included
+                );
+                println!(
+                    "Messages summarized:    {:>12}",
+                    stats.total_messages_summarized
+                );
             }
             TokensAction::Session { session_id, json } => {
                 let stats = db.get_session_token_stats(&session_id).await?;
@@ -1379,14 +1595,29 @@ async fn main() -> Result<()> {
                 println!("Token Statistics for Session {}", session_id);
                 println!("{}", "=".repeat(50));
                 println!("Turns:                  {:>12}", stats.turn_count);
-                println!("Input tokens:           {:>12}", format_tokens(stats.total_input_tokens));
-                println!("Output tokens:          {:>12}", format_tokens(stats.total_output_tokens));
-                println!("Total tokens:           {:>12}", format_tokens(stats.total_input_tokens + stats.total_output_tokens));
+                println!(
+                    "Input tokens:           {:>12}",
+                    format_tokens(stats.total_input_tokens)
+                );
+                println!(
+                    "Output tokens:          {:>12}",
+                    format_tokens(stats.total_output_tokens)
+                );
+                println!(
+                    "Total tokens:           {:>12}",
+                    format_tokens(stats.total_input_tokens + stats.total_output_tokens)
+                );
                 println!();
                 println!("Cache Performance");
                 println!("{}", "-".repeat(50));
-                println!("Cache reads:            {:>12}", format_tokens(stats.total_cache_read_tokens));
-                println!("Cache writes:           {:>12}", format_tokens(stats.total_cache_write_tokens));
+                println!(
+                    "Cache reads:            {:>12}",
+                    format_tokens(stats.total_cache_read_tokens)
+                );
+                println!(
+                    "Cache writes:           {:>12}",
+                    format_tokens(stats.total_cache_write_tokens)
+                );
                 println!("Cache hit rate:         {:>11.1}%", stats.cache_hit_rate);
             }
             TokensAction::Summary { days } => {
@@ -1411,25 +1642,58 @@ async fn main() -> Result<()> {
                 };
 
                 println!("╔══════════════════════════════════════════════════════════════╗");
-                println!("║               TOKEN USAGE SUMMARY ({} Days)                ║", days);
+                println!(
+                    "║               TOKEN USAGE SUMMARY ({} Days)                ║",
+                    days
+                );
                 println!("╠══════════════════════════════════════════════════════════════╣");
                 println!("║  Total Tokens                                                ║");
-                println!("║    Input:            {:>20}                    ║", format_tokens(total_input));
-                println!("║    Output:           {:>20}                    ║", format_tokens(total_output));
-                println!("║    Combined:         {:>20}                    ║", format_tokens(total_input + total_output));
+                println!(
+                    "║    Input:            {:>20}                    ║",
+                    format_tokens(total_input)
+                );
+                println!(
+                    "║    Output:           {:>20}                    ║",
+                    format_tokens(total_output)
+                );
+                println!(
+                    "║    Combined:         {:>20}                    ║",
+                    format_tokens(total_input + total_output)
+                );
                 println!("╠══════════════════════════════════════════════════════════════╣");
                 println!("║  Cache Performance                                           ║");
-                println!("║    Cache reads:      {:>20}                    ║", format_tokens(total_cache_read));
-                println!("║    Cache writes:     {:>20}                    ║", format_tokens(total_cache_write));
-                println!("║    Hit rate:         {:>19.1}%                    ║", cache_hit_rate);
+                println!(
+                    "║    Cache reads:      {:>20}                    ║",
+                    format_tokens(total_cache_read)
+                );
+                println!(
+                    "║    Cache writes:     {:>20}                    ║",
+                    format_tokens(total_cache_write)
+                );
+                println!(
+                    "║    Hit rate:         {:>19.1}%                    ║",
+                    cache_hit_rate
+                );
                 println!("╠══════════════════════════════════════════════════════════════╣");
                 println!("║  Activity                                                    ║");
-                println!("║    Total requests:   {:>20}                    ║", total_requests);
-                println!("║    Days with usage:  {:>20}                    ║", usage.len());
+                println!(
+                    "║    Total requests:   {:>20}                    ║",
+                    total_requests
+                );
+                println!(
+                    "║    Days with usage:  {:>20}                    ║",
+                    usage.len()
+                );
                 println!("╠══════════════════════════════════════════════════════════════╣");
                 println!("║  Estimated Cost                                              ║");
-                println!("║    Total:            {:>19}                     ║", format!("${:.4}", total_cost));
-                println!("║    Avg per day:      {:>19}                     ║", format!("${:.4}", total_cost / usage.len() as f64));
+                println!(
+                    "║    Total:            {:>19}                     ║",
+                    format!("${:.4}", total_cost)
+                );
+                println!(
+                    "║    Avg per day:      {:>19}                     ║",
+                    format!("${:.4}", total_cost / usage.len() as f64)
+                );
                 println!("╚══════════════════════════════════════════════════════════════╝");
             }
         },
@@ -1438,7 +1702,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn get_instruction_by_id_or_name(db: &Database, id_or_name: &str) -> Result<CustomInstruction> {
+async fn get_instruction_by_id_or_name(
+    db: &Database,
+    id_or_name: &str,
+) -> Result<CustomInstruction> {
     // Try parsing as ID first
     if let Ok(id) = id_or_name.parse::<i64>() {
         if let Some(inst) = db.get_instruction(id).await? {
@@ -1528,7 +1795,11 @@ async fn run_daemon(
         // Get API key from environment
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("CLAUDE_API_KEY"))
-            .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY or CLAUDE_API_KEY not set. Use --use-cli for OAuth."))?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "ANTHROPIC_API_KEY or CLAUDE_API_KEY not set. Use --use-cli for OAuth."
+                )
+            })?;
 
         DaemonClient::Api(ClaudeClient::new(api_key))
     };
@@ -1539,11 +1810,20 @@ async fn run_daemon(
     println!("║                    ORCHESTRATE DAEMON                        ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║  Mode:            {:<42} ║", mode_str);
-    println!("║  Model:           {:<42} ║", &model[..model.len().min(42)]);
+    println!(
+        "║  Model:           {:<42} ║",
+        &model[..model.len().min(42)]
+    );
     println!("║  Max concurrent:  {:<42} ║", max_concurrent);
-    println!("║  Poll interval:   {:<42} ║", format!("{}s", poll_interval));
+    println!(
+        "║  Poll interval:   {:<42} ║",
+        format!("{}s", poll_interval)
+    );
     if port > 0 {
-        println!("║  Web API:         {:<42} ║", format!("http://localhost:{}", port));
+        println!(
+            "║  Web API:         {:<42} ║",
+            format!("http://localhost:{}", port)
+        );
     } else {
         println!("║  Web API:         {:<42} ║", "disabled");
     }
@@ -1626,7 +1906,9 @@ async fn run_daemon(
 
                 info!("[AGENT {}] Starting execution", agent_id);
 
-                match run_single_agent(db_clone, client_clone, agent, model_clone, shutdown_clone).await {
+                match run_single_agent(db_clone, client_clone, agent, model_clone, shutdown_clone)
+                    .await
+                {
                     Ok(()) => {
                         info!("[AGENT {}] Completed successfully", agent_id);
                     }
@@ -1638,7 +1920,10 @@ async fn run_daemon(
         }
 
         // Clean up completed agents from tracking set
-        let running = db.list_agents_by_state(AgentState::Running).await.unwrap_or_default();
+        let running = db
+            .list_agents_by_state(AgentState::Running)
+            .await
+            .unwrap_or_default();
         let running_ids: std::collections::HashSet<_> = running.iter().map(|a| a.id).collect();
         active_agents.retain(|id| running_ids.contains(id));
 
@@ -1734,8 +2019,8 @@ async fn run_agent_with_cli(
     model: String,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
-    use tokio::process::Command;
     use orchestrate_core::Message;
+    use tokio::process::Command;
 
     // Transition through proper state machine: Created -> Initializing -> Running
     agent.transition_to(AgentState::Initializing)?;
@@ -1753,9 +2038,11 @@ async fn run_agent_with_cli(
     // Build command
     let mut cmd = Command::new("claude");
     cmd.arg("-p")
-        .arg("--output-format").arg("json")
-        .arg("--model").arg(&model)
-        .arg("--dangerously-skip-permissions");  // For autonomous operation
+        .arg("--output-format")
+        .arg("json")
+        .arg("--model")
+        .arg(&model)
+        .arg("--dangerously-skip-permissions"); // For autonomous operation
 
     // Set working directory to worktree path if available
     let working_dir: Option<String> = if let Some(ref worktree_id) = agent.worktree_id {
@@ -1786,7 +2073,10 @@ async fn run_agent_with_cli(
         "[AGENT {}] Running via CLI with model {}{}",
         agent.id,
         model,
-        working_dir.as_ref().map(|p| format!(" in {}", p)).unwrap_or_default()
+        working_dir
+            .as_ref()
+            .map(|p| format!(" in {}", p))
+            .unwrap_or_default()
     );
 
     let mut child = cmd.spawn()?;
@@ -1795,7 +2085,7 @@ async fn run_agent_with_cli(
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         stdin.write_all(prompt.as_bytes()).await?;
-        drop(stdin);  // Close stdin
+        drop(stdin); // Close stdin
     }
 
     // Wait for completion with shutdown check
@@ -1820,7 +2110,8 @@ async fn run_agent_with_cli(
 
                 // Parse response to get result
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                    let result_text = json.get("result")
+                    let result_text = json
+                        .get("result")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Task completed");
 
@@ -1830,12 +2121,32 @@ async fn run_agent_with_cli(
 
                     // Update token usage if available
                     if let Some(usage) = json.get("usage") {
-                        let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let input = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let output_tokens = usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let cache_read = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let cache_write = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
 
-                        db.update_daily_token_usage(&model, input, output_tokens, cache_read, cache_write).await.ok();
+                        db.update_daily_token_usage(
+                            &model,
+                            input,
+                            output_tokens,
+                            cache_read,
+                            cache_write,
+                        )
+                        .await
+                        .ok();
                     }
 
                     agent.transition_to(AgentState::Completed)?;
@@ -1861,6 +2172,83 @@ async fn run_agent_with_cli(
     result
 }
 
+// ==================== Story Functions ====================
+
+/// Parse story status from string
+fn parse_story_status(s: &str) -> Result<StoryStatus> {
+    match s.to_lowercase().as_str() {
+        "pending" => Ok(StoryStatus::Pending),
+        "in-progress" | "inprogress" => Ok(StoryStatus::InProgress),
+        "completed" => Ok(StoryStatus::Completed),
+        "blocked" => Ok(StoryStatus::Blocked),
+        "skipped" => Ok(StoryStatus::Skipped),
+        _ => anyhow::bail!(
+            "Unknown story status: {}. Valid: pending, in-progress, completed, blocked, skipped",
+            s
+        ),
+    }
+}
+
+/// Show detailed story information
+async fn show_story(db: &Database, id: &str) -> Result<()> {
+    let story = db
+        .get_story(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Story not found: {}", id))?;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║                      STORY DETAILS                           ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("Story: {}", story.id);
+    println!("Title: {}", story.title);
+    println!("Epic: {}", story.epic_id);
+    println!("Status: {:?}", story.status);
+    println!();
+
+    if let Some(ref desc) = story.description {
+        println!("Description:");
+        println!("{}", "-".repeat(60));
+        println!("{}", desc);
+        println!();
+    }
+
+    if let Some(ref criteria) = story.acceptance_criteria {
+        println!("Acceptance Criteria:");
+        println!("{}", "-".repeat(60));
+
+        // Try to parse as array of strings
+        if let Some(array) = criteria.as_array() {
+            for (i, item) in array.iter().enumerate() {
+                if let Some(text) = item.as_str() {
+                    println!("  {}. {}", i + 1, text);
+                }
+            }
+        } else if let Some(text) = criteria.as_str() {
+            println!("{}", text);
+        } else {
+            println!("{}", serde_json::to_string_pretty(criteria)?);
+        }
+        println!();
+    }
+
+    if let Some(agent_id) = story.agent_id {
+        println!("Assigned Agent: {}", agent_id);
+
+        // Try to get agent details
+        if let Ok(Some(agent)) = db.get_agent(agent_id).await {
+            println!("  Type: {:?}", agent.agent_type);
+            println!("  State: {:?}", agent.state);
+        }
+        println!();
+    }
+
+    println!("Created: {}", story.created_at);
+    println!("Updated: {}", story.updated_at);
+
+    Ok(())
+}
+
 // ==================== BMAD Functions ====================
 
 /// Process BMAD epics from the specified directory
@@ -1870,8 +2258,8 @@ async fn process_bmad_epics(
     pattern: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    use std::fs;
     use regex::Regex;
+    use std::fs;
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                    BMAD EPIC PROCESSOR                       ║");
@@ -1910,10 +2298,12 @@ async fn process_bmad_epics(
     }
 
     // Filter by pattern if provided
-    let pattern_regex = pattern.map(|p| {
-        let regex_pattern = p.replace("*", ".*").replace("?", ".");
-        Regex::new(&format!("^{}$", regex_pattern)).ok()
-    }).flatten();
+    let pattern_regex = pattern
+        .map(|p| {
+            let regex_pattern = p.replace("*", ".*").replace("?", ".");
+            Regex::new(&format!("^{}$", regex_pattern)).ok()
+        })
+        .flatten();
 
     let filtered_entries: Vec<_> = entries
         .into_iter()
@@ -1927,9 +2317,12 @@ async fn process_bmad_epics(
         })
         .collect();
 
-    println!("📋 Found {} epic file(s){}",
+    println!(
+        "📋 Found {} epic file(s){}",
         filtered_entries.len(),
-        pattern.map(|p| format!(" matching '{}'", p)).unwrap_or_default()
+        pattern
+            .map(|p| format!(" matching '{}'", p))
+            .unwrap_or_default()
     );
     println!();
 
@@ -1953,7 +2346,10 @@ async fn process_bmad_epics(
         println!("   Stories: {}", stories.len());
 
         if dry_run {
-            println!("   [DRY RUN] Would create epic and {} stories", stories.len());
+            println!(
+                "   [DRY RUN] Would create epic and {} stories",
+                stories.len()
+            );
             for story in &stories {
                 println!("      - {}: {}", story.id, story.title);
             }
@@ -1997,16 +2393,22 @@ async fn process_bmad_epics(
         }
 
         // Create agents for pending stories
-        let pending_stories: Vec<_> = stories.iter()
+        let pending_stories: Vec<_> = stories
+            .iter()
             .filter(|s| s.status == StoryStatus::Pending)
             .collect();
 
         if !pending_stories.is_empty() {
-            println!("   Creating agents for {} pending stories...", pending_stories.len());
+            println!(
+                "   Creating agents for {} pending stories...",
+                pending_stories.len()
+            );
 
             for story in pending_stories {
                 // Check if agent already exists for this story
-                let existing = db.list_stories(None).await?
+                let existing = db
+                    .list_stories(None)
+                    .await?
                     .iter()
                     .find(|s| s.id == story.id && s.agent_id.is_some())
                     .is_some();
@@ -2021,14 +2423,18 @@ async fn process_bmad_epics(
                     "Implement story {}: {}\n\n{}",
                     story.id,
                     story.title,
-                    story.description.as_deref().unwrap_or("No description provided.")
+                    story
+                        .description
+                        .as_deref()
+                        .unwrap_or("No description provided.")
                 );
 
                 let agent = Agent::new(AgentType::StoryDeveloper, &task);
                 db.insert_agent(&agent).await?;
 
                 // Link story to agent
-                db.update_story_status(&story.id, StoryStatus::Pending, Some(agent.id)).await?;
+                db.update_story_status(&story.id, StoryStatus::Pending, Some(agent.id))
+                    .await?;
 
                 println!("      ✓ Created agent for story {}", story.id);
             }
@@ -2065,7 +2471,9 @@ fn parse_epic_file(filename: &str, content: &str) -> Result<(Epic, Vec<Story>)> 
     let title = content
         .lines()
         .find_map(|line| {
-            title_regex.captures(line).map(|c| c.get(1).unwrap().as_str().to_string())
+            title_regex
+                .captures(line)
+                .map(|c| c.get(1).unwrap().as_str().to_string())
         })
         .unwrap_or_else(|| filename.replace(".md", "").replace("-", " "));
 
@@ -2177,12 +2585,25 @@ async fn show_bmad_status(db: &Database) -> Result<()> {
 
     for epic in &pending_epics {
         let stories = db.get_stories_for_epic(&epic.id).await?;
-        let completed = stories.iter().filter(|s| s.status == StoryStatus::Completed).count();
-        let in_progress = stories.iter().filter(|s| s.status == StoryStatus::InProgress).count();
-        let pending = stories.iter().filter(|s| s.status == StoryStatus::Pending).count();
-        let blocked = stories.iter().filter(|s| s.status == StoryStatus::Blocked).count();
+        let completed = stories
+            .iter()
+            .filter(|s| s.status == StoryStatus::Completed)
+            .count();
+        let in_progress = stories
+            .iter()
+            .filter(|s| s.status == StoryStatus::InProgress)
+            .count();
+        let pending = stories
+            .iter()
+            .filter(|s| s.status == StoryStatus::Pending)
+            .count();
+        let blocked = stories
+            .iter()
+            .filter(|s| s.status == StoryStatus::Blocked)
+            .count();
 
-        let phase_str = epic.current_phase
+        let phase_str = epic
+            .current_phase
             .map(|p| format!("{}", p))
             .unwrap_or_else(|| "NOT_STARTED".to_string());
 
@@ -2200,8 +2621,10 @@ async fn show_bmad_status(db: &Database) -> Result<()> {
         println!("   Stories: {}/{} complete", completed, stories.len());
 
         if in_progress > 0 || pending > 0 || blocked > 0 {
-            println!("   Progress: {} in progress, {} pending, {} blocked",
-                in_progress, pending, blocked);
+            println!(
+                "   Progress: {} in progress, {} pending, {} blocked",
+                in_progress, pending, blocked
+            );
         }
 
         // Show story details
@@ -2215,7 +2638,8 @@ async fn show_bmad_status(db: &Database) -> Result<()> {
                     StoryStatus::Blocked => "✗",
                     StoryStatus::Skipped => "⏭",
                 };
-                let agent_str = story.agent_id
+                let agent_str = story
+                    .agent_id
                     .map(|id| format!(" [agent: {}]", &id.to_string()[..8]))
                     .unwrap_or_default();
                 println!("      {} {}: {}{}", icon, story.id, story.title, agent_str);

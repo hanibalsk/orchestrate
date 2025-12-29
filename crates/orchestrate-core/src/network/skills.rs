@@ -286,17 +286,17 @@ pub fn default_skill_registry() -> SkillRegistry {
     registry.register(
         SkillDefinition::new("develop", vec![AgentType::StoryDeveloper])
             .requires_state(AgentState::Running)
-            .with_timeout(3600) // 1 hour
+            .with_timeout(3600), // 1 hour
     );
     registry.register(
         SkillDefinition::new("test", vec![AgentType::StoryDeveloper])
             .requires_state(AgentState::Running)
-            .with_timeout(1800) // 30 minutes
+            .with_timeout(1800), // 30 minutes
     );
     registry.register(
         SkillDefinition::new("refactor", vec![AgentType::StoryDeveloper])
             .requires_state(AgentState::Running)
-            .with_timeout(3600)
+            .with_timeout(3600),
     );
 
     // Code Reviewer skills
@@ -304,85 +304,88 @@ pub fn default_skill_registry() -> SkillRegistry {
         SkillDefinition::new("review", vec![AgentType::CodeReviewer])
             .requires_state(AgentState::Running)
             .requires_dependency(AgentType::StoryDeveloper, AgentState::Completed)
-            .with_timeout(1800)
+            .with_timeout(1800),
     );
 
     // Issue Fixer skills
     registry.register(
         SkillDefinition::new("diagnose", vec![AgentType::IssueFixer])
             .requires_state(AgentState::Running)
-            .with_timeout(900) // 15 minutes
+            .with_timeout(900), // 15 minutes
     );
     registry.register(
         SkillDefinition::new("fix", vec![AgentType::IssueFixer])
             .requires_state(AgentState::Running)
-            .with_timeout(1800)
+            .with_timeout(1800),
     );
 
     // Explorer skills
     registry.register(
         SkillDefinition::new("search", vec![AgentType::Explorer])
             .requires_state(AgentState::Running)
-            .with_timeout(300) // 5 minutes
+            .with_timeout(300), // 5 minutes
     );
     registry.register(
         SkillDefinition::new("analyze", vec![AgentType::Explorer])
             .requires_state(AgentState::Running)
-            .with_timeout(600) // 10 minutes
+            .with_timeout(600), // 10 minutes
     );
 
     // PR Shepherd skills
     registry.register(
         SkillDefinition::new("watch_pr", vec![AgentType::PrShepherd])
             .requires_state(AgentState::Running)
-            .cancellable(false) // Long-running
+            .cancellable(false), // Long-running
     );
     registry.register(
         SkillDefinition::new("fix_review", vec![AgentType::PrShepherd])
             .requires_state(AgentState::Running)
-            .with_timeout(1800)
+            .with_timeout(1800),
     );
     registry.register(
-        SkillDefinition::new("resolve_conflicts", vec![AgentType::PrShepherd, AgentType::ConflictResolver])
-            .requires_state(AgentState::Running)
-            .with_timeout(900)
+        SkillDefinition::new(
+            "resolve_conflicts",
+            vec![AgentType::PrShepherd, AgentType::ConflictResolver],
+        )
+        .requires_state(AgentState::Running)
+        .with_timeout(900),
     );
 
     // BMAD Orchestrator skills
     registry.register(
         SkillDefinition::new("orchestrate_epic", vec![AgentType::BmadOrchestrator])
             .requires_state(AgentState::Running)
-            .cancellable(false)
+            .cancellable(false),
     );
     registry.register(
         SkillDefinition::new("spawn_developer", vec![AgentType::BmadOrchestrator])
             .requires_state(AgentState::Running)
-            .with_timeout(60) // Quick spawn
+            .with_timeout(60), // Quick spawn
     );
 
     // BMAD Planner skills
     registry.register(
         SkillDefinition::new("plan_epic", vec![AgentType::BmadPlanner])
             .requires_state(AgentState::Running)
-            .with_timeout(1800)
+            .with_timeout(1800),
     );
     registry.register(
         SkillDefinition::new("create_stories", vec![AgentType::BmadPlanner])
             .requires_state(AgentState::Running)
-            .with_timeout(1800)
+            .with_timeout(1800),
     );
 
     // PR Controller skills
     registry.register(
         SkillDefinition::new("manage_queue", vec![AgentType::PrController])
             .requires_state(AgentState::Running)
-            .cancellable(false)
+            .cancellable(false),
     );
     registry.register(
         SkillDefinition::new("merge_pr", vec![AgentType::PrController])
             .requires_state(AgentState::Running)
             .requires_dependency(AgentType::CodeReviewer, AgentState::Completed)
-            .with_timeout(300)
+            .with_timeout(300),
     );
 
     registry
@@ -433,8 +436,8 @@ mod tests {
 
     #[test]
     fn test_skill_execution() {
-        let definition = SkillDefinition::new("test", vec![AgentType::StoryDeveloper])
-            .with_timeout(60);
+        let definition =
+            SkillDefinition::new("test", vec![AgentType::StoryDeveloper]).with_timeout(60);
 
         let mut skill = Skill::new(definition);
         assert_eq!(skill.status, SkillStatus::Pending);

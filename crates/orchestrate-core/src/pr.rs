@@ -101,7 +101,10 @@ impl MergeStrategy {
             "squash" => Ok(MergeStrategy::Squash),
             "rebase" => Ok(MergeStrategy::Rebase),
             "merge" => Ok(MergeStrategy::Merge),
-            _ => Err(crate::Error::Other(format!("Unknown merge strategy: {}", s))),
+            _ => Err(crate::Error::Other(format!(
+                "Unknown merge strategy: {}",
+                s
+            ))),
         }
     }
 }
@@ -261,9 +264,18 @@ mod tests {
 
     #[test]
     fn test_merge_strategy_from_str() {
-        assert_eq!(MergeStrategy::from_str("squash").unwrap(), MergeStrategy::Squash);
-        assert_eq!(MergeStrategy::from_str("rebase").unwrap(), MergeStrategy::Rebase);
-        assert_eq!(MergeStrategy::from_str("merge").unwrap(), MergeStrategy::Merge);
+        assert_eq!(
+            MergeStrategy::from_str("squash").unwrap(),
+            MergeStrategy::Squash
+        );
+        assert_eq!(
+            MergeStrategy::from_str("rebase").unwrap(),
+            MergeStrategy::Rebase
+        );
+        assert_eq!(
+            MergeStrategy::from_str("merge").unwrap(),
+            MergeStrategy::Merge
+        );
         assert!(MergeStrategy::from_str("invalid").is_err());
     }
 
@@ -288,32 +300,28 @@ mod tests {
 
     #[test]
     fn test_pull_request_with_epic() {
-        let pr = PullRequest::new("feature/auth")
-            .with_epic("epic-7A");
+        let pr = PullRequest::new("feature/auth").with_epic("epic-7A");
 
         assert_eq!(pr.epic_id, Some("epic-7A".to_string()));
     }
 
     #[test]
     fn test_pull_request_with_worktree() {
-        let pr = PullRequest::new("feature/auth")
-            .with_worktree("wt-123");
+        let pr = PullRequest::new("feature/auth").with_worktree("wt-123");
 
         assert_eq!(pr.worktree_id, Some("wt-123".to_string()));
     }
 
     #[test]
     fn test_pull_request_with_title() {
-        let pr = PullRequest::new("feature/auth")
-            .with_title("Add authentication");
+        let pr = PullRequest::new("feature/auth").with_title("Add authentication");
 
         assert_eq!(pr.title, Some("Add authentication".to_string()));
     }
 
     #[test]
     fn test_pull_request_with_strategy() {
-        let pr = PullRequest::new("feature/auth")
-            .with_strategy(MergeStrategy::Rebase);
+        let pr = PullRequest::new("feature/auth").with_strategy(MergeStrategy::Rebase);
 
         assert_eq!(pr.merge_strategy, MergeStrategy::Rebase);
     }

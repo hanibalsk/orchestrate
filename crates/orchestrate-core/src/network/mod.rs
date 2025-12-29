@@ -215,7 +215,10 @@ impl FromStr for StepOutputType {
             "state_transition" => Ok(StepOutputType::StateTransition),
             "artifact" => Ok(StepOutputType::Artifact),
             "error" => Ok(StepOutputType::Error),
-            _ => Err(crate::Error::Other(format!("Unknown step output type: {}", s))),
+            _ => Err(crate::Error::Other(format!(
+                "Unknown step output type: {}",
+                s
+            ))),
         }
     }
 }
@@ -257,9 +260,7 @@ impl StepOutput {
         data: serde_json::Value,
     ) -> crate::Result<Self> {
         // Validate data size to prevent unbounded storage
-        let data_size = serde_json::to_string(&data)
-            .map(|s| s.len())
-            .unwrap_or(0);
+        let data_size = serde_json::to_string(&data).map(|s| s.len()).unwrap_or(0);
         if data_size > MAX_STEP_OUTPUT_DATA_SIZE {
             return Err(crate::Error::Other(format!(
                 "Step output data size {} exceeds maximum of {} bytes",
@@ -335,7 +336,8 @@ mod tests {
             agent_id,
             "develop",
             serde_json::json!({"files_changed": 5, "tests_passed": true}),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(output.agent_id, agent_id);
         assert_eq!(output.skill_name, "develop");
@@ -365,7 +367,8 @@ mod tests {
             "build",
             "/path/to/artifact.zip",
             serde_json::json!({"size": 1024}),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(output.output_type, StepOutputType::Artifact);
         assert_eq!(output.data["path"], "/path/to/artifact.zip");
@@ -374,8 +377,14 @@ mod tests {
     #[test]
     fn test_step_output_type_conversion() {
         assert_eq!(StepOutputType::SkillResult.as_str(), "skill_result");
-        assert_eq!("skill_result".parse::<StepOutputType>().unwrap(), StepOutputType::SkillResult);
-        assert_eq!("artifact".parse::<StepOutputType>().unwrap(), StepOutputType::Artifact);
+        assert_eq!(
+            "skill_result".parse::<StepOutputType>().unwrap(),
+            StepOutputType::SkillResult
+        );
+        assert_eq!(
+            "artifact".parse::<StepOutputType>().unwrap(),
+            StepOutputType::Artifact
+        );
         assert!("invalid".parse::<StepOutputType>().is_err());
     }
 

@@ -5,11 +5,14 @@ use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::{Agent, AgentState, AgentType, Epic, EpicStatus, Message, MessageRole, PrStatus, PullRequest, MergeStrategy, Result, Story, StoryStatus};
-use crate::network::{AgentId, StepOutput, StepOutputType};
 use crate::instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
     LearningPattern, PatternStatus, PatternType,
+};
+use crate::network::{AgentId, StepOutput, StepOutputType};
+use crate::{
+    Agent, AgentState, AgentType, Epic, EpicStatus, MergeStrategy, Message, MessageRole, PrStatus,
+    PullRequest, Result, Story, StoryStatus,
 };
 
 /// Database configuration
@@ -66,9 +69,7 @@ impl Database {
         sqlx::query("PRAGMA journal_mode=WAL")
             .execute(&pool)
             .await?;
-        sqlx::query("PRAGMA foreign_keys=ON")
-            .execute(&pool)
-            .await?;
+        sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
         sqlx::query("PRAGMA busy_timeout=5000")
             .execute(&pool)
             .await?;
@@ -101,9 +102,11 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/003_step_outputs.sql"))
             .execute(&self.pool)
             .await?;
-        sqlx::query(include_str!("../../../migrations/004_custom_instructions.sql"))
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(include_str!(
+            "../../../migrations/004_custom_instructions.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         // Token tracking migration - uses ALTER TABLE which may fail if columns exist
         // This is safe because SQLite ALTER TABLE ADD COLUMN is idempotent for this use case
         let _ = sqlx::query(include_str!("../../../migrations/005_token_tracking.sql"))
@@ -146,12 +149,10 @@ impl Database {
 
     /// Get an agent by ID
     pub async fn get_agent(&self, id: Uuid) -> Result<Option<Agent>> {
-        let row = sqlx::query_as::<_, AgentRow>(
-            "SELECT * FROM agents WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, AgentRow>("SELECT * FROM agents WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
 
         row.map(|r| r.try_into()).transpose()
     }
@@ -181,7 +182,11 @@ impl Database {
     }
 
     /// Update an agent with optimistic locking (returns true if updated)
-    pub async fn update_agent_with_version(&self, agent: &Agent, expected_updated_at: &str) -> Result<bool> {
+    pub async fn update_agent_with_version(
+        &self,
+        agent: &Agent,
+        expected_updated_at: &str,
+    ) -> Result<bool> {
         let result = sqlx::query(
             r#"
             UPDATE agents SET
@@ -220,11 +225,9 @@ impl Database {
 
     /// List all agents
     pub async fn list_agents(&self) -> Result<Vec<Agent>> {
-        let rows = sqlx::query_as::<_, AgentRow>(
-            "SELECT * FROM agents ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query_as::<_, AgentRow>("SELECT * FROM agents ORDER BY created_at DESC")
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter().map(|r| r.try_into()).collect()
     }
@@ -233,12 +236,10 @@ impl Database {
 
     /// Get worktree path by ID
     pub async fn get_worktree_path(&self, worktree_id: &str) -> Result<Option<String>> {
-        let row = sqlx::query_scalar::<_, String>(
-            "SELECT path FROM worktrees WHERE id = ?",
-        )
-        .bind(worktree_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_scalar::<_, String>("SELECT path FROM worktrees WHERE id = ?")
+            .bind(worktree_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row)
     }
@@ -328,12 +329,11 @@ impl Database {
 
     /// Count messages for an agent
     pub async fn count_messages(&self, agent_id: Uuid) -> Result<i64> {
-        let result = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM agent_messages WHERE agent_id = ?",
-        )
-        .bind(agent_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
+        let result =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_messages WHERE agent_id = ?")
+                .bind(agent_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
 
         Ok(result)
     }
@@ -395,11 +395,9 @@ impl Database {
 
     /// Count total agents
     pub async fn count_agents(&self) -> Result<i64> {
-        let result = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM agents",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let result = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agents")
+            .fetch_one(&self.pool)
+            .await?;
 
         Ok(result)
     }
@@ -450,18 +448,19 @@ impl Database {
 
     /// Get session by ID
     pub async fn get_session(&self, session_id: &str) -> Result<Option<crate::Session>> {
-        let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT * FROM sessions WHERE id = ?",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, SessionRow>("SELECT * FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         row.map(|r| r.try_into()).transpose()
     }
 
     /// Get open session for an agent
-    pub async fn get_open_session_for_agent(&self, agent_id: Uuid) -> Result<Option<crate::Session>> {
+    pub async fn get_open_session_for_agent(
+        &self,
+        agent_id: Uuid,
+    ) -> Result<Option<crate::Session>> {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"
             SELECT * FROM sessions
@@ -479,39 +478,33 @@ impl Database {
 
     /// Update session tokens
     pub async fn update_session_tokens(&self, session_id: &str, total_tokens: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE sessions SET total_tokens = ? WHERE id = ?",
-        )
-        .bind(total_tokens)
-        .bind(session_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE sessions SET total_tokens = ? WHERE id = ?")
+            .bind(total_tokens)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
 
     /// Set API session ID for a session
     pub async fn set_api_session_id(&self, session_id: &str, api_session_id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE sessions SET api_session_id = ? WHERE id = ?",
-        )
-        .bind(api_session_id)
-        .bind(session_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE sessions SET api_session_id = ? WHERE id = ?")
+            .bind(api_session_id)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
 
     /// Close a session
     pub async fn close_session(&self, session_id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE sessions SET closed_at = ? WHERE id = ?",
-        )
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(session_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE sessions SET closed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -684,12 +677,10 @@ impl Database {
 
     /// Get a story by ID
     pub async fn get_story(&self, id: &str) -> Result<Option<Story>> {
-        let row = sqlx::query_as::<_, StoryRow>(
-            "SELECT * FROM stories WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, StoryRow>("SELECT * FROM stories WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         row.map(|r| r.try_into()).transpose()
     }
@@ -727,7 +718,12 @@ impl Database {
     }
 
     /// Update story status
-    pub async fn update_story_status(&self, id: &str, status: StoryStatus, agent_id: Option<Uuid>) -> Result<bool> {
+    pub async fn update_story_status(
+        &self,
+        id: &str,
+        status: StoryStatus,
+        agent_id: Option<Uuid>,
+    ) -> Result<bool> {
         let now = chrono::Utc::now();
         let completed_at = if status == StoryStatus::Completed {
             Some(now.to_rfc3339())
@@ -766,11 +762,9 @@ impl Database {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, StoryRow>(
-                "SELECT * FROM stories ORDER BY created_at DESC",
-            )
-            .fetch_all(&self.pool)
-            .await?
+            sqlx::query_as::<_, StoryRow>("SELECT * FROM stories ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?
         };
 
         rows.into_iter().map(|r| r.try_into()).collect()
@@ -825,7 +819,10 @@ impl Database {
 
     /// Get unconsumed step outputs from specific agents (dependencies)
     #[tracing::instrument(skip(self), level = "debug", fields(count = dependency_agent_ids.len()))]
-    pub async fn get_dependency_outputs(&self, dependency_agent_ids: &[AgentId]) -> Result<Vec<StepOutput>> {
+    pub async fn get_dependency_outputs(
+        &self,
+        dependency_agent_ids: &[AgentId],
+    ) -> Result<Vec<StepOutput>> {
         if dependency_agent_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -841,7 +838,10 @@ impl Database {
         }
 
         // Build placeholders for IN clause
-        let placeholders: Vec<String> = dependency_agent_ids.iter().map(|_| "?".to_string()).collect();
+        let placeholders: Vec<String> = dependency_agent_ids
+            .iter()
+            .map(|_| "?".to_string())
+            .collect();
         let query = format!(
             "SELECT * FROM step_outputs WHERE agent_id IN ({}) AND consumed = 0 ORDER BY created_at ASC",
             placeholders.join(", ")
@@ -871,7 +871,11 @@ impl Database {
 
     /// Get step outputs by skill name
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_step_outputs_by_skill(&self, agent_id: AgentId, skill_name: &str) -> Result<Vec<StepOutput>> {
+    pub async fn get_step_outputs_by_skill(
+        &self,
+        agent_id: AgentId,
+        skill_name: &str,
+    ) -> Result<Vec<StepOutput>> {
         let rows = sqlx::query_as::<_, StepOutputRow>(
             "SELECT * FROM step_outputs WHERE agent_id = ? AND skill_name = ? ORDER BY created_at DESC",
         )
@@ -886,7 +890,11 @@ impl Database {
     /// Mark step outputs as consumed by an agent
     /// Returns the number of outputs that were actually consumed (not already consumed)
     #[tracing::instrument(skip(self), level = "debug", fields(count = output_ids.len()))]
-    pub async fn mark_outputs_consumed(&self, output_ids: &[i64], consumed_by: AgentId) -> Result<u64> {
+    pub async fn mark_outputs_consumed(
+        &self,
+        output_ids: &[i64],
+        consumed_by: AgentId,
+    ) -> Result<u64> {
         if output_ids.is_empty() {
             return Ok(0);
         }
@@ -936,7 +944,10 @@ impl Database {
             )));
         }
 
-        let placeholders: Vec<String> = dependency_agent_ids.iter().map(|_| "?".to_string()).collect();
+        let placeholders: Vec<String> = dependency_agent_ids
+            .iter()
+            .map(|_| "?".to_string())
+            .collect();
         let query = format!(
             "SELECT COUNT(*) as count FROM step_outputs WHERE agent_id IN ({}) AND consumed = 0",
             placeholders.join(", ")
@@ -980,12 +991,10 @@ impl Database {
         let id = result.last_insert_rowid();
 
         // Initialize effectiveness metrics
-        sqlx::query(
-            "INSERT INTO instruction_effectiveness (instruction_id) VALUES (?)"
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO instruction_effectiveness (instruction_id) VALUES (?)")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(id)
     }
@@ -993,12 +1002,11 @@ impl Database {
     /// Get instruction by ID
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn get_instruction(&self, id: i64) -> Result<Option<CustomInstruction>> {
-        let row = sqlx::query_as::<_, InstructionRow>(
-            "SELECT * FROM custom_instructions WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, InstructionRow>("SELECT * FROM custom_instructions WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
 
         row.map(|r| r.try_into()).transpose()
     }
@@ -1006,19 +1014,21 @@ impl Database {
     /// Get instruction by name
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn get_instruction_by_name(&self, name: &str) -> Result<Option<CustomInstruction>> {
-        let row = sqlx::query_as::<_, InstructionRow>(
-            "SELECT * FROM custom_instructions WHERE name = ?",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, InstructionRow>("SELECT * FROM custom_instructions WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
 
         row.map(|r| r.try_into()).transpose()
     }
 
     /// Get all enabled instructions for an agent type (includes global)
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_instructions_for_agent(&self, agent_type: AgentType) -> Result<Vec<CustomInstruction>> {
+    pub async fn get_instructions_for_agent(
+        &self,
+        agent_type: AgentType,
+    ) -> Result<Vec<CustomInstruction>> {
         let rows = sqlx::query_as::<_, InstructionRow>(
             r#"
             SELECT * FROM custom_instructions
@@ -1094,14 +1104,12 @@ impl Database {
     /// Enable/disable an instruction
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn set_instruction_enabled(&self, id: i64, enabled: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE custom_instructions SET enabled = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(enabled)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE custom_instructions SET enabled = ?, updated_at = ? WHERE id = ?")
+            .bind(enabled)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -1238,7 +1246,12 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        tracing::warn!(instruction_id = id, penalty = amount, reason, "Penalty applied");
+        tracing::warn!(
+            instruction_id = id,
+            penalty = amount,
+            reason,
+            "Penalty applied"
+        );
         Ok(())
     }
 
@@ -1264,7 +1277,10 @@ impl Database {
 
     /// Get instruction effectiveness
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_instruction_effectiveness(&self, instruction_id: i64) -> Result<Option<InstructionEffectiveness>> {
+    pub async fn get_instruction_effectiveness(
+        &self,
+        instruction_id: i64,
+    ) -> Result<Option<InstructionEffectiveness>> {
         let row = sqlx::query_as::<_, EffectivenessRow>(
             "SELECT * FROM instruction_effectiveness WHERE instruction_id = ?",
         )
@@ -1368,7 +1384,7 @@ impl Database {
 
         // Try to find existing pattern by signature
         let existing = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM learning_patterns WHERE pattern_signature = ?"
+            "SELECT id FROM learning_patterns WHERE pattern_signature = ?",
         )
         .bind(&pattern.pattern_signature)
         .fetch_optional(&self.pool)
@@ -1415,19 +1431,20 @@ impl Database {
     /// Get pattern by ID
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn get_pattern(&self, id: i64) -> Result<Option<LearningPattern>> {
-        let row = sqlx::query_as::<_, PatternRow>(
-            "SELECT * FROM learning_patterns WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, PatternRow>("SELECT * FROM learning_patterns WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         row.map(|r| r.try_into()).transpose()
     }
 
     /// Get patterns ready for instruction generation
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_patterns_for_review(&self, min_occurrences: i64) -> Result<Vec<LearningPattern>> {
+    pub async fn get_patterns_for_review(
+        &self,
+        min_occurrences: i64,
+    ) -> Result<Vec<LearningPattern>> {
         let rows = sqlx::query_as::<_, PatternRow>(
             r#"
             SELECT * FROM learning_patterns
@@ -1445,7 +1462,10 @@ impl Database {
 
     /// List all patterns with optional status filter
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn list_patterns(&self, status: Option<PatternStatus>) -> Result<Vec<LearningPattern>> {
+    pub async fn list_patterns(
+        &self,
+        status: Option<PatternStatus>,
+    ) -> Result<Vec<LearningPattern>> {
         let rows = if let Some(s) = status {
             sqlx::query_as::<_, PatternRow>(
                 "SELECT * FROM learning_patterns WHERE status = ? ORDER BY occurrence_count DESC",
@@ -1472,14 +1492,12 @@ impl Database {
         status: PatternStatus,
         instruction_id: Option<i64>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE learning_patterns SET status = ?, instruction_id = ? WHERE id = ?",
-        )
-        .bind(status.as_str())
-        .bind(instruction_id)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE learning_patterns SET status = ?, instruction_id = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(instruction_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -1595,16 +1613,17 @@ impl Database {
         cache_write_tokens: i64,
     ) -> f64 {
         // Pricing per 1M tokens (USD)
-        let (input_price, output_price, cache_read_price, cache_write_price) = if model.contains("opus") {
-            // Claude Opus 4
-            (15.0, 75.0, 1.5, 18.75)  // cache read 90% off, cache write 25% premium
-        } else if model.contains("haiku") {
-            // Claude Haiku 3
-            (0.25, 1.25, 0.025, 0.3125)
-        } else {
-            // Claude Sonnet 4 (default)
-            (3.0, 15.0, 0.3, 3.75)
-        };
+        let (input_price, output_price, cache_read_price, cache_write_price) =
+            if model.contains("opus") {
+                // Claude Opus 4
+                (15.0, 75.0, 1.5, 18.75) // cache read 90% off, cache write 25% premium
+            } else if model.contains("haiku") {
+                // Claude Haiku 3
+                (0.25, 1.25, 0.025, 0.3125)
+            } else {
+                // Claude Sonnet 4 (default)
+                (3.0, 15.0, 0.3, 3.75)
+            };
 
         // Calculate regular input tokens (excluding cached)
         let regular_input = input_tokens - cache_read_tokens - cache_write_tokens;
@@ -1849,12 +1868,25 @@ impl TryFrom<AgentRow> for Agent {
             task: row.task,
             context: serde_json::from_str(&row.context)?,
             session_id: row.session_id,
-            parent_agent_id: row.parent_agent_id.map(|s| Uuid::parse_str(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?,
+            parent_agent_id: row
+                .parent_agent_id
+                .map(|s| Uuid::parse_str(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
             worktree_id: row.worktree_id,
             error_message: row.error_message,
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
-            completed_at: row.completed_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
         })
     }
 }
@@ -1919,14 +1951,27 @@ impl TryFrom<SessionRow> for crate::Session {
     fn try_from(row: SessionRow) -> Result<Self> {
         Ok(crate::Session {
             id: row.id,
-            agent_id: Uuid::parse_str(&row.agent_id).map_err(|e| crate::Error::Other(e.to_string()))?,
+            agent_id: Uuid::parse_str(&row.agent_id)
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
             parent_id: row.parent_id,
             api_session_id: row.api_session_id,
             total_tokens: row.total_tokens,
             is_forked: row.is_forked,
-            forked_at: row.forked_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
-            closed_at: row.closed_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+            forked_at: row
+                .forked_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            closed_at: row
+                .closed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
         })
     }
 }
@@ -1950,14 +1995,23 @@ impl TryFrom<MessageRow> for Message {
     fn try_from(row: MessageRow) -> Result<Self> {
         Ok(Message {
             id: row.id,
-            agent_id: Uuid::parse_str(&row.agent_id).map_err(|e| crate::Error::Other(e.to_string()))?,
+            agent_id: Uuid::parse_str(&row.agent_id)
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
             role: MessageRole::from_str(&row.role)?,
             content: row.content,
-            tool_calls: row.tool_calls.map(|s| serde_json::from_str(&s)).transpose()?,
-            tool_results: row.tool_results.map(|s| serde_json::from_str(&s)).transpose()?,
+            tool_calls: row
+                .tool_calls
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
+            tool_results: row
+                .tool_results
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
         })
     }
 }
@@ -1994,11 +2048,24 @@ impl TryFrom<PrRow> for PullRequest {
             pr_number: row.pr_number,
             status: PrStatus::from_str(&row.status)?,
             merge_strategy: MergeStrategy::from_str(&row.merge_strategy)?,
-            agent_id: row.agent_id.map(|s| Uuid::parse_str(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?,
+            agent_id: row
+                .agent_id
+                .map(|s| Uuid::parse_str(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
             error_message: row.error_message,
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
-            merged_at: row.merged_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            merged_at: row
+                .merged_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
         })
     }
 }
@@ -2029,13 +2096,29 @@ impl TryFrom<EpicRow> for Epic {
             source_file: row.source_file,
             pattern: row.pattern,
             status: EpicStatus::from_str(&row.status)?,
-            current_phase: row.current_phase.map(|p| serde_json::from_str(&format!("\"{}\"", p))).transpose()?,
-            agent_id: row.agent_id.map(|s| Uuid::parse_str(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?,
+            current_phase: row
+                .current_phase
+                .map(|p| serde_json::from_str(&format!("\"{}\"", p)))
+                .transpose()?,
+            agent_id: row
+                .agent_id
+                .map(|s| Uuid::parse_str(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
             pr_id: row.pr_id,
             error_message: row.error_message,
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
-            completed_at: row.completed_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
         })
     }
 }
@@ -2063,12 +2146,14 @@ impl TryFrom<StoryRow> for Story {
             epic_id: row.epic_id,
             title: row.title,
             description: row.description,
-            acceptance_criteria: row.acceptance_criteria
+            acceptance_criteria: row
+                .acceptance_criteria
                 .map(|s| serde_json::from_str(&s))
                 .transpose()
                 .map_err(|e| crate::Error::Other(e.to_string()))?,
             status: StoryStatus::from_str(&row.status)?,
-            agent_id: row.agent_id
+            agent_id: row
+                .agent_id
                 .map(|s| Uuid::parse_str(&s))
                 .transpose()
                 .map_err(|e| crate::Error::Other(e.to_string()))?,
@@ -2078,7 +2163,8 @@ impl TryFrom<StoryRow> for Story {
             updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
-            completed_at: row.completed_at
+            completed_at: row
+                .completed_at
                 .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
                 .transpose()
                 .map_err(|e| crate::Error::Other(e.to_string()))?
@@ -2106,16 +2192,18 @@ impl TryFrom<StepOutputRow> for StepOutput {
     fn try_from(row: StepOutputRow) -> Result<Self> {
         use std::str::FromStr;
 
-        let agent_uuid = Uuid::parse_str(&row.agent_id)
-            .map_err(|e| crate::Error::Other(e.to_string()))?;
+        let agent_uuid =
+            Uuid::parse_str(&row.agent_id).map_err(|e| crate::Error::Other(e.to_string()))?;
 
-        let consumed_by = row.consumed_by
+        let consumed_by = row
+            .consumed_by
             .map(|s| Uuid::parse_str(&s))
             .transpose()
             .map_err(|e| crate::Error::Other(e.to_string()))?
             .map(AgentId::from_uuid);
 
-        let consumed_at = row.consumed_at
+        let consumed_at = row
+            .consumed_at
             .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
             .transpose()
             .map_err(|e| crate::Error::Other(e.to_string()))?
@@ -2160,11 +2248,13 @@ impl TryFrom<InstructionRow> for CustomInstruction {
     type Error = crate::Error;
 
     fn try_from(row: InstructionRow) -> Result<Self> {
-        let agent_type = row.agent_type
+        let agent_type = row
+            .agent_type
             .map(|s| AgentType::from_str(&s))
             .transpose()?;
 
-        let tags: Vec<String> = row.tags
+        let tags: Vec<String> = row
+            .tags
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_default();
@@ -2209,19 +2299,22 @@ impl TryFrom<EffectivenessRow> for InstructionEffectiveness {
     type Error = crate::Error;
 
     fn try_from(row: EffectivenessRow) -> Result<Self> {
-        let last_success_at = row.last_success_at
+        let last_success_at = row
+            .last_success_at
             .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
             .transpose()
             .map_err(|e| crate::Error::Other(e.to_string()))?
             .map(Into::into);
 
-        let last_failure_at = row.last_failure_at
+        let last_failure_at = row
+            .last_failure_at
             .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
             .transpose()
             .map_err(|e| crate::Error::Other(e.to_string()))?
             .map(Into::into);
 
-        let last_penalty_at = row.last_penalty_at
+        let last_penalty_at = row
+            .last_penalty_at
             .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
             .transpose()
             .map_err(|e| crate::Error::Other(e.to_string()))?
@@ -2269,7 +2362,8 @@ impl TryFrom<PatternRow> for LearningPattern {
     type Error = crate::Error;
 
     fn try_from(row: PatternRow) -> Result<Self> {
-        let agent_type = row.agent_type
+        let agent_type = row
+            .agent_type
             .map(|s| AgentType::from_str(&s))
             .transpose()?;
 

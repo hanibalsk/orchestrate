@@ -238,7 +238,6 @@ impl ContextManager {
         let min_recent = self.config.min_recent_messages.min(messages.len());
 
         // Start from the end and work backwards
-        let mut included_messages = Vec::new();
         let mut included_tokens = 0;
         let mut start_idx = messages.len();
 
@@ -258,11 +257,12 @@ impl ContextManager {
         }
 
         // Collect the messages we're keeping
-        included_messages = messages[start_idx..].to_vec();
+        let included_messages = messages[start_idx..].to_vec();
         let summarized_count = start_idx;
 
         // Generate summary if we dropped messages
-        let (summary, summary_tokens) = if summarized_count > 0 && self.config.enable_summarization {
+        let (summary, summary_tokens) = if summarized_count > 0 && self.config.enable_summarization
+        {
             let summary = self.generate_summary(&messages[..summarized_count]);
             let tokens = self.estimator.estimate_text(&summary);
             (Some(summary), tokens)
@@ -288,9 +288,18 @@ impl ContextManager {
         let mut summary_parts = Vec::new();
 
         // Count message types
-        let user_count = messages.iter().filter(|m| m.role == orchestrate_core::MessageRole::User).count();
-        let assistant_count = messages.iter().filter(|m| m.role == orchestrate_core::MessageRole::Assistant).count();
-        let tool_count = messages.iter().filter(|m| m.role == orchestrate_core::MessageRole::Tool).count();
+        let user_count = messages
+            .iter()
+            .filter(|m| m.role == orchestrate_core::MessageRole::User)
+            .count();
+        let assistant_count = messages
+            .iter()
+            .filter(|m| m.role == orchestrate_core::MessageRole::Assistant)
+            .count();
+        let tool_count = messages
+            .iter()
+            .filter(|m| m.role == orchestrate_core::MessageRole::Tool)
+            .count();
 
         summary_parts.push(format!(
             "[CONTEXT SUMMARY: {} earlier messages ({} user, {} assistant, {} tool results) omitted for context limit]",
@@ -303,7 +312,8 @@ impl ContextManager {
             if let Some(ref tool_calls) = msg.tool_calls {
                 for call in tool_calls {
                     // Find corresponding result
-                    let result_preview = messages.iter()
+                    let result_preview = messages
+                        .iter()
                         .filter_map(|m| m.tool_results.as_ref())
                         .flatten()
                         .find(|r| r.tool_call_id == call.id)
@@ -327,7 +337,10 @@ impl ContextManager {
         }
 
         // Include the first user message (original task) if present
-        if let Some(first_user) = messages.iter().find(|m| m.role == orchestrate_core::MessageRole::User) {
+        if let Some(first_user) = messages
+            .iter()
+            .find(|m| m.role == orchestrate_core::MessageRole::User)
+        {
             let task_preview: String = first_user.content.chars().take(200).collect();
             summary_parts.push(format!("Original task: {}...", task_preview));
         }
@@ -337,7 +350,11 @@ impl ContextManager {
 
     /// Calculate optimal max_tokens for output based on context usage
     pub fn calculate_output_tokens(&self, context_tokens: usize) -> usize {
-        let remaining = self.config.limits.max_context_tokens.saturating_sub(context_tokens);
+        let remaining = self
+            .config
+            .limits
+            .max_context_tokens
+            .saturating_sub(context_tokens);
 
         // Use at most max_output_tokens, at least min_output_reserve
         remaining
@@ -387,15 +404,14 @@ impl CachedPrompt {
 
     /// Hash content for cache key
     fn hash_content(content: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
         hasher.finish()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -409,7 +425,11 @@ mod tests {
         // 40 chars should be ~10 tokens
         let text = "This is a test string of forty chars!";
         let tokens = estimator.estimate_text(text);
-        assert!(tokens >= 8 && tokens <= 15, "Expected ~10 tokens, got {}", tokens);
+        assert!(
+            tokens >= 8 && tokens <= 15,
+            "Expected ~10 tokens, got {}",
+            tokens
+        );
     }
 
     #[test]
@@ -457,7 +477,7 @@ mod tests {
     #[test]
     fn test_context_manager_windowing() {
         let mut config = TokenConfig::default();
-        config.limits.max_context_tokens = 1000;  // Very small for testing
+        config.limits.max_context_tokens = 1000; // Very small for testing
         config.limits.system_prompt_reserve = 100;
         config.limits.tools_reserve = 100;
         config.limits.min_output_reserve = 100;
@@ -467,7 +487,7 @@ mod tests {
         let agent_id = Uuid::new_v4();
 
         // Create many long messages
-        let long_content = "x".repeat(500);  // ~125 tokens each
+        let long_content = "x".repeat(500); // ~125 tokens each
         let messages: Vec<Message> = (0..10)
             .map(|_| Message::user(agent_id, long_content.clone()))
             .collect();
@@ -496,7 +516,7 @@ mod tests {
 
         // With low context usage, should get max output
         let output = manager.calculate_output_tokens(10_000);
-        assert_eq!(output, 8192);  // max_output_tokens for Sonnet
+        assert_eq!(output, 8192); // max_output_tokens for Sonnet
 
         // With high context usage, should get at least min_output_reserve
         let output = manager.calculate_output_tokens(195_000);

@@ -10,9 +10,8 @@ use axum::{
     Json, Router,
 };
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CustomInstruction, Database,
-    InstructionEffectiveness, InstructionScope, InstructionSource,
-    LearningEngine, LearningPattern, PatternStatus,
+    Agent, AgentState, AgentType, CustomInstruction, Database, InstructionEffectiveness,
+    InstructionScope, InstructionSource, LearningEngine, LearningPattern, PatternStatus,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -143,11 +142,22 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/agents/:id/messages", get(get_messages))
         .route("/api/status", get(system_status))
         // Instruction routes
-        .route("/api/instructions", get(list_instructions).post(create_instruction))
-        .route("/api/instructions/:id", get(get_instruction).put(update_instruction).delete(delete_instruction))
+        .route(
+            "/api/instructions",
+            get(list_instructions).post(create_instruction),
+        )
+        .route(
+            "/api/instructions/:id",
+            get(get_instruction)
+                .put(update_instruction)
+                .delete(delete_instruction),
+        )
         .route("/api/instructions/:id/enable", post(enable_instruction))
         .route("/api/instructions/:id/disable", post(disable_instruction))
-        .route("/api/instructions/:id/effectiveness", get(get_instruction_effectiveness))
+        .route(
+            "/api/instructions/:id/effectiveness",
+            get(get_instruction_effectiveness),
+        )
         // Learning pattern routes
         .route("/api/patterns", get(list_patterns))
         .route("/api/patterns/:id", get(get_pattern))
@@ -155,11 +165,13 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/patterns/:id/reject", post(reject_pattern))
         .route("/api/learning/process", post(process_patterns))
         .route("/api/learning/cleanup", post(cleanup_instructions))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // Public routes (no auth required)
-    let public_routes = Router::new()
-        .route("/api/health", get(health_check));
+    let public_routes = Router::new().route("/api/health", get(health_check));
 
     Router::new()
         .merge(protected_routes)
@@ -170,11 +182,18 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
 /// Create the full router with both API and UI routes
 pub fn create_router(state: Arc<AppState>) -> Router {
     let api_router = create_api_router(state.clone());
-    let ui_router = crate::ui::create_ui_router().with_state(state);
+    let ui_router = crate::ui::create_ui_router().with_state(state.clone());
+
+    // Create WebSocket state with the same database
+    let ws_state = Arc::new(crate::websocket::WsState::new(state.db.clone()));
 
     Router::new()
         .merge(api_router)
         .merge(ui_router)
+        .route(
+            "/ws",
+            axum::routing::get(crate::websocket::ws_handler).with_state(ws_state),
+        )
 }
 
 // ==================== Handlers ====================
@@ -252,12 +271,9 @@ async fn pause_agent(
 
     let original_updated_at = agent.updated_at.to_rfc3339();
 
-    agent
-        .transition_to(AgentState::Paused)
-        .map_err(|_| ApiError::conflict(format!(
-            "Cannot pause agent in state {:?}",
-            agent.state
-        )))?;
+    agent.transition_to(AgentState::Paused).map_err(|_| {
+        ApiError::conflict(format!("Cannot pause agent in state {:?}", agent.state))
+    })?;
 
     // Use optimistic locking to prevent race conditions
     let updated = state
@@ -288,12 +304,9 @@ async fn resume_agent(
 
     let original_updated_at = agent.updated_at.to_rfc3339();
 
-    agent
-        .transition_to(AgentState::Running)
-        .map_err(|_| ApiError::conflict(format!(
-            "Cannot resume agent in state {:?}",
-            agent.state
-        )))?;
+    agent.transition_to(AgentState::Running).map_err(|_| {
+        ApiError::conflict(format!("Cannot resume agent in state {:?}", agent.state))
+    })?;
 
     let updated = state
         .db
@@ -323,12 +336,9 @@ async fn terminate_agent(
 
     let original_updated_at = agent.updated_at.to_rfc3339();
 
-    agent
-        .transition_to(AgentState::Terminated)
-        .map_err(|_| ApiError::conflict(format!(
-            "Cannot terminate agent in state {:?}",
-            agent.state
-        )))?;
+    agent.transition_to(AgentState::Terminated).map_err(|_| {
+        ApiError::conflict(format!("Cannot terminate agent in state {:?}", agent.state))
+    })?;
 
     let updated = state
         .db
@@ -366,18 +376,25 @@ async fn get_messages(
     Ok(Json(messages.into_iter().map(Into::into).collect()))
 }
 
-async fn system_status(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<SystemStatus>, ApiError> {
+async fn system_status(State(state): State<Arc<AppState>>) -> Result<Json<SystemStatus>, ApiError> {
     let agents = state
         .db
         .list_agents()
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    let running = agents.iter().filter(|a| a.state == AgentState::Running).count();
-    let paused = agents.iter().filter(|a| a.state == AgentState::Paused).count();
-    let completed = agents.iter().filter(|a| a.state == AgentState::Completed).count();
+    let running = agents
+        .iter()
+        .filter(|a| a.state == AgentState::Running)
+        .count();
+    let paused = agents
+        .iter()
+        .filter(|a| a.state == AgentState::Paused)
+        .count();
+    let completed = agents
+        .iter()
+        .filter(|a| a.state == AgentState::Completed)
+        .count();
 
     Ok(Json(SystemStatus {
         total_agents: agents.len(),
@@ -393,12 +410,16 @@ async fn list_instructions(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListInstructionsParams>,
 ) -> Result<Json<Vec<InstructionResponse>>, ApiError> {
-    let scope = params.scope.as_deref()
+    let scope = params
+        .scope
+        .as_deref()
         .map(|s| InstructionScope::from_str(s))
         .transpose()
         .map_err(|e| ApiError::bad_request(format!("Invalid scope: {}", e)))?;
 
-    let source = params.source.as_deref()
+    let source = params
+        .source
+        .as_deref()
         .map(|s| InstructionSource::from_str(s))
         .transpose()
         .map_err(|e| ApiError::bad_request(format!("Invalid source: {}", e)))?;
@@ -433,7 +454,8 @@ async fn create_instruction(
     req.validate()?;
 
     let mut instruction = if req.scope == Some("agent_type".to_string()) {
-        let agent_type = req.agent_type
+        let agent_type = req
+            .agent_type
             .as_ref()
             .ok_or_else(|| ApiError::validation("agent_type required for agent_type scope"))?;
         let agent_type = AgentType::from_str(agent_type)
@@ -591,7 +613,9 @@ async fn list_patterns(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListPatternsParams>,
 ) -> Result<Json<Vec<PatternResponse>>, ApiError> {
-    let status = params.status.as_deref()
+    let status = params
+        .status
+        .as_deref()
         .map(|s| PatternStatus::from_str(s))
         .transpose()
         .map_err(|e| ApiError::bad_request(format!("Invalid status: {}", e)))?;
@@ -632,7 +656,8 @@ async fn approve_pattern(
 
     // Generate instruction from pattern
     let engine = LearningEngine::new();
-    let instruction = engine.generate_instruction_from_pattern(&pattern)
+    let instruction = engine
+        .generate_instruction_from_pattern(&pattern)
         .ok_or_else(|| ApiError::bad_request("Could not generate instruction from pattern"))?;
 
     let instruction_id = state
@@ -831,10 +856,14 @@ impl CreateInstructionRequest {
             return Err(ApiError::validation("Content cannot be empty"));
         }
         if self.name.len() > 255 {
-            return Err(ApiError::validation("Name exceeds maximum length of 255 characters"));
+            return Err(ApiError::validation(
+                "Name exceeds maximum length of 255 characters",
+            ));
         }
         if self.content.len() > 10_000 {
-            return Err(ApiError::validation("Content exceeds maximum length of 10000 characters"));
+            return Err(ApiError::validation(
+                "Content exceeds maximum length of 10000 characters",
+            ));
         }
         Ok(())
     }
@@ -1017,7 +1046,8 @@ mod tests {
     async fn test_health_check() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1042,7 +1072,8 @@ mod tests {
     async fn test_auth_no_key_configured_allows_access() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1060,7 +1091,8 @@ mod tests {
     async fn test_auth_missing_key_returns_unauthorized() {
         let test_app = setup_app_with_auth("secret-key").await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1078,7 +1110,8 @@ mod tests {
     async fn test_auth_wrong_key_returns_unauthorized() {
         let test_app = setup_app_with_auth("secret-key").await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1097,7 +1130,8 @@ mod tests {
     async fn test_auth_correct_key_allows_access() {
         let test_app = setup_app_with_auth("secret-key").await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1116,7 +1150,8 @@ mod tests {
     async fn test_auth_bearer_token_works() {
         let test_app = setup_app_with_auth("secret-key").await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1137,7 +1172,8 @@ mod tests {
     async fn test_list_agents_empty() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1159,7 +1195,8 @@ mod tests {
     async fn test_create_agent_success() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1186,7 +1223,8 @@ mod tests {
     async fn test_create_agent_empty_task_fails() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1209,13 +1247,16 @@ mod tests {
     async fn test_create_agent_whitespace_task_fails() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri("/api/agents")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"agent_type":"story_developer","task":"   "}"#))
+                    .body(Body::from(
+                        r#"{"agent_type":"story_developer","task":"   "}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1229,9 +1270,13 @@ mod tests {
         let test_app = setup_app().await;
 
         let long_task = "x".repeat(MAX_TASK_LENGTH + 1);
-        let body = format!(r#"{{"agent_type":"story_developer","task":"{}"}}"#, long_task);
+        let body = format!(
+            r#"{{"agent_type":"story_developer","task":"{}"}}"#,
+            long_task
+        );
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1255,7 +1300,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1278,7 +1324,8 @@ mod tests {
     async fn test_get_agent_not_found() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1296,7 +1343,8 @@ mod tests {
     async fn test_get_agent_invalid_uuid() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1309,7 +1357,10 @@ mod tests {
 
         // Axum returns 400 for invalid path params, but our route might not match
         // Invalid UUID format in path should return 400 (bad request)
-        assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
+        assert!(
+            response.status() == StatusCode::BAD_REQUEST
+                || response.status() == StatusCode::NOT_FOUND
+        );
     }
 
     // ==================== Agent Action Tests ====================
@@ -1324,7 +1375,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1353,7 +1405,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1378,7 +1431,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1406,7 +1460,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1436,7 +1491,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1461,7 +1517,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1486,7 +1543,8 @@ mod tests {
         let agent_id = agent.id.to_string();
         test_app.state.db.insert_agent(&agent).await.unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1508,7 +1566,8 @@ mod tests {
     async fn test_get_messages_for_nonexistent_agent() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1528,7 +1587,8 @@ mod tests {
     async fn test_system_status_empty() {
         let test_app = setup_app().await;
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1556,7 +1616,12 @@ mod tests {
         // Create agents in different states
         let mut running_agent = Agent::new(AgentType::StoryDeveloper, "Running task");
         make_running(&mut running_agent);
-        test_app.state.db.insert_agent(&running_agent).await.unwrap();
+        test_app
+            .state
+            .db
+            .insert_agent(&running_agent)
+            .await
+            .unwrap();
 
         let mut paused_agent = Agent::new(AgentType::StoryDeveloper, "Paused task");
         make_running(&mut paused_agent);
@@ -1565,10 +1630,18 @@ mod tests {
 
         let mut completed_agent = Agent::new(AgentType::StoryDeveloper, "Completed task");
         make_running(&mut completed_agent);
-        completed_agent.transition_to(AgentState::Completed).unwrap();
-        test_app.state.db.insert_agent(&completed_agent).await.unwrap();
+        completed_agent
+            .transition_to(AgentState::Completed)
+            .unwrap();
+        test_app
+            .state
+            .db
+            .insert_agent(&completed_agent)
+            .await
+            .unwrap();
 
-        let response = test_app.router
+        let response = test_app
+            .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -1627,6 +1700,7 @@ mod tests {
         let valid = CreateAgentRequest {
             agent_type: AgentType::StoryDeveloper,
             task: "Valid task".to_string(),
+            worktree_id: None,
         };
         assert!(valid.validate().is_ok());
 
@@ -1634,6 +1708,7 @@ mod tests {
         let empty_task = CreateAgentRequest {
             agent_type: AgentType::StoryDeveloper,
             task: "".to_string(),
+            worktree_id: None,
         };
         assert!(empty_task.validate().is_err());
 
@@ -1641,6 +1716,7 @@ mod tests {
         let whitespace_task = CreateAgentRequest {
             agent_type: AgentType::StoryDeveloper,
             task: "   \t\n".to_string(),
+            worktree_id: None,
         };
         assert!(whitespace_task.validate().is_err());
 
@@ -1648,6 +1724,7 @@ mod tests {
         let max_task = CreateAgentRequest {
             agent_type: AgentType::StoryDeveloper,
             task: "x".repeat(MAX_TASK_LENGTH),
+            worktree_id: None,
         };
         assert!(max_task.validate().is_ok());
 
@@ -1655,6 +1732,7 @@ mod tests {
         let over_max_task = CreateAgentRequest {
             agent_type: AgentType::StoryDeveloper,
             task: "x".repeat(MAX_TASK_LENGTH + 1),
+            worktree_id: None,
         };
         assert!(over_max_task.validate().is_err());
     }

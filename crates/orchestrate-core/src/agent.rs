@@ -79,9 +79,9 @@ impl AgentState {
             | (Running, Failed) => true,
 
             // Waiting states can go back to Running or fail
-            (WaitingForInput, Running)
-            | (WaitingForInput, Paused)
-            | (WaitingForInput, Failed) => true,
+            (WaitingForInput, Running) | (WaitingForInput, Paused) | (WaitingForInput, Failed) => {
+                true
+            }
             (WaitingForExternal, Running)
             | (WaitingForExternal, Paused)
             | (WaitingForExternal, Failed) => true,
@@ -403,9 +403,18 @@ mod tests {
 
     #[test]
     fn test_state_from_str() {
-        assert_eq!(AgentState::from_str("created").unwrap(), AgentState::Created);
-        assert_eq!(AgentState::from_str("running").unwrap(), AgentState::Running);
-        assert_eq!(AgentState::from_str("waiting_for_input").unwrap(), AgentState::WaitingForInput);
+        assert_eq!(
+            AgentState::from_str("created").unwrap(),
+            AgentState::Created
+        );
+        assert_eq!(
+            AgentState::from_str("running").unwrap(),
+            AgentState::Running
+        );
+        assert_eq!(
+            AgentState::from_str("waiting_for_input").unwrap(),
+            AgentState::WaitingForInput
+        );
         assert!(AgentState::from_str("invalid").is_err());
     }
 
@@ -420,15 +429,27 @@ mod tests {
 
     #[test]
     fn test_agent_type_from_str() {
-        assert_eq!(AgentType::from_str("story_developer").unwrap(), AgentType::StoryDeveloper);
-        assert_eq!(AgentType::from_str("code_reviewer").unwrap(), AgentType::CodeReviewer);
+        assert_eq!(
+            AgentType::from_str("story_developer").unwrap(),
+            AgentType::StoryDeveloper
+        );
+        assert_eq!(
+            AgentType::from_str("code_reviewer").unwrap(),
+            AgentType::CodeReviewer
+        );
         assert!(AgentType::from_str("invalid").is_err());
     }
 
     #[test]
     fn test_agent_type_default_model() {
-        assert_eq!(AgentType::Explorer.default_model(), "claude-3-haiku-20240307");
-        assert_eq!(AgentType::StoryDeveloper.default_model(), "claude-sonnet-4-20250514");
+        assert_eq!(
+            AgentType::Explorer.default_model(),
+            "claude-3-haiku-20240307"
+        );
+        assert_eq!(
+            AgentType::StoryDeveloper.default_model(),
+            "claude-sonnet-4-20250514"
+        );
     }
 
     #[test]
@@ -488,8 +509,7 @@ mod tests {
 
     #[test]
     fn test_agent_with_worktree() {
-        let agent = Agent::new(AgentType::StoryDeveloper, "Task")
-            .with_worktree("worktree-123");
+        let agent = Agent::new(AgentType::StoryDeveloper, "Task").with_worktree("worktree-123");
         assert_eq!(agent.worktree_id, Some("worktree-123".to_string()));
     }
 
@@ -523,7 +543,10 @@ mod tests {
 
         assert!(agent.fail("Something went wrong").is_ok());
         assert_eq!(agent.state, AgentState::Failed);
-        assert_eq!(agent.error_message, Some("Something went wrong".to_string()));
+        assert_eq!(
+            agent.error_message,
+            Some("Something went wrong".to_string())
+        );
         assert!(agent.completed_at.is_some());
     }
 
@@ -540,8 +563,11 @@ mod tests {
         ];
 
         for state in states {
-            assert!(state.can_transition_to(AgentState::Terminated),
-                "Should be able to terminate from {:?}", state);
+            assert!(
+                state.can_transition_to(AgentState::Terminated),
+                "Should be able to terminate from {:?}",
+                state
+            );
         }
     }
 
