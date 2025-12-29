@@ -26,6 +26,7 @@ pub mod feedback;
 pub mod instruction;
 pub mod learning;
 pub mod message;
+pub mod model_selection;
 pub mod network;
 pub mod pipeline;
 pub mod pipeline_executor;
@@ -114,3 +115,10 @@ pub use approval_service::ApprovalService;
 
 // Re-export pipeline template types
 pub use pipeline_template::PipelineTemplate;
+
+// Re-export model selection types
+pub use model_selection::{
+    classify_task_complexity, model_to_tier, AlternativeModel, ModelPerformance,
+    ModelRecommendation, ModelSelectionConfig, ModelSelectionRule, ModelTier, OptimizationGoal,
+    TaskComplexity,
+};

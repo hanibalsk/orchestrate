@@ -10,6 +10,9 @@ use crate::experiment::{
     Experiment, ExperimentMetric, ExperimentStatus, ExperimentType, ExperimentVariant,
     VariantResults,
 };
+use crate::model_selection::{
+    ModelPerformance, ModelSelectionConfig, ModelSelectionRule, OptimizationGoal, TaskComplexity,
+};
 use crate::feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
 use crate::instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
@@ -2502,6 +2505,279 @@ impl Database {
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn delete_experiment(&self, id: i64) -> Result<bool> {
         let result = sqlx::query("DELETE FROM experiments WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    // ==================== Model Selection Operations ====================
+
+    /// Record or update model performance for a task type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn record_model_performance(
+        &self,
+        model: &str,
+        task_type: &str,
+        agent_type: Option<&str>,
+        success: bool,
+        tokens: i64,
+        cost: f64,
+        duration_secs: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let (success_inc, failure_inc) = if success { (1, 0) } else { (0, 1) };
+
+        sqlx::query(
+            r#"
+            INSERT INTO model_performance (model, task_type, agent_type, success_count, failure_count, total_tokens, total_cost, total_duration_secs, sample_count, last_used_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(model, task_type, agent_type) DO UPDATE SET
+                success_count = success_count + ?,
+                failure_count = failure_count + ?,
+                total_tokens = total_tokens + ?,
+                total_cost = total_cost + ?,
+                total_duration_secs = total_duration_secs + ?,
+                sample_count = sample_count + 1,
+                last_used_at = ?,
+                updated_at = ?
+            "#,
+        )
+        .bind(model)
+        .bind(task_type)
+        .bind(agent_type)
+        .bind(success_inc)
+        .bind(failure_inc)
+        .bind(tokens)
+        .bind(cost)
+        .bind(duration_secs)
+        .bind(&now)
+        .bind(&now)
+        .bind(success_inc)
+        .bind(failure_inc)
+        .bind(tokens)
+        .bind(cost)
+        .bind(duration_secs)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get model performance statistics
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_model_performance(
+        &self,
+        task_type: Option<&str>,
+        agent_type: Option<&str>,
+    ) -> Result<Vec<ModelPerformance>> {
+        let rows = if let Some(task) = task_type {
+            if let Some(agent) = agent_type {
+                sqlx::query_as::<_, ModelPerformanceRow>(
+                    "SELECT * FROM model_performance WHERE task_type = ? AND (agent_type = ? OR agent_type IS NULL) ORDER BY sample_count DESC",
+                )
+                .bind(task)
+                .bind(agent)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                sqlx::query_as::<_, ModelPerformanceRow>(
+                    "SELECT * FROM model_performance WHERE task_type = ? ORDER BY sample_count DESC",
+                )
+                .bind(task)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        } else {
+            sqlx::query_as::<_, ModelPerformanceRow>(
+                "SELECT * FROM model_performance ORDER BY sample_count DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    /// Get the best performing model for a task type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_best_model_for_task(
+        &self,
+        task_type: &str,
+        agent_type: Option<&str>,
+        optimization_goal: OptimizationGoal,
+        min_samples: i64,
+    ) -> Result<Option<ModelPerformance>> {
+        let performances = self.get_model_performance(Some(task_type), agent_type).await?;
+
+        let filtered: Vec<_> = performances
+            .into_iter()
+            .filter(|p| p.sample_count >= min_samples && p.success_rate >= 0.5)
+            .collect();
+
+        if filtered.is_empty() {
+            return Ok(None);
+        }
+
+        let best = match optimization_goal {
+            OptimizationGoal::Cost => filtered.into_iter().max_by(|a, b| {
+                a.cost_score()
+                    .partial_cmp(&b.cost_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            OptimizationGoal::Quality => filtered.into_iter().max_by(|a, b| {
+                a.quality_score()
+                    .partial_cmp(&b.quality_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            OptimizationGoal::Balanced => filtered.into_iter().max_by(|a, b| {
+                a.balanced_score()
+                    .partial_cmp(&b.balanced_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        };
+
+        Ok(best)
+    }
+
+    /// Create a model selection rule
+    #[tracing::instrument(skip(self, rule), level = "debug", fields(name = %rule.name))]
+    pub async fn create_model_selection_rule(&self, rule: &ModelSelectionRule) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO model_selection_rules (name, task_type, agent_type, complexity, preferred_model, fallback_model, max_cost, min_success_rate, priority, enabled, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&rule.name)
+        .bind(&rule.task_type)
+        .bind(&rule.agent_type)
+        .bind(rule.complexity.map(|c| c.as_str()))
+        .bind(&rule.preferred_model)
+        .bind(&rule.fallback_model)
+        .bind(rule.max_cost)
+        .bind(rule.min_success_rate)
+        .bind(rule.priority)
+        .bind(rule.enabled)
+        .bind(rule.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// List model selection rules
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_model_selection_rules(&self, enabled_only: bool) -> Result<Vec<ModelSelectionRule>> {
+        let rows = if enabled_only {
+            sqlx::query_as::<_, ModelSelectionRuleRow>(
+                "SELECT * FROM model_selection_rules WHERE enabled = 1 ORDER BY priority DESC, id",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ModelSelectionRuleRow>(
+                "SELECT * FROM model_selection_rules ORDER BY priority DESC, id",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Find matching model selection rule for a task
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn find_matching_rule(
+        &self,
+        task_type: &str,
+        agent_type: Option<&str>,
+        complexity: Option<TaskComplexity>,
+    ) -> Result<Option<ModelSelectionRule>> {
+        let rules = self.list_model_selection_rules(true).await?;
+
+        // Find best matching rule (highest priority first)
+        for rule in rules {
+            // Check task_type match
+            if let Some(ref rule_task) = rule.task_type {
+                if rule_task != task_type {
+                    continue;
+                }
+            }
+
+            // Check agent_type match
+            if let Some(ref rule_agent) = rule.agent_type {
+                if agent_type.map_or(true, |a| a != rule_agent) {
+                    continue;
+                }
+            }
+
+            // Check complexity match
+            if let Some(rule_complexity) = rule.complexity {
+                if complexity.map_or(true, |c| c != rule_complexity) {
+                    continue;
+                }
+            }
+
+            return Ok(Some(rule));
+        }
+
+        Ok(None)
+    }
+
+    /// Get model selection config
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_model_selection_config(&self) -> Result<ModelSelectionConfig> {
+        let row = sqlx::query_as::<_, ModelSelectionConfigRow>(
+            "SELECT * FROM model_selection_config WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.into()).unwrap_or_default())
+    }
+
+    /// Update model selection config
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_model_selection_config(&self, config: &ModelSelectionConfig) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO model_selection_config (id, optimization_goal, max_cost_per_task, min_success_rate, min_samples_for_auto, enabled, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                optimization_goal = ?,
+                max_cost_per_task = ?,
+                min_success_rate = ?,
+                min_samples_for_auto = ?,
+                enabled = ?,
+                updated_at = ?
+            "#,
+        )
+        .bind(config.optimization_goal.as_str())
+        .bind(config.max_cost_per_task)
+        .bind(config.min_success_rate)
+        .bind(config.min_samples_for_auto)
+        .bind(config.enabled)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(config.optimization_goal.as_str())
+        .bind(config.max_cost_per_task)
+        .bind(config.min_success_rate)
+        .bind(config.min_samples_for_auto)
+        .bind(config.enabled)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a model selection rule
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_model_selection_rule(&self, id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM model_selection_rules WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -5039,6 +5315,145 @@ impl From<VariantResultsRow> for VariantResults {
             max_value: row.max_value,
             success_count: row.success_count,
             success_rate,
+        }
+    }
+}
+
+// ==================== Model Selection Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct ModelPerformanceRow {
+    #[allow(dead_code)]
+    id: i64,
+    model: String,
+    task_type: String,
+    agent_type: Option<String>,
+    success_count: i64,
+    failure_count: i64,
+    total_tokens: i64,
+    total_cost: f64,
+    total_duration_secs: f64,
+    sample_count: i64,
+    last_used_at: Option<String>,
+    #[allow(dead_code)]
+    updated_at: String,
+}
+
+impl From<ModelPerformanceRow> for ModelPerformance {
+    fn from(row: ModelPerformanceRow) -> Self {
+        let success_rate = if row.sample_count > 0 {
+            row.success_count as f64 / row.sample_count as f64
+        } else {
+            0.0
+        };
+
+        let avg_tokens = if row.sample_count > 0 {
+            row.total_tokens as f64 / row.sample_count as f64
+        } else {
+            0.0
+        };
+
+        let avg_cost = if row.sample_count > 0 {
+            row.total_cost / row.sample_count as f64
+        } else {
+            0.0
+        };
+
+        let avg_duration_secs = if row.sample_count > 0 {
+            row.total_duration_secs / row.sample_count as f64
+        } else {
+            0.0
+        };
+
+        ModelPerformance {
+            model: row.model,
+            task_type: row.task_type,
+            agent_type: row.agent_type,
+            success_count: row.success_count,
+            failure_count: row.failure_count,
+            success_rate,
+            avg_tokens,
+            avg_cost,
+            avg_duration_secs,
+            sample_count: row.sample_count,
+            last_used_at: row
+                .last_used_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(Into::into),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ModelSelectionRuleRow {
+    id: i64,
+    name: String,
+    task_type: Option<String>,
+    agent_type: Option<String>,
+    complexity: Option<String>,
+    preferred_model: String,
+    fallback_model: Option<String>,
+    max_cost: Option<f64>,
+    min_success_rate: Option<f64>,
+    priority: i32,
+    enabled: bool,
+    created_at: String,
+}
+
+impl TryFrom<ModelSelectionRuleRow> for ModelSelectionRule {
+    type Error = crate::Error;
+
+    fn try_from(row: ModelSelectionRuleRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        let complexity = row
+            .complexity
+            .map(|s| TaskComplexity::from_str(&s))
+            .transpose()?;
+
+        Ok(ModelSelectionRule {
+            id: row.id,
+            name: row.name,
+            task_type: row.task_type,
+            agent_type: row.agent_type,
+            complexity,
+            preferred_model: row.preferred_model,
+            fallback_model: row.fallback_model,
+            max_cost: row.max_cost,
+            min_success_rate: row.min_success_rate,
+            priority: row.priority,
+            enabled: row.enabled,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ModelSelectionConfigRow {
+    #[allow(dead_code)]
+    id: i64,
+    optimization_goal: String,
+    max_cost_per_task: Option<f64>,
+    min_success_rate: f64,
+    min_samples_for_auto: i64,
+    enabled: bool,
+    #[allow(dead_code)]
+    updated_at: String,
+}
+
+impl From<ModelSelectionConfigRow> for ModelSelectionConfig {
+    fn from(row: ModelSelectionConfigRow) -> Self {
+        use std::str::FromStr;
+
+        ModelSelectionConfig {
+            optimization_goal: OptimizationGoal::from_str(&row.optimization_goal)
+                .unwrap_or(OptimizationGoal::Balanced),
+            max_cost_per_task: row.max_cost_per_task,
+            min_success_rate: row.min_success_rate,
+            min_samples_for_auto: row.min_samples_for_auto,
+            enabled: row.enabled,
         }
     }
 }
