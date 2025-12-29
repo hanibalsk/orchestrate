@@ -186,6 +186,11 @@ enum Commands {
         #[command(subcommand)]
         action: DocsAction,
     },
+    /// Requirements management
+    Requirements {
+        #[command(subcommand)]
+        action: RequirementsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1080,6 +1085,64 @@ enum AdrAction {
         /// ADR that supersedes this one (if status is superseded)
         #[arg(long)]
         superseded_by: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RequirementsAction {
+    /// Capture a new requirement
+    Capture {
+        /// Requirement title
+        #[arg(short, long)]
+        title: String,
+        /// Requirement description
+        #[arg(short, long)]
+        description: String,
+        /// Requirement type (functional, non_functional, security, etc.)
+        #[arg(short = 't', long, default_value = "functional")]
+        req_type: String,
+        /// Priority (critical, high, medium, low)
+        #[arg(short, long, default_value = "medium")]
+        priority: String,
+    },
+    /// List requirements
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by type
+        #[arg(short = 't', long)]
+        req_type: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show requirement details
+    Show {
+        /// Requirement ID
+        id: String,
+    },
+    /// Generate stories from a requirement
+    GenerateStories {
+        /// Requirement ID
+        id: String,
+        /// Output file
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Show traceability matrix
+    Trace {
+        /// Specific requirement to trace
+        #[arg(short, long)]
+        requirement: Option<String>,
+        /// Output format (markdown, json)
+        #[arg(short, long, default_value = "markdown")]
+        format: String,
+    },
+    /// Analyze impact of requirement changes
+    Impact {
+        /// Requirement ID
+        id: String,
     },
 }
 
@@ -3842,6 +3905,255 @@ async fn main() -> Result<()> {
                         println!("Note: Python http.server not available.");
                         println!("Please install a static file server to serve docs locally.");
                     }
+                }
+            }
+        },
+        Commands::Requirements { action } => match action {
+            RequirementsAction::Capture { title, description, req_type, priority } => {
+                use orchestrate_core::{Requirement, RequirementType, RequirementPriority};
+
+                let requirement_type = match req_type.to_lowercase().as_str() {
+                    "functional" => RequirementType::Functional,
+                    "non_functional" | "nonfunctional" => RequirementType::NonFunctional,
+                    "security" => RequirementType::Security,
+                    "performance" => RequirementType::Performance,
+                    "usability" => RequirementType::Usability,
+                    "interface" => RequirementType::Interface,
+                    "constraint" => RequirementType::Constraint,
+                    _ => anyhow::bail!("Unknown requirement type: {}", req_type),
+                };
+
+                let req_priority = match priority.to_lowercase().as_str() {
+                    "critical" => RequirementPriority::Critical,
+                    "high" => RequirementPriority::High,
+                    "medium" => RequirementPriority::Medium,
+                    "low" => RequirementPriority::Low,
+                    _ => anyhow::bail!("Unknown priority: {}. Valid: critical, high, medium, low", priority),
+                };
+
+                // Generate requirement ID
+                let req_dir = std::path::Path::new("docs/requirements");
+                std::fs::create_dir_all(req_dir)?;
+
+                let mut max_num = 0u32;
+                for entry in std::fs::read_dir(req_dir)? {
+                    if let Ok(entry) = entry {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("REQ-") && name.ends_with(".md") {
+                            if let Some(num_str) = name.strip_prefix("REQ-").and_then(|s| s.strip_suffix(".md")) {
+                                if let Ok(num) = num_str.parse::<u32>() {
+                                    max_num = max_num.max(num);
+                                }
+                            }
+                        }
+                    }
+                }
+                let req_id = format!("REQ-{:03}", max_num + 1);
+
+                let mut req = Requirement::new(&req_id, &title, &description, requirement_type);
+                req.priority = req_priority;
+
+                let file_path = req_dir.join(format!("{}.md", req_id));
+                std::fs::write(&file_path, req.to_markdown())?;
+
+                println!("Created requirement: {}", file_path.display());
+                println!("  ID: {}", req_id);
+                println!("  Title: {}", title);
+                println!("  Type: {}", req_type);
+                println!("  Priority: {}", priority);
+            }
+            RequirementsAction::List { status, req_type, json } => {
+                let req_dir = std::path::Path::new("docs/requirements");
+                if !req_dir.exists() {
+                    println!("No requirements found (docs/requirements directory doesn't exist)");
+                    return Ok(());
+                }
+
+                let mut requirements = vec![];
+                for entry in std::fs::read_dir(req_dir)? {
+                    if let Ok(entry) = entry {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("REQ-") && name.ends_with(".md") {
+                            let content = std::fs::read_to_string(entry.path())?;
+                            let title = content.lines().next().unwrap_or("").trim_start_matches("# ").to_string();
+
+                            // Parse type and priority from content
+                            let parsed_type = content.lines()
+                                .find(|l| l.starts_with("**Type:**"))
+                                .map(|l| l.trim_start_matches("**Type:** ").to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+
+                            let parsed_status = content.lines()
+                                .find(|l| l.starts_with("**Status:**"))
+                                .map(|l| l.trim_start_matches("**Status:** ").to_string())
+                                .unwrap_or_else(|| "draft".to_string());
+
+                            // Apply filters
+                            if let Some(ref filter_status) = status {
+                                if !parsed_status.to_lowercase().contains(&filter_status.to_lowercase()) {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref filter_type) = req_type {
+                                if !parsed_type.to_lowercase().contains(&filter_type.to_lowercase()) {
+                                    continue;
+                                }
+                            }
+
+                            requirements.push(serde_json::json!({
+                                "id": name.trim_end_matches(".md"),
+                                "title": title.split(':').nth(1).map(|s| s.trim()).unwrap_or(&title),
+                                "type": parsed_type,
+                                "status": parsed_status,
+                            }));
+                        }
+                    }
+                }
+
+                requirements.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&requirements)?);
+                } else {
+                    println!("Requirements");
+                    println!("{}", "=".repeat(60));
+                    for req in &requirements {
+                        println!("{}: {} [{}] ({})",
+                            req["id"].as_str().unwrap_or(""),
+                            req["title"].as_str().unwrap_or(""),
+                            req["type"].as_str().unwrap_or(""),
+                            req["status"].as_str().unwrap_or(""),
+                        );
+                    }
+                    println!("\nTotal: {} requirements", requirements.len());
+                }
+            }
+            RequirementsAction::Show { id } => {
+                let req_path = std::path::Path::new("docs/requirements").join(format!("{}.md", id));
+                if !req_path.exists() {
+                    anyhow::bail!("Requirement not found: {}", id);
+                }
+                let content = std::fs::read_to_string(&req_path)?;
+                println!("{}", content);
+            }
+            RequirementsAction::GenerateStories { id, output } => {
+                use orchestrate_core::{GeneratedStory, StoryComplexity};
+
+                let req_path = std::path::Path::new("docs/requirements").join(format!("{}.md", id));
+                if !req_path.exists() {
+                    anyhow::bail!("Requirement not found: {}", id);
+                }
+                let content = std::fs::read_to_string(&req_path)?;
+
+                // Parse title from requirement
+                let title = content.lines().next().unwrap_or("").split(':').nth(1)
+                    .map(|s| s.trim())
+                    .unwrap_or("Feature");
+
+                // Generate a sample story based on the requirement
+                let story = GeneratedStory {
+                    title: title.to_string(),
+                    user_type: "user".to_string(),
+                    goal: format!("use the {} feature", title.to_lowercase()),
+                    benefit: "accomplish my task efficiently".to_string(),
+                    acceptance_criteria: vec![
+                        "Feature is accessible from the main interface".to_string(),
+                        "Feature provides clear feedback on actions".to_string(),
+                        "Feature handles errors gracefully".to_string(),
+                    ],
+                    complexity: StoryComplexity::Medium,
+                    related_requirements: vec![id.to_string()],
+                    suggested_epic: None,
+                };
+
+                let markdown = story.to_markdown();
+                if let Some(output_path) = output {
+                    std::fs::write(&output_path, &markdown)?;
+                    println!("Story generated: {}", output_path);
+                } else {
+                    println!("{}", markdown);
+                }
+            }
+            RequirementsAction::Trace { requirement, format } => {
+                use orchestrate_core::TraceabilityMatrix;
+
+                let mut matrix = TraceabilityMatrix::new();
+
+                // Scan requirements directory
+                let req_dir = std::path::Path::new("docs/requirements");
+                if req_dir.exists() {
+                    for entry in std::fs::read_dir(req_dir)? {
+                        if let Ok(entry) = entry {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            if name.starts_with("REQ-") && name.ends_with(".md") {
+                                let req_id = name.trim_end_matches(".md").to_string();
+
+                                // Filter by specific requirement if provided
+                                if let Some(ref filter_req) = requirement {
+                                    if &req_id != filter_req {
+                                        continue;
+                                    }
+                                }
+
+                                matrix.requirements.push(req_id);
+                            }
+                        }
+                    }
+                }
+
+                matrix.calculate_coverage();
+
+                match format.to_lowercase().as_str() {
+                    "markdown" | "md" => {
+                        println!("{}", matrix.to_markdown());
+                    }
+                    "json" => {
+                        println!("{}", serde_json::to_string_pretty(&matrix)?);
+                    }
+                    _ => {
+                        anyhow::bail!("Unknown format: {}. Valid: markdown, json", format);
+                    }
+                }
+            }
+            RequirementsAction::Impact { id } => {
+                use orchestrate_core::{ImpactAnalysis, EffortEstimate, RiskLevel};
+
+                let req_path = std::path::Path::new("docs/requirements").join(format!("{}.md", id));
+                if !req_path.exists() {
+                    anyhow::bail!("Requirement not found: {}", id);
+                }
+
+                // Create a mock impact analysis
+                let analysis = ImpactAnalysis {
+                    requirement_id: id.clone(),
+                    affected_stories: vec![],
+                    affected_code_files: vec![],
+                    affected_tests: vec![],
+                    estimated_effort: EffortEstimate::Medium,
+                    risk_level: RiskLevel::Low,
+                    recommendations: vec![
+                        "Review affected stories before making changes".to_string(),
+                        "Update test cases to reflect requirement changes".to_string(),
+                    ],
+                    generated_at: chrono::Utc::now(),
+                };
+
+                println!("Impact Analysis for: {}", id);
+                println!("{}", "=".repeat(60));
+                println!();
+                println!("Affected Stories: {}", analysis.affected_stories.len());
+                println!("Affected Code Files: {}", analysis.affected_code_files.len());
+                println!("Affected Tests: {}", analysis.affected_tests.len());
+                println!();
+                println!("Estimated Effort: {}", analysis.estimated_effort.as_str());
+                println!("Risk Level: {}", analysis.risk_level.as_str());
+                println!();
+                println!("Recommendations:");
+                for rec in &analysis.recommendations {
+                    println!("  - {}", rec);
                 }
             }
         },

@@ -21,6 +21,7 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 pub mod documentation;
 pub mod epic;
+pub mod requirements;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -154,4 +155,11 @@ pub use documentation::{
     ApiParameter, ApiServer, Changelog, ChangelogEntry, ChangelogRelease, ChangeType, DocItemType,
     DocIssueType, DocType, DocValidationIssue, DocValidationResult, ParameterLocation, PropertyInfo,
     ReadmeContent, ReadmeSection, SchemaInfo,
+};
+
+// Re-export requirements types
+pub use requirements::{
+    ArtifactType, ClarifyingQuestion, EffortEstimate, GeneratedStory, ImpactAnalysis, LinkType,
+    Requirement, RequirementPriority, RequirementStatus, RequirementType, RiskLevel,
+    StoryComplexity, TraceCoverage, TraceabilityLink, TraceabilityMatrix,
 };
