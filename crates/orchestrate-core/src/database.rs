@@ -1934,6 +1934,23 @@ impl Database {
 
         Ok(result.rows_affected())
     }
+
+    /// Get recent webhook events (all statuses)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_recent_webhook_events(&self, limit: i64) -> Result<Vec<WebhookEvent>> {
+        let rows = sqlx::query_as::<_, WebhookEventRow>(
+            r#"
+            SELECT * FROM webhook_events
+            ORDER BY received_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
 }
 
 /// Token usage statistics

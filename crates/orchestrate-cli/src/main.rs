@@ -141,6 +141,11 @@ enum Commands {
         #[command(subcommand)]
         action: TokensAction,
     },
+    /// Webhook server management
+    Webhook {
+        #[command(subcommand)]
+        action: WebhookAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -477,6 +482,51 @@ enum TokensAction {
         #[arg(short, long, default_value = "30")]
         days: i32,
     },
+}
+
+#[derive(Subcommand)]
+enum WebhookAction {
+    /// Start webhook server
+    Start {
+        /// Port for webhook server
+        #[arg(short, long, default_value = "9000")]
+        port: u16,
+        /// Webhook secret (defaults to GITHUB_WEBHOOK_SECRET env var)
+        #[arg(short, long, env = "GITHUB_WEBHOOK_SECRET")]
+        secret: Option<String>,
+    },
+    /// List recent webhook events
+    ListEvents {
+        /// Maximum number of events to show
+        #[arg(short, long, default_value = "20")]
+        limit: i64,
+        /// Filter by status (pending, processing, completed, failed, dead_letter)
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Simulate a webhook event for testing
+    Simulate {
+        /// Event type (e.g., pull_request.opened, check_run.completed)
+        event_type: String,
+        /// Optional JSON payload file
+        #[arg(short, long)]
+        payload_file: Option<PathBuf>,
+    },
+    /// Show webhook server status
+    Status,
+    /// Manage webhook secret
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Generate and rotate webhook secret
+    Rotate,
+    /// Show current webhook secret
+    Show,
 }
 
 #[tokio::main]
@@ -1697,6 +1747,32 @@ async fn main() -> Result<()> {
                 println!("╚══════════════════════════════════════════════════════════════╝");
             }
         },
+
+        Commands::Webhook { action } => match action {
+            WebhookAction::Start { port, secret } => {
+                handle_webhook_start(db, port, secret).await?;
+            }
+            WebhookAction::ListEvents { limit, status } => {
+                handle_webhook_list_events(db, limit, status.as_deref()).await?;
+            }
+            WebhookAction::Simulate {
+                event_type,
+                payload_file,
+            } => {
+                handle_webhook_simulate(db, &event_type, payload_file.as_ref()).await?;
+            }
+            WebhookAction::Status => {
+                handle_webhook_status().await?;
+            }
+            WebhookAction::Secret { action } => match action {
+                SecretAction::Rotate => {
+                    handle_webhook_secret_rotate().await?;
+                }
+                SecretAction::Show => {
+                    handle_webhook_secret_show().await?;
+                }
+            },
+        },
     }
 
     Ok(())
@@ -2677,4 +2753,237 @@ async fn reset_bmad_state(db: &Database, force: bool) -> Result<()> {
     println!("   Note: Epics may need manual cleanup if delete_epic is not implemented.");
 
     Ok(())
+}
+
+/// Handle webhook start command
+async fn handle_webhook_start(
+    db: Database,
+    port: u16,
+    secret: Option<String>,
+) -> Result<()> {
+    use orchestrate_web::{WebhookProcessor, WebhookProcessorConfig, create_router_with_webhook};
+    use std::sync::Arc;
+
+    info!("Starting webhook server on port {}", port);
+
+    let webhook_secret = secret.or_else(|| std::env::var("GITHUB_WEBHOOK_SECRET").ok());
+
+    if webhook_secret.is_none() {
+        warn!("No webhook secret configured. Signature verification will be skipped.");
+        warn!("Set GITHUB_WEBHOOK_SECRET environment variable or use --secret flag.");
+    }
+
+    let db_arc = Arc::new(db);
+
+    // Start webhook processor in background
+    let processor = WebhookProcessor::new(db_arc.clone(), WebhookProcessorConfig::default());
+    tokio::spawn(async move {
+        processor.run().await;
+    });
+
+    // Create AppState for the router
+    let app_state = Arc::new(orchestrate_web::api::AppState::new(
+        db_arc.as_ref().clone(),
+        None, // No API key for webhook-only server
+    ));
+
+    // Create router with webhook endpoint
+    let app = create_router_with_webhook(app_state, webhook_secret.clone());
+
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║               WEBHOOK SERVER STARTED                         ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Listening on: {:<46} ║", addr);
+    println!("║  Webhook URL:  {:<46} ║", format!("http://{}:{}/webhooks/github", "localhost", port));
+    println!("║  Secret configured: {:<39} ║", if webhook_secret.is_some() { "Yes" } else { "No" });
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("Press Ctrl+C to stop");
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Handle webhook list-events command
+async fn handle_webhook_list_events(
+    db: Database,
+    limit: i64,
+    status_filter: Option<&str>,
+) -> Result<()> {
+    use orchestrate_core::WebhookEventStatus;
+    use std::str::FromStr;
+
+    let events = if let Some(status_str) = status_filter {
+        let status = WebhookEventStatus::from_str(status_str)?;
+        db.get_webhook_events_by_status(status, limit).await?
+    } else {
+        // Get recent events sorted by created_at DESC
+        db.get_recent_webhook_events(limit).await?
+    };
+
+    if events.is_empty() {
+        println!("No webhook events found");
+        return Ok(());
+    }
+
+    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
+    println!("║                           WEBHOOK EVENTS                                     ║");
+    println!("╠════════╦═══════════════════╦═════════════╦═════════╦═════════════════════════╣");
+    println!("║   ID   ║   Event Type      ║   Status    ║ Retries ║   Received At           ║");
+    println!("╠════════╬═══════════════════╬═════════════╬═════════╬═════════════════════════╣");
+
+    for event in events {
+        println!(
+            "║ {:>6} ║ {:<17} ║ {:<11} ║   {:>3}   ║ {} ║",
+            event.id.unwrap_or(0),
+            event.event_type.chars().take(17).collect::<String>(),
+            event.status.as_str(),
+            event.retry_count,
+            event.received_at.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+
+    println!("╚════════╩═══════════════════╩═════════════╩═════════╩═════════════════════════╝");
+
+    Ok(())
+}
+
+/// Handle webhook simulate command
+async fn handle_webhook_simulate(
+    db: Database,
+    event_type: &str,
+    payload_file: Option<&PathBuf>,
+) -> Result<()> {
+    use orchestrate_core::WebhookEvent;
+    use uuid::Uuid;
+
+    let payload = if let Some(file_path) = payload_file {
+        std::fs::read_to_string(file_path)?
+    } else {
+        // Generate a minimal test payload based on event type
+        generate_test_payload(event_type)
+    };
+
+    let delivery_id = format!("sim-{}", Uuid::new_v4());
+    let event = WebhookEvent::new(delivery_id.clone(), event_type.to_string(), payload);
+
+    db.insert_webhook_event(&event).await?;
+
+    println!("✅ Simulated event queued successfully");
+    println!();
+    println!("Event Type:    {}", event_type);
+    println!("Delivery ID:   {}", delivery_id);
+    println!("Status:        pending");
+    println!();
+    println!("The event will be processed by the webhook processor.");
+    println!("Use 'orchestrate webhook list-events' to check status.");
+
+    Ok(())
+}
+
+/// Handle webhook status command
+async fn handle_webhook_status() -> Result<()> {
+    // TODO: Implement actual status check (e.g., check if server is running via PID file)
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║               Webhook Server Status                          ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Status:           Not implemented yet                       ║");
+    println!("║                                                              ║");
+    println!("║  Use 'orchestrate webhook start' to start the server        ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    Ok(())
+}
+
+/// Handle webhook secret rotate command
+async fn handle_webhook_secret_rotate() -> Result<()> {
+    use rand::Rng;
+
+    // Generate a random 32-byte secret
+    let secret: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(64)
+        .map(char::from)
+        .collect();
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║               New Webhook Secret Generated                   ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║                                                              ║");
+    println!("║  {:<60} ║", &secret[..60]);
+    println!("║  {:<60} ║", &secret[60..]);
+    println!("║                                                              ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║  Setup Instructions:                                         ║");
+    println!("║                                                              ║");
+    println!("║  1. Set environment variable:                                ║");
+    println!("║     export GITHUB_WEBHOOK_SECRET='<secret>'                  ║");
+    println!("║                                                              ║");
+    println!("║  2. Update GitHub webhook settings:                          ║");
+    println!("║     - Go to repository Settings > Webhooks                   ║");
+    println!("║     - Edit webhook > Secret                                  ║");
+    println!("║     - Paste the secret above                                 ║");
+    println!("║                                                              ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    Ok(())
+}
+
+/// Handle webhook secret show command
+async fn handle_webhook_secret_show() -> Result<()> {
+    let secret = std::env::var("GITHUB_WEBHOOK_SECRET").ok();
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║               Current Webhook Secret                         ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+
+    if let Some(s) = secret {
+        // Show only first and last 8 characters for security
+        let masked = if s.len() > 16 {
+            format!("{}...{}", &s[..8], &s[s.len() - 8..])
+        } else {
+            "***".to_string()
+        };
+        println!("║  Secret (masked): {:<43} ║", masked);
+    } else {
+        println!("║  Status: Not configured                                      ║");
+        println!("║                                                              ║");
+        println!("║  Set GITHUB_WEBHOOK_SECRET environment variable              ║");
+        println!("║  or use 'orchestrate webhook secret rotate' to generate     ║");
+    }
+
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    Ok(())
+}
+
+/// Generate a minimal test payload for simulation
+fn generate_test_payload(event_type: &str) -> String {
+    match event_type {
+        "pull_request.opened" | "pull_request" => {
+            r#"{"action":"opened","number":1,"pull_request":{"number":1,"title":"Test PR","head":{"ref":"test-branch"},"base":{"ref":"main"}}}"#.to_string()
+        }
+        "check_run.completed" | "check_run" => {
+            r#"{"action":"completed","check_run":{"id":1,"name":"test","conclusion":"failure","head_sha":"abc123","html_url":"https://github.com/test/test/runs/1"}}"#.to_string()
+        }
+        "check_suite.completed" | "check_suite" => {
+            r#"{"action":"completed","check_suite":{"id":1,"conclusion":"failure","head_sha":"abc123","head_branch":"main"}}"#.to_string()
+        }
+        "push" => {
+            r#"{"ref":"refs/heads/main","before":"abc123","after":"def456","commits":[]}"#.to_string()
+        }
+        "pull_request_review.submitted" | "pull_request_review" => {
+            r#"{"action":"submitted","pull_request":{"number":1},"review":{"state":"changes_requested","body":"Please fix"}}"#.to_string()
+        }
+        "issues.opened" | "issues" => {
+            r#"{"action":"opened","issue":{"number":1,"title":"Test Issue","body":"Test body"}}"#.to_string()
+        }
+        _ => {
+            format!(r#"{{"action":"test","event_type":"{}"}}"#, event_type)
+        }
+    }
 }
