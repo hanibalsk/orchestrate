@@ -21,6 +21,7 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 #[cfg(test)]
 mod database_environment_tests;
+pub mod deployment_strategy;
 pub mod environment;
 pub mod epic;
 pub mod error;
@@ -114,3 +115,9 @@ pub use environment::{CreateEnvironment, Environment, EnvironmentType};
 
 // Re-export secrets types
 pub use secrets::{get_encryption_key, SecretsManager};
+
+// Re-export deployment strategy types
+pub use deployment_strategy::{
+    BatchSize, BlueGreenConfig, CanaryConfig, DeploymentStrategy, Environment as BlueGreenEnvironment,
+    HealthCheck, RecreateConfig, RollingConfig, StrategyType,
+};
