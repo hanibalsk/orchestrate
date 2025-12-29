@@ -11,9 +11,10 @@ use axum::{
 };
 use orchestrate_core::{
     Agent, AgentState, AgentType, ApprovalDecision, ApprovalRequest, ApprovalService,
-    ApprovalStatus, CustomInstruction, Database, InstructionEffectiveness, InstructionScope,
-    InstructionSource, LearningEngine, LearningPattern, PatternStatus, Pipeline, PipelineRun,
-    PipelineRunStatus, PipelineStage, Schedule, ScheduleRun,
+    ApprovalStatus, CustomInstruction, Database, Feedback, FeedbackRating, FeedbackSource,
+    FeedbackStats, InstructionEffectiveness, InstructionScope, InstructionSource, LearningEngine,
+    LearningPattern, PatternStatus, Pipeline, PipelineRun, PipelineRunStatus, PipelineStage,
+    Schedule, ScheduleRun,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -197,6 +198,10 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/schedules/:id/resume", post(resume_schedule))
         .route("/api/schedules/:id/run", post(run_schedule))
         .route("/api/schedules/:id/runs", get(get_schedule_runs))
+        // Feedback routes
+        .route("/api/feedback", get(list_feedback).post(create_feedback))
+        .route("/api/feedback/:id", get(get_feedback).delete(delete_feedback))
+        .route("/api/feedback/stats", get(get_feedback_stats))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -1793,6 +1798,209 @@ impl From<ScheduleRun> for ScheduleRunResponse {
             completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
         }
     }
+}
+
+// ==================== Feedback Handlers ====================
+
+#[derive(Debug, Deserialize)]
+struct CreateFeedbackRequest {
+    agent_id: String,
+    rating: String,
+    #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
+    message_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeedbackResponse {
+    id: i64,
+    agent_id: String,
+    message_id: Option<i64>,
+    rating: String,
+    comment: Option<String>,
+    source: String,
+    created_by: String,
+    created_at: String,
+}
+
+impl From<Feedback> for FeedbackResponse {
+    fn from(fb: Feedback) -> Self {
+        Self {
+            id: fb.id,
+            agent_id: fb.agent_id.to_string(),
+            message_id: fb.message_id,
+            rating: fb.rating.as_str().to_string(),
+            comment: fb.comment,
+            source: fb.source.as_str().to_string(),
+            created_by: fb.created_by,
+            created_at: fb.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FeedbackStatsResponse {
+    total: i64,
+    positive: i64,
+    negative: i64,
+    neutral: i64,
+    score: f64,
+    positive_percentage: f64,
+}
+
+impl From<FeedbackStats> for FeedbackStatsResponse {
+    fn from(stats: FeedbackStats) -> Self {
+        Self {
+            total: stats.total,
+            positive: stats.positive,
+            negative: stats.negative,
+            neutral: stats.neutral,
+            score: stats.score,
+            positive_percentage: stats.positive_percentage,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedbackListQuery {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    rating: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default = "default_feedback_limit")]
+    limit: i64,
+}
+
+fn default_feedback_limit() -> i64 {
+    50
+}
+
+async fn create_feedback(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateFeedbackRequest>,
+) -> Result<Json<FeedbackResponse>, ApiError> {
+    use std::str::FromStr;
+
+    // Parse agent ID
+    let agent_uuid = Uuid::parse_str(&req.agent_id)
+        .map_err(|e| ApiError::validation(format!("Invalid agent ID: {}", e)))?;
+
+    // Verify agent exists
+    if state.db.get_agent(agent_uuid).await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .is_none()
+    {
+        return Err(ApiError::not_found("Agent"));
+    }
+
+    // Parse rating
+    let rating = FeedbackRating::from_str(&req.rating)
+        .map_err(|_| ApiError::validation("Invalid rating. Use: positive, negative, neutral"))?;
+
+    // Build feedback
+    let mut feedback = Feedback::new(agent_uuid, rating, "api")
+        .with_source(FeedbackSource::Api);
+
+    if let Some(msg_id) = req.message_id {
+        feedback = feedback.with_message_id(msg_id);
+    }
+
+    if let Some(comment) = req.comment {
+        feedback = feedback.with_comment(comment);
+    }
+
+    // Insert feedback
+    let id = state.db.insert_feedback(&feedback).await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    // Retrieve the created feedback
+    let created = state.db.get_feedback(id).await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::internal("Failed to retrieve created feedback".to_string()))?;
+
+    Ok(Json(created.into()))
+}
+
+async fn list_feedback(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FeedbackListQuery>,
+) -> Result<Json<Vec<FeedbackResponse>>, ApiError> {
+    use std::str::FromStr;
+
+    let feedbacks = if let Some(agent_id) = query.agent_id {
+        let agent_uuid = Uuid::parse_str(&agent_id)
+            .map_err(|e| ApiError::validation(format!("Invalid agent ID: {}", e)))?;
+        state.db.list_feedback_for_agent(agent_uuid, query.limit).await
+    } else {
+        let rating_filter = query.rating
+            .as_ref()
+            .map(|r| FeedbackRating::from_str(r))
+            .transpose()
+            .map_err(|_| ApiError::validation("Invalid rating filter"))?;
+        let source_filter = query.source
+            .as_ref()
+            .map(|s| FeedbackSource::from_str(s))
+            .transpose()
+            .map_err(|_| ApiError::validation("Invalid source filter"))?;
+        state.db.list_feedback(rating_filter, source_filter, query.limit).await
+    };
+
+    let feedbacks = feedbacks
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(feedbacks.into_iter().map(Into::into).collect()))
+}
+
+async fn get_feedback(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<FeedbackResponse>, ApiError> {
+    let feedback = state.db.get_feedback(id).await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Feedback"))?;
+
+    Ok(Json(feedback.into()))
+}
+
+async fn delete_feedback(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let deleted = state.db.delete_feedback(id).await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Feedback"))
+    }
+}
+
+async fn get_feedback_stats(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FeedbackStatsQuery>,
+) -> Result<Json<FeedbackStatsResponse>, ApiError> {
+    let stats = if let Some(agent_id) = query.agent_id {
+        let agent_uuid = Uuid::parse_str(&agent_id)
+            .map_err(|e| ApiError::validation(format!("Invalid agent ID: {}", e)))?;
+        state.db.get_feedback_stats_for_agent(agent_uuid).await
+    } else {
+        state.db.get_feedback_stats().await
+    };
+
+    let stats = stats
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(stats.into()))
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedbackStatsQuery {
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 #[cfg(test)]

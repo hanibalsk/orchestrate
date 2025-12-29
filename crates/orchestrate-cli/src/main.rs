@@ -10,6 +10,7 @@ use orchestrate_core::{
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use uuid::Uuid;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
@@ -160,6 +161,11 @@ enum Commands {
     Approval {
         #[command(subcommand)]
         action: ApprovalAction,
+    },
+    /// Feedback collection
+    Feedback {
+        #[command(subcommand)]
+        action: FeedbackAction,
     },
 }
 
@@ -751,6 +757,53 @@ enum ApprovalAction {
         /// User to delegate to
         #[arg(long)]
         to: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FeedbackAction {
+    /// Add feedback for an agent
+    Add {
+        /// Agent ID (UUID)
+        agent_id: String,
+        /// Rating (positive, negative, neutral, +, -, pos, neg)
+        #[arg(short, long)]
+        rating: String,
+        /// Optional comment
+        #[arg(short, long)]
+        comment: Option<String>,
+        /// Optional message ID for specific output feedback
+        #[arg(short, long)]
+        message_id: Option<i64>,
+    },
+    /// List feedback
+    List {
+        /// Filter by agent ID
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Filter by rating (positive, negative, neutral)
+        #[arg(short, long)]
+        rating: Option<String>,
+        /// Filter by source (cli, web, slack, api, automated)
+        #[arg(short, long)]
+        source: Option<String>,
+        /// Maximum number of results
+        #[arg(long, default_value = "50")]
+        limit: i64,
+    },
+    /// Show feedback statistics
+    Stats {
+        /// Show stats for specific agent
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Group stats by agent type
+        #[arg(long)]
+        by_type: bool,
+    },
+    /// Delete feedback
+    Delete {
+        /// Feedback ID
+        id: i64,
     },
 }
 
@@ -1533,7 +1586,7 @@ async fn main() -> Result<()> {
                     .map(|t| SuccessPatternType::from_str(t))
                     .transpose()?;
 
-                let patterns = db.list_success_patterns(type_filter).await?;
+                let patterns = db.list_success_patterns(type_filter, 100).await?;
 
                 // Filter by agent type if specified
                 let patterns: Vec<_> = if let Some(ref at) = agent_type {
@@ -1630,9 +1683,6 @@ async fn main() -> Result<()> {
                 }
             }
             LearnAction::CleanupSuccesses { days, force } => {
-                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
-                let cutoff_str = cutoff.to_rfc3339();
-
                 if !force {
                     println!(
                         "This will delete success patterns older than {} days with < 5 occurrences.",
@@ -1643,7 +1693,7 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let deleted = db.cleanup_old_success_patterns(&cutoff_str).await?;
+                let deleted = db.cleanup_old_success_patterns(days).await?;
                 println!("Deleted {} old success patterns", deleted);
             }
         },
@@ -2433,6 +2483,32 @@ async fn main() -> Result<()> {
             }
             ApprovalAction::Delegate { id, to } => {
                 handle_approval_delegate(&db, id, &to).await?;
+            }
+        },
+        Commands::Feedback { action } => match action {
+            FeedbackAction::Add {
+                agent_id,
+                rating,
+                comment,
+                message_id,
+            } => {
+                handle_feedback_add(&db, &agent_id, &rating, comment.as_deref(), message_id)
+                    .await?;
+            }
+            FeedbackAction::List {
+                agent,
+                rating,
+                source,
+                limit,
+            } => {
+                handle_feedback_list(&db, agent.as_deref(), rating.as_deref(), source.as_deref(), limit)
+                    .await?;
+            }
+            FeedbackAction::Stats { agent, by_type } => {
+                handle_feedback_stats(&db, agent.as_deref(), by_type).await?;
+            }
+            FeedbackAction::Delete { id } => {
+                handle_feedback_delete(&db, id).await?;
             }
         },
     }
@@ -4102,6 +4178,175 @@ async fn handle_approval_delegate(db: &Database, id: i64, to: &str) -> Result<()
 
     println!("Approval request {} delegated to {}", id, to);
 
+    Ok(())
+}
+
+// ==================== Feedback Handlers ====================
+
+async fn handle_feedback_add(
+    db: &Database,
+    agent_id: &str,
+    rating: &str,
+    comment: Option<&str>,
+    message_id: Option<i64>,
+) -> Result<()> {
+    use orchestrate_core::{Feedback, FeedbackRating, FeedbackSource};
+    use std::str::FromStr;
+
+    // Parse agent ID
+    let agent_uuid = Uuid::parse_str(agent_id)
+        .map_err(|e| anyhow::anyhow!("Invalid agent ID '{}': {}", agent_id, e))?;
+
+    // Verify agent exists
+    if db.get_agent(agent_uuid).await?.is_none() {
+        anyhow::bail!("Agent not found: {}", agent_id);
+    }
+
+    // Parse rating
+    let feedback_rating = FeedbackRating::from_str(rating)
+        .map_err(|_| anyhow::anyhow!("Invalid rating '{}'. Use: positive, negative, neutral, +, -, pos, neg", rating))?;
+
+    // Get current user
+    let created_by = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    // Build feedback
+    let mut feedback = Feedback::new(agent_uuid, feedback_rating, created_by)
+        .with_source(FeedbackSource::Cli);
+
+    if let Some(msg_id) = message_id {
+        feedback = feedback.with_message_id(msg_id);
+    }
+
+    if let Some(c) = comment {
+        feedback = feedback.with_comment(c);
+    }
+
+    // Insert feedback
+    let id = db.insert_feedback(&feedback).await?;
+
+    println!("Feedback added successfully (ID: {})", id);
+    println!("  Agent: {}", agent_id);
+    println!("  Rating: {}", feedback_rating);
+    if let Some(c) = comment {
+        println!("  Comment: {}", c);
+    }
+
+    Ok(())
+}
+
+async fn handle_feedback_list(
+    db: &Database,
+    agent: Option<&str>,
+    rating: Option<&str>,
+    source: Option<&str>,
+    limit: i64,
+) -> Result<()> {
+    use orchestrate_core::{FeedbackRating, FeedbackSource};
+    use std::str::FromStr;
+
+    let feedbacks = if let Some(agent_id) = agent {
+        let agent_uuid = Uuid::parse_str(agent_id)
+            .map_err(|e| anyhow::anyhow!("Invalid agent ID '{}': {}", agent_id, e))?;
+        db.list_feedback_for_agent(agent_uuid, limit).await?
+    } else {
+        let rating_filter = rating
+            .map(|r| FeedbackRating::from_str(r))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Invalid rating filter"))?;
+        let source_filter = source
+            .map(|s| FeedbackSource::from_str(s))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Invalid source filter"))?;
+        db.list_feedback(rating_filter, source_filter, limit).await?
+    };
+
+    if feedbacks.is_empty() {
+        println!("No feedback found");
+        return Ok(());
+    }
+
+    println!("Feedback ({} entries):", feedbacks.len());
+    println!("{:-<80}", "");
+
+    for fb in feedbacks {
+        let rating_symbol = match fb.rating {
+            orchestrate_core::FeedbackRating::Positive => "+",
+            orchestrate_core::FeedbackRating::Negative => "-",
+            orchestrate_core::FeedbackRating::Neutral => "0",
+        };
+        println!(
+            "[{}] ID: {} | Agent: {} | {} | by {} | {}",
+            rating_symbol,
+            fb.id,
+            &fb.agent_id.to_string()[..8],
+            fb.source,
+            fb.created_by,
+            fb.created_at.format("%Y-%m-%d %H:%M")
+        );
+        if let Some(comment) = &fb.comment {
+            println!("    Comment: {}", comment);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_feedback_stats(
+    db: &Database,
+    agent: Option<&str>,
+    by_type: bool,
+) -> Result<()> {
+    if let Some(agent_id) = agent {
+        let agent_uuid = Uuid::parse_str(agent_id)
+            .map_err(|e| anyhow::anyhow!("Invalid agent ID '{}': {}", agent_id, e))?;
+        let stats = db.get_feedback_stats_for_agent(agent_uuid).await?;
+
+        println!("Feedback Stats for Agent {}", agent_id);
+        println!("{:-<50}", "");
+        print_feedback_stats(&stats);
+    } else if by_type {
+        let stats_by_type = db.get_feedback_stats_by_agent_type().await?;
+
+        if stats_by_type.is_empty() {
+            println!("No feedback statistics available");
+            return Ok(());
+        }
+
+        println!("Feedback Stats by Agent Type");
+        println!("{:-<60}", "");
+
+        for (agent_type, stats) in stats_by_type {
+            println!("\n{}", agent_type.as_str());
+            print_feedback_stats(&stats);
+        }
+    } else {
+        let stats = db.get_feedback_stats().await?;
+
+        println!("Overall Feedback Stats");
+        println!("{:-<50}", "");
+        print_feedback_stats(&stats);
+    }
+
+    Ok(())
+}
+
+fn print_feedback_stats(stats: &orchestrate_core::FeedbackStats) {
+    println!("  Total: {}", stats.total);
+    println!(
+        "  Positive: {} ({:.1}%)",
+        stats.positive, stats.positive_percentage
+    );
+    println!("  Negative: {}", stats.negative);
+    println!("  Neutral: {}", stats.neutral);
+    println!("  Score: {:.2}", stats.score);
+}
+
+async fn handle_feedback_delete(db: &Database, id: i64) -> Result<()> {
+    if db.delete_feedback(id).await? {
+        println!("Feedback {} deleted", id);
+    } else {
+        println!("Feedback {} not found", id);
+    }
     Ok(())
 }
 

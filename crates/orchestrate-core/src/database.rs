@@ -6,6 +6,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
+use crate::feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
 use crate::instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
     LearningPattern, PatternStatus, PatternType, SuccessPattern, SuccessPatternType,
@@ -1722,6 +1723,210 @@ impl Database {
         .bind(&cutoff_str)
         .execute(&self.pool)
         .await?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    // ==================== Feedback Operations ====================
+
+    /// Insert a new feedback record
+    #[tracing::instrument(skip(self, feedback), level = "debug")]
+    pub async fn insert_feedback(&self, feedback: &Feedback) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO feedback (
+                agent_id, message_id, rating, comment, source, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(feedback.agent_id.to_string())
+        .bind(feedback.message_id)
+        .bind(feedback.rating.as_str())
+        .bind(&feedback.comment)
+        .bind(feedback.source.as_str())
+        .bind(&feedback.created_by)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get feedback by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback(&self, id: i64) -> Result<Option<Feedback>> {
+        let row: Option<FeedbackRow> = sqlx::query_as("SELECT * FROM feedback WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List feedback for an agent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_feedback_for_agent(
+        &self,
+        agent_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<Feedback>> {
+        let rows: Vec<FeedbackRow> = sqlx::query_as(
+            "SELECT * FROM feedback WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(agent_id.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List all feedback with optional filters
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_feedback(
+        &self,
+        rating: Option<FeedbackRating>,
+        source: Option<FeedbackSource>,
+        limit: i64,
+    ) -> Result<Vec<Feedback>> {
+        let rows: Vec<FeedbackRow> = match (rating, source) {
+            (Some(r), Some(s)) => {
+                sqlx::query_as(
+                    "SELECT * FROM feedback WHERE rating = ? AND source = ? ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(r.as_str())
+                .bind(s.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(r), None) => {
+                sqlx::query_as(
+                    "SELECT * FROM feedback WHERE rating = ? ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(r.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(s)) => {
+                sqlx::query_as(
+                    "SELECT * FROM feedback WHERE source = ? ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(s.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as("SELECT * FROM feedback ORDER BY created_at DESC LIMIT ?")
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get feedback statistics for an agent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback_stats_for_agent(&self, agent_id: Uuid) -> Result<FeedbackStats> {
+        let row: Option<FeedbackStatsRow> = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN rating = 'positive' THEN 1 ELSE 0 END) as positive,
+                SUM(CASE WHEN rating = 'negative' THEN 1 ELSE 0 END) as negative,
+                SUM(CASE WHEN rating = 'neutral' THEN 1 ELSE 0 END) as neutral
+            FROM feedback
+            WHERE agent_id = ?
+            "#,
+        )
+        .bind(agent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(|r| FeedbackStats::from_counts(r.positive, r.negative, r.neutral))
+            .unwrap_or_else(FeedbackStats::empty))
+    }
+
+    /// Get overall feedback statistics
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback_stats(&self) -> Result<FeedbackStats> {
+        let row: Option<FeedbackStatsRow> = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN rating = 'positive' THEN 1 ELSE 0 END) as positive,
+                SUM(CASE WHEN rating = 'negative' THEN 1 ELSE 0 END) as negative,
+                SUM(CASE WHEN rating = 'neutral' THEN 1 ELSE 0 END) as neutral
+            FROM feedback
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(|r| FeedbackStats::from_counts(r.positive, r.negative, r.neutral))
+            .unwrap_or_else(FeedbackStats::empty))
+    }
+
+    /// Get feedback statistics grouped by agent type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback_stats_by_agent_type(
+        &self,
+    ) -> Result<Vec<(AgentType, FeedbackStats)>> {
+        let rows: Vec<FeedbackStatsByTypeRow> = sqlx::query_as(
+            r#"
+            SELECT
+                a.agent_type,
+                COUNT(*) as total,
+                SUM(CASE WHEN f.rating = 'positive' THEN 1 ELSE 0 END) as positive,
+                SUM(CASE WHEN f.rating = 'negative' THEN 1 ELSE 0 END) as negative,
+                SUM(CASE WHEN f.rating = 'neutral' THEN 1 ELSE 0 END) as neutral
+            FROM feedback f
+            JOIN agents a ON f.agent_id = a.id
+            GROUP BY a.agent_type
+            ORDER BY total DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                let agent_type = AgentType::from_str(&r.agent_type)?;
+                let stats = FeedbackStats::from_counts(r.positive, r.negative, r.neutral);
+                Ok((agent_type, stats))
+            })
+            .collect()
+    }
+
+    /// Delete feedback by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_feedback(&self, id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM feedback WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Cleanup old feedback records
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn cleanup_old_feedback(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let result = sqlx::query("DELETE FROM feedback WHERE created_at < ?")
+            .bind(&cutoff_str)
+            .execute(&self.pool)
+            .await?;
 
         Ok(result.rows_affected() as usize)
     }
@@ -4014,4 +4219,59 @@ impl TryFrom<SuccessPatternRow> for SuccessPattern {
                 .into(),
         })
     }
+}
+
+// ==================== Feedback Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct FeedbackRow {
+    id: i64,
+    agent_id: String,
+    message_id: Option<i64>,
+    rating: String,
+    comment: Option<String>,
+    source: String,
+    created_by: String,
+    created_at: String,
+}
+
+impl TryFrom<FeedbackRow> for Feedback {
+    type Error = crate::Error;
+
+    fn try_from(row: FeedbackRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(Feedback {
+            id: row.id,
+            agent_id: Uuid::parse_str(&row.agent_id)
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
+            message_id: row.message_id,
+            rating: FeedbackRating::from_str(&row.rating)?,
+            comment: row.comment,
+            source: FeedbackSource::from_str(&row.source)?,
+            created_by: row.created_by,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct FeedbackStatsRow {
+    #[allow(dead_code)]
+    total: i64,
+    positive: i64,
+    negative: i64,
+    neutral: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct FeedbackStatsByTypeRow {
+    agent_type: String,
+    #[allow(dead_code)]
+    total: i64,
+    positive: i64,
+    negative: i64,
+    neutral: i64,
 }

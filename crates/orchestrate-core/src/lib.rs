@@ -21,6 +21,7 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 pub mod epic;
 pub mod error;
+pub mod feedback;
 pub mod instruction;
 pub mod learning;
 pub mod message;
@@ -56,6 +57,9 @@ pub use instruction::{
 
 // Re-export learning types
 pub use learning::{CleanupResult, LearningEngine, SuccessRecommendations};
+
+// Re-export feedback types
+pub use feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
 
 // Re-export network types
 pub use network::{
