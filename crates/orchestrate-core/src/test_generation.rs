@@ -1,572 +1,718 @@
-//! Test Generation Module
+//! Test generation service for automated test creation
 //!
-//! Types and utilities for automated test generation, coverage tracking,
-//! and test quality validation.
+//! This module provides functionality to analyze source code and generate
+//! unit tests for functions across multiple languages (Rust, TypeScript, Python).
 
-use chrono::{DateTime, Utc};
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-/// Test type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TestType {
-    Unit,
-    Integration,
-    EndToEnd,
-    Property,
+/// Programming language support for test generation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Rust,
+    TypeScript,
+    Python,
 }
 
-impl TestType {
-    pub fn as_str(&self) -> &'static str {
+impl Language {
+    /// Detect language from file extension
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| Error::Other("No file extension found".to_string()))?;
+
+        match extension {
+            "rs" => Ok(Language::Rust),
+            "ts" | "tsx" => Ok(Language::TypeScript),
+            "py" => Ok(Language::Python),
+            _ => Err(Error::Other(format!(
+                "Unsupported file extension: {}",
+                extension
+            ))),
+        }
+    }
+
+    /// Get test file extension for this language
+    pub fn test_extension(&self) -> &'static str {
         match self {
-            Self::Unit => "unit",
-            Self::Integration => "integration",
-            Self::EndToEnd => "e2e",
-            Self::Property => "property",
+            Language::Rust => "rs",
+            Language::TypeScript => "test.ts",
+            Language::Python => "test.py",
         }
     }
-}
 
-impl std::str::FromStr for TestType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "unit" => Ok(Self::Unit),
-            "integration" | "int" => Ok(Self::Integration),
-            "e2e" | "end-to-end" | "endtoend" => Ok(Self::EndToEnd),
-            "property" | "prop" => Ok(Self::Property),
-            _ => Err(format!("Unknown test type: {}", s)),
-        }
-    }
-}
-
-/// Test framework
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TestFramework {
-    CargoTest,    // Rust
-    Jest,         // JavaScript/TypeScript
-    Vitest,       // JavaScript/TypeScript
-    Pytest,       // Python
-    Playwright,   // E2E
-    Cypress,      // E2E
-}
-
-impl TestFramework {
-    pub fn as_str(&self) -> &'static str {
+    /// Get typical test directory for this language
+    pub fn test_directory(&self) -> &'static str {
         match self {
-            Self::CargoTest => "cargo_test",
-            Self::Jest => "jest",
-            Self::Vitest => "vitest",
-            Self::Pytest => "pytest",
-            Self::Playwright => "playwright",
-            Self::Cypress => "cypress",
-        }
-    }
-
-    /// Detect framework from file extension
-    pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext {
-            "rs" => Some(Self::CargoTest),
-            "ts" | "tsx" | "js" | "jsx" => Some(Self::Vitest),
-            "py" => Some(Self::Pytest),
-            _ => None,
+            Language::Rust => "tests",
+            Language::TypeScript => "__tests__",
+            Language::Python => "tests",
         }
     }
 }
 
-/// Generated test
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeneratedTest {
+/// Represents a function signature extracted from source code
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionSignature {
+    /// Function name
     pub name: String,
-    pub test_type: TestType,
-    pub framework: TestFramework,
-    pub target_file: String,
-    pub target_function: Option<String>,
-    pub test_code: String,
-    pub description: String,
-    pub generated_at: DateTime<Utc>,
+    /// Parameter names and types (simplified)
+    pub parameters: Vec<Parameter>,
+    /// Return type (if known)
+    pub return_type: Option<String>,
+    /// Whether function is async
+    pub is_async: bool,
+    /// Source code line number
+    pub line_number: usize,
 }
 
-impl GeneratedTest {
-    /// Create a new generated test
-    pub fn new(
-        name: &str,
-        test_type: TestType,
-        framework: TestFramework,
-        target_file: &str,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            test_type,
-            framework,
-            target_file: target_file.to_string(),
-            target_function: None,
-            test_code: String::new(),
-            description: String::new(),
-            generated_at: Utc::now(),
-        }
-    }
-
-    /// Set the test code
-    pub fn with_code(mut self, code: &str) -> Self {
-        self.test_code = code.to_string();
-        self
-    }
-
-    /// Set target function
-    pub fn with_function(mut self, function: &str) -> Self {
-        self.target_function = Some(function.to_string());
-        self
-    }
-}
-
-/// Test generation request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestGenerationRequest {
-    pub target_path: String,
-    pub test_type: TestType,
-    pub framework: Option<TestFramework>,
-    pub story_id: Option<String>,
-    pub include_edge_cases: bool,
-    pub include_error_cases: bool,
-    pub mock_dependencies: bool,
-}
-
-impl Default for TestGenerationRequest {
-    fn default() -> Self {
-        Self {
-            target_path: String::new(),
-            test_type: TestType::Unit,
-            framework: None,
-            story_id: None,
-            include_edge_cases: true,
-            include_error_cases: true,
-            mock_dependencies: true,
-        }
-    }
-}
-
-/// Test coverage data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoverageReport {
-    pub project_name: String,
-    pub overall_percentage: f64,
-    pub target_percentage: f64,
-    pub modules: Vec<ModuleCoverage>,
-    pub generated_at: DateTime<Utc>,
-    pub trends: Vec<CoverageTrend>,
-}
-
-impl CoverageReport {
-    /// Create a new coverage report
-    pub fn new(project_name: &str) -> Self {
-        Self {
-            project_name: project_name.to_string(),
-            overall_percentage: 0.0,
-            target_percentage: 80.0,
-            modules: vec![],
-            generated_at: Utc::now(),
-            trends: vec![],
-        }
-    }
-
-    /// Add a module
-    pub fn add_module(&mut self, module: ModuleCoverage) {
-        self.modules.push(module);
-        self.recalculate_overall();
-    }
-
-    /// Recalculate overall coverage
-    fn recalculate_overall(&mut self) {
-        if self.modules.is_empty() {
-            self.overall_percentage = 0.0;
-            return;
-        }
-
-        let total_lines: u32 = self.modules.iter().map(|m| m.total_lines).sum();
-        let covered_lines: u32 = self.modules.iter().map(|m| m.covered_lines).sum();
-
-        self.overall_percentage = if total_lines > 0 {
-            (covered_lines as f64 / total_lines as f64) * 100.0
-        } else {
-            0.0
-        };
-    }
-
-    /// Check if coverage meets target
-    pub fn meets_target(&self) -> bool {
-        self.overall_percentage >= self.target_percentage
-    }
-
-    /// Get modules below target
-    pub fn modules_below_target(&self) -> Vec<&ModuleCoverage> {
-        self.modules
-            .iter()
-            .filter(|m| m.coverage_percentage < m.target_percentage)
-            .collect()
-    }
-
-    /// Generate summary
-    pub fn to_summary(&self) -> String {
-        let mut output = format!("Coverage Report: {}\n", self.project_name);
-        output.push_str(&format!("Generated: {}\n\n", self.generated_at.format("%Y-%m-%d %H:%M:%S UTC")));
-
-        let status = if self.meets_target() { "✓" } else { "⚠️" };
-        output.push_str(&format!(
-            "Overall: {:.1}% (target: {:.0}%) {}\n\n",
-            self.overall_percentage, self.target_percentage, status
-        ));
-
-        output.push_str("Modules:\n");
-        for module in &self.modules {
-            let status = if module.coverage_percentage >= module.target_percentage {
-                ""
-            } else {
-                " ⚠️"
-            };
-            output.push_str(&format!(
-                "  {}: {:.1}% (target: {:.0}%){}\n",
-                module.name, module.coverage_percentage, module.target_percentage, status
-            ));
-        }
-
-        output
-    }
-}
-
-/// Module coverage
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModuleCoverage {
+/// Function parameter
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parameter {
     pub name: String,
-    pub path: String,
-    pub total_lines: u32,
-    pub covered_lines: u32,
-    pub coverage_percentage: f64,
-    pub target_percentage: f64,
-    pub files: Vec<FileCoverage>,
+    pub type_hint: Option<String>,
 }
 
-impl ModuleCoverage {
-    /// Create new module coverage
-    pub fn new(name: &str, path: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            path: path.to_string(),
-            total_lines: 0,
-            covered_lines: 0,
-            coverage_percentage: 0.0,
-            target_percentage: 80.0,
-            files: vec![],
-        }
-    }
-
-    /// Add file coverage
-    pub fn add_file(&mut self, file: FileCoverage) {
-        self.total_lines += file.total_lines;
-        self.covered_lines += file.covered_lines;
-        self.files.push(file);
-        self.recalculate();
-    }
-
-    fn recalculate(&mut self) {
-        self.coverage_percentage = if self.total_lines > 0 {
-            (self.covered_lines as f64 / self.total_lines as f64) * 100.0
-        } else {
-            0.0
-        };
-    }
+/// Test case to be generated
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCase {
+    /// Test name
+    pub name: String,
+    /// Test category (happy_path, edge_case, error_condition)
+    pub category: TestCategory,
+    /// Generated test code
+    pub code: String,
 }
 
-/// File coverage
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileCoverage {
-    pub path: String,
-    pub total_lines: u32,
-    pub covered_lines: u32,
-    pub coverage_percentage: f64,
-    pub uncovered_lines: Vec<u32>,
-}
-
-impl FileCoverage {
-    /// Create new file coverage
-    pub fn new(path: &str, total: u32, covered: u32) -> Self {
-        let percentage = if total > 0 {
-            (covered as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        Self {
-            path: path.to_string(),
-            total_lines: total,
-            covered_lines: covered,
-            coverage_percentage: percentage,
-            uncovered_lines: vec![],
-        }
-    }
-}
-
-/// Coverage trend
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoverageTrend {
-    pub date: DateTime<Utc>,
-    pub overall_percentage: f64,
-    pub commit_sha: Option<String>,
-}
-
-/// Test run result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestRun {
-    pub id: String,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub status: TestRunStatus,
-    pub total_tests: u32,
-    pub passed: u32,
-    pub failed: u32,
-    pub skipped: u32,
-    pub duration_seconds: Option<f64>,
-    pub test_results: Vec<TestResult>,
-    pub coverage: Option<CoverageReport>,
-}
-
-impl TestRun {
-    /// Create a new test run
-    pub fn new(id: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            started_at: Utc::now(),
-            completed_at: None,
-            status: TestRunStatus::Running,
-            total_tests: 0,
-            passed: 0,
-            failed: 0,
-            skipped: 0,
-            duration_seconds: None,
-            test_results: vec![],
-            coverage: None,
-        }
-    }
-
-    /// Add a test result
-    pub fn add_result(&mut self, result: TestResult) {
-        self.total_tests += 1;
-        match result.status {
-            TestResultStatus::Passed => self.passed += 1,
-            TestResultStatus::Failed => self.failed += 1,
-            TestResultStatus::Skipped => self.skipped += 1,
-        }
-        self.test_results.push(result);
-    }
-
-    /// Complete the test run
-    pub fn complete(&mut self, status: TestRunStatus) {
-        self.completed_at = Some(Utc::now());
-        self.status = status;
-        if let Some(completed) = self.completed_at {
-            self.duration_seconds = Some((completed - self.started_at).num_milliseconds() as f64 / 1000.0);
-        }
-    }
-
-    /// Check if all tests passed
-    pub fn all_passed(&self) -> bool {
-        self.failed == 0 && self.status == TestRunStatus::Completed
-    }
-}
-
-/// Test run status
+/// Category of test case
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TestRunStatus {
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
+pub enum TestCategory {
+    HappyPath,
+    EdgeCase,
+    ErrorCondition,
 }
 
-impl TestRunStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
+/// Result of test generation for a file
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestGenerationResult {
+    /// Source file that was analyzed
+    pub source_file: PathBuf,
+    /// Target language
+    pub language: Language,
+    /// Functions found in the file
+    pub functions: Vec<FunctionSignature>,
+    /// Generated test cases
+    pub test_cases: Vec<TestCase>,
+    /// Suggested test file location
+    pub test_file_path: PathBuf,
 }
 
-/// Individual test result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestResult {
-    pub name: String,
-    pub status: TestResultStatus,
-    pub duration_ms: Option<u64>,
-    pub error_message: Option<String>,
-    pub stack_trace: Option<String>,
-}
+/// Service for generating unit tests
+pub struct TestGenerationService;
 
-/// Test result status
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TestResultStatus {
-    Passed,
-    Failed,
-    Skipped,
-}
-
-impl TestResultStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Passed => "passed",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
-        }
-    }
-}
-
-/// Test quality validation result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestQualityReport {
-    pub total_tests: u32,
-    pub validated_at: DateTime<Utc>,
-    pub issues: Vec<TestQualityIssue>,
-    pub mutation_score: Option<f64>,
-    pub suggestions: Vec<String>,
-}
-
-impl TestQualityReport {
-    /// Create a new quality report
+impl TestGenerationService {
+    /// Create a new test generation service
     pub fn new() -> Self {
-        Self {
-            total_tests: 0,
-            validated_at: Utc::now(),
-            issues: vec![],
-            mutation_score: None,
-            suggestions: vec![],
+        Self
+    }
+
+    /// Analyze a source file and generate unit tests
+    pub async fn generate_tests(&self, file_path: &Path) -> Result<TestGenerationResult> {
+        // Detect language from file extension
+        let language = Language::from_path(file_path)?;
+
+        // Read source file
+        let source_code = tokio::fs::read_to_string(file_path)
+            .await
+            .map_err(|e| Error::Other(format!("Failed to read file: {}", e)))?;
+
+        // Extract function signatures
+        let functions = self.extract_functions(&source_code, language)?;
+
+        // Generate test cases for each function
+        let mut test_cases = Vec::new();
+        for function in &functions {
+            test_cases.extend(self.generate_test_cases(function, language)?);
+        }
+
+        // Determine test file location
+        let test_file_path = self.determine_test_location(file_path, language)?;
+
+        Ok(TestGenerationResult {
+            source_file: file_path.to_path_buf(),
+            language,
+            functions,
+            test_cases,
+            test_file_path,
+        })
+    }
+
+    /// Extract function signatures from source code
+    fn extract_functions(
+        &self,
+        source_code: &str,
+        language: Language,
+    ) -> Result<Vec<FunctionSignature>> {
+        match language {
+            Language::Rust => self.extract_rust_functions(source_code),
+            Language::TypeScript => self.extract_typescript_functions(source_code),
+            Language::Python => self.extract_python_functions(source_code),
         }
     }
 
-    /// Add an issue
-    pub fn add_issue(&mut self, issue: TestQualityIssue) {
-        self.issues.push(issue);
+    /// Extract Rust function signatures
+    fn extract_rust_functions(&self, source_code: &str) -> Result<Vec<FunctionSignature>> {
+        let mut functions = Vec::new();
+        let lines: Vec<&str> = source_code.lines().collect();
+
+        for (line_number, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            // Skip comments and non-function lines
+            if trimmed.starts_with("//") || !trimmed.contains("fn ") {
+                continue;
+            }
+
+            // Simple regex-like parsing for "pub fn name(" or "fn name("
+            if let Some(fn_pos) = trimmed.find("fn ") {
+                let after_fn = &trimmed[fn_pos + 3..];
+                if let Some(paren_pos) = after_fn.find('(') {
+                    let name = after_fn[..paren_pos].trim().to_string();
+
+                    // Skip test functions themselves
+                    if name.starts_with("test_") {
+                        continue;
+                    }
+
+                    // Check if async
+                    let is_async = trimmed.contains("async fn");
+
+                    // Extract parameters (simplified - just count them)
+                    let params = self.extract_rust_parameters(after_fn);
+
+                    // Extract return type (simplified)
+                    let return_type = self.extract_rust_return_type(after_fn);
+
+                    functions.push(FunctionSignature {
+                        name,
+                        parameters: params,
+                        return_type,
+                        is_async,
+                        line_number: line_number + 1,
+                    });
+                }
+            }
+        }
+
+        Ok(functions)
     }
 
-    /// Add suggestion
-    pub fn add_suggestion(&mut self, suggestion: &str) {
-        self.suggestions.push(suggestion.to_string());
+    /// Extract Rust function parameters
+    fn extract_rust_parameters(&self, fn_signature: &str) -> Vec<Parameter> {
+        let mut params = Vec::new();
+
+        if let Some(paren_start) = fn_signature.find('(') {
+            if let Some(paren_end) = fn_signature.find(')') {
+                let params_str = &fn_signature[paren_start + 1..paren_end];
+
+                if params_str.trim().is_empty() || params_str.trim() == "&self" || params_str.trim() == "self" {
+                    return params;
+                }
+
+                for param in params_str.split(',') {
+                    let parts: Vec<&str> = param.trim().split(':').collect();
+                    if parts.len() >= 2 {
+                        params.push(Parameter {
+                            name: parts[0].trim().to_string(),
+                            type_hint: Some(parts[1].trim().to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        params
     }
 
-    /// Check if tests are high quality
-    pub fn is_high_quality(&self) -> bool {
-        self.issues.is_empty() && self.mutation_score.unwrap_or(0.0) >= 70.0
+    /// Extract Rust return type
+    fn extract_rust_return_type(&self, fn_signature: &str) -> Option<String> {
+        if let Some(arrow_pos) = fn_signature.find("->") {
+            let after_arrow = &fn_signature[arrow_pos + 2..];
+            if let Some(brace_pos) = after_arrow.find('{') {
+                return Some(after_arrow[..brace_pos].trim().to_string());
+            }
+        }
+        None
+    }
+
+    /// Extract TypeScript function signatures
+    fn extract_typescript_functions(&self, source_code: &str) -> Result<Vec<FunctionSignature>> {
+        let mut functions = Vec::new();
+        let lines: Vec<&str> = source_code.lines().collect();
+
+        for (line_number, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            // Skip comments
+            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                continue;
+            }
+
+            // Look for function declarations
+            if trimmed.contains("function ") || trimmed.contains("const ") && trimmed.contains("= (") {
+                // Extract function name (simplified)
+                let name = self.extract_typescript_function_name(trimmed)?;
+
+                // Skip test functions
+                if name.starts_with("test") || name.contains("Test") {
+                    continue;
+                }
+
+                let is_async = trimmed.contains("async");
+
+                functions.push(FunctionSignature {
+                    name,
+                    parameters: Vec::new(), // Simplified for now
+                    return_type: None,
+                    is_async,
+                    line_number: line_number + 1,
+                });
+            }
+        }
+
+        Ok(functions)
+    }
+
+    /// Extract TypeScript function name
+    fn extract_typescript_function_name(&self, line: &str) -> Result<String> {
+        if let Some(fn_pos) = line.find("function ") {
+            let after_fn = &line[fn_pos + 9..];
+            if let Some(paren_pos) = after_fn.find('(') {
+                return Ok(after_fn[..paren_pos].trim().to_string());
+            }
+        } else if let Some(const_pos) = line.find("const ") {
+            let after_const = &line[const_pos + 6..];
+            if let Some(eq_pos) = after_const.find('=') {
+                return Ok(after_const[..eq_pos].trim().to_string());
+            }
+        }
+
+        Err(Error::Other("Could not extract function name".to_string()))
+    }
+
+    /// Extract Python function signatures
+    fn extract_python_functions(&self, source_code: &str) -> Result<Vec<FunctionSignature>> {
+        let mut functions = Vec::new();
+        let lines: Vec<&str> = source_code.lines().collect();
+
+        for (line_number, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            // Check for async def first, then regular def
+            let is_async = trimmed.starts_with("async def ");
+            let is_def = trimmed.starts_with("def ") || is_async;
+
+            if is_def {
+                let after_def = if is_async {
+                    &trimmed[10..] // "async def " is 10 chars
+                } else {
+                    &trimmed[4..] // "def " is 4 chars
+                };
+
+                if let Some(paren_pos) = after_def.find('(') {
+                    let name = after_def[..paren_pos].trim().to_string();
+
+                    // Skip test functions
+                    if name.starts_with("test_") {
+                        continue;
+                    }
+
+                    functions.push(FunctionSignature {
+                        name,
+                        parameters: Vec::new(), // Simplified for now
+                        return_type: None,
+                        is_async,
+                        line_number: line_number + 1,
+                    });
+                }
+            }
+        }
+
+        Ok(functions)
+    }
+
+    /// Generate test cases for a function
+    fn generate_test_cases(
+        &self,
+        function: &FunctionSignature,
+        language: Language,
+    ) -> Result<Vec<TestCase>> {
+        let mut test_cases = Vec::new();
+
+        // Generate happy path test
+        test_cases.push(self.generate_happy_path_test(function, language)?);
+
+        // Generate edge case tests
+        test_cases.extend(self.generate_edge_case_tests(function, language)?);
+
+        // Generate error condition tests
+        test_cases.extend(self.generate_error_tests(function, language)?);
+
+        Ok(test_cases)
+    }
+
+    /// Generate happy path test
+    fn generate_happy_path_test(
+        &self,
+        function: &FunctionSignature,
+        language: Language,
+    ) -> Result<TestCase> {
+        let test_name = format!("test_{}_happy_path", function.name);
+        let code = match language {
+            Language::Rust => self.generate_rust_test_code(function, &test_name, TestCategory::HappyPath),
+            Language::TypeScript => self.generate_typescript_test_code(function, &test_name, TestCategory::HappyPath),
+            Language::Python => self.generate_python_test_code(function, &test_name, TestCategory::HappyPath),
+        };
+
+        Ok(TestCase {
+            name: test_name,
+            category: TestCategory::HappyPath,
+            code,
+        })
+    }
+
+    /// Generate edge case tests
+    fn generate_edge_case_tests(
+        &self,
+        function: &FunctionSignature,
+        language: Language,
+    ) -> Result<Vec<TestCase>> {
+        let mut tests = Vec::new();
+
+        // Generate empty input test
+        let empty_test_name = format!("test_{}_empty_input", function.name);
+        let empty_code = match language {
+            Language::Rust => self.generate_rust_test_code(function, &empty_test_name, TestCategory::EdgeCase),
+            Language::TypeScript => self.generate_typescript_test_code(function, &empty_test_name, TestCategory::EdgeCase),
+            Language::Python => self.generate_python_test_code(function, &empty_test_name, TestCategory::EdgeCase),
+        };
+
+        tests.push(TestCase {
+            name: empty_test_name,
+            category: TestCategory::EdgeCase,
+            code: empty_code,
+        });
+
+        Ok(tests)
+    }
+
+    /// Generate error condition tests
+    fn generate_error_tests(
+        &self,
+        function: &FunctionSignature,
+        language: Language,
+    ) -> Result<Vec<TestCase>> {
+        let mut tests = Vec::new();
+
+        // Generate error condition test
+        let error_test_name = format!("test_{}_error_condition", function.name);
+        let error_code = match language {
+            Language::Rust => self.generate_rust_test_code(function, &error_test_name, TestCategory::ErrorCondition),
+            Language::TypeScript => self.generate_typescript_test_code(function, &error_test_name, TestCategory::ErrorCondition),
+            Language::Python => self.generate_python_test_code(function, &error_test_name, TestCategory::ErrorCondition),
+        };
+
+        tests.push(TestCase {
+            name: error_test_name,
+            category: TestCategory::ErrorCondition,
+            code: error_code,
+        });
+
+        Ok(tests)
+    }
+
+    /// Generate Rust test code
+    fn generate_rust_test_code(
+        &self,
+        function: &FunctionSignature,
+        test_name: &str,
+        category: TestCategory,
+    ) -> String {
+        let async_marker = if function.is_async {
+            "#[tokio::test]\nasync "
+        } else {
+            "#[test]\n"
+        };
+
+        let await_suffix = if function.is_async { ".await" } else { "" };
+
+        let test_body = match category {
+            TestCategory::HappyPath => {
+                format!(
+                    r#"    // Arrange
+    let input = todo!("Setup test input");
+
+    // Act
+    let result = {}(input){};
+
+    // Assert
+    assert!(result.is_ok(), "Function should succeed with valid input");"#,
+                    function.name, await_suffix
+                )
+            }
+            TestCategory::EdgeCase => {
+                format!(
+                    r#"    // Arrange
+    let input = todo!("Setup empty/boundary input");
+
+    // Act
+    let result = {}(input){};
+
+    // Assert
+    // TODO: Add appropriate assertion for edge case"#,
+                    function.name, await_suffix
+                )
+            }
+            TestCategory::ErrorCondition => {
+                format!(
+                    r#"    // Arrange
+    let input = todo!("Setup invalid input");
+
+    // Act
+    let result = {}(input){};
+
+    // Assert
+    assert!(result.is_err(), "Function should fail with invalid input");"#,
+                    function.name, await_suffix
+                )
+            }
+        };
+
+        format!(
+            r#"{}fn {}() {{
+{}
+}}"#,
+            async_marker, test_name, test_body
+        )
+    }
+
+    /// Generate TypeScript test code
+    fn generate_typescript_test_code(
+        &self,
+        function: &FunctionSignature,
+        test_name: &str,
+        category: TestCategory,
+    ) -> String {
+        let async_marker = if function.is_async { "async " } else { "" };
+        let await_prefix = if function.is_async { "await " } else { "" };
+
+        let test_body = match category {
+            TestCategory::HappyPath => {
+                format!(
+                    r#"  // Arrange
+  const input = null; // TODO: Setup test input
+
+  // Act
+  const result = {}{}(input);
+
+  // Assert
+  expect(result).toBeDefined();"#,
+                    await_prefix, function.name
+                )
+            }
+            TestCategory::EdgeCase => {
+                format!(
+                    r#"  // Arrange
+  const input = null; // TODO: Setup empty/boundary input
+
+  // Act
+  const result = {}{}(input);
+
+  // Assert
+  // TODO: Add appropriate assertion for edge case"#,
+                    await_prefix, function.name
+                )
+            }
+            TestCategory::ErrorCondition => {
+                format!(
+                    r#"  // Arrange
+  const input = null; // TODO: Setup invalid input
+
+  // Act & Assert
+  expect(() => {}{}(input)).toThrow();"#,
+                    await_prefix, function.name
+                )
+            }
+        };
+
+        format!(
+            r#"test('{}', {}() => {{
+{}
+}});"#,
+            test_name, async_marker, test_body
+        )
+    }
+
+    /// Generate Python test code
+    fn generate_python_test_code(
+        &self,
+        function: &FunctionSignature,
+        test_name: &str,
+        category: TestCategory,
+    ) -> String {
+        let async_marker = if function.is_async { "async " } else { "" };
+        let await_prefix = if function.is_async { "await " } else { "" };
+
+        let test_body = match category {
+            TestCategory::HappyPath => {
+                format!(
+                    r#"    # Arrange
+    input_data = None  # TODO: Setup test input
+
+    # Act
+    result = {}{}(input_data)
+
+    # Assert
+    assert result is not None"#,
+                    await_prefix, function.name
+                )
+            }
+            TestCategory::EdgeCase => {
+                format!(
+                    r#"    # Arrange
+    input_data = None  # TODO: Setup empty/boundary input
+
+    # Act
+    result = {}{}(input_data)
+
+    # Assert
+    # TODO: Add appropriate assertion for edge case"#,
+                    await_prefix, function.name
+                )
+            }
+            TestCategory::ErrorCondition => {
+                format!(
+                    r#"    # Arrange
+    input_data = None  # TODO: Setup invalid input
+
+    # Act & Assert
+    with pytest.raises(Exception):
+        {}{}(input_data)"#,
+                    await_prefix, function.name
+                )
+            }
+        };
+
+        format!(
+            r#"{}def {}():
+{}
+"#,
+            async_marker, test_name, test_body
+        )
+    }
+
+    /// Determine where to place test file
+    fn determine_test_location(&self, source_file: &Path, language: Language) -> Result<PathBuf> {
+        let file_name = source_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::Other("Invalid file name".to_string()))?;
+
+        match language {
+            Language::Rust => {
+                // For Rust, tests can be in the same file or in tests/ directory
+                // Default to same file (inline tests module)
+                Ok(source_file.to_path_buf())
+            }
+            Language::TypeScript => {
+                // For TypeScript, put in __tests__ directory
+                let parent = source_file
+                    .parent()
+                    .ok_or_else(|| Error::Other("No parent directory".to_string()))?;
+                Ok(parent.join("__tests__").join(format!(
+                    "{}.{}",
+                    file_name,
+                    language.test_extension()
+                )))
+            }
+            Language::Python => {
+                // For Python, put in tests/ directory
+                let parent = source_file
+                    .parent()
+                    .ok_or_else(|| Error::Other("No parent directory".to_string()))?;
+                Ok(parent.join("tests").join(format!(
+                    "{}_{}",
+                    file_name,
+                    language.test_extension()
+                )))
+            }
+        }
+    }
+
+    /// Format test cases into a complete test file/module
+    pub fn format_test_output(
+        &self,
+        result: &TestGenerationResult,
+    ) -> Result<String> {
+        match result.language {
+            Language::Rust => self.format_rust_test_module(&result.test_cases),
+            Language::TypeScript => self.format_typescript_test_file(&result.test_cases),
+            Language::Python => self.format_python_test_file(&result.test_cases),
+        }
+    }
+
+    /// Format Rust test module
+    fn format_rust_test_module(&self, test_cases: &[TestCase]) -> Result<String> {
+        let mut output = String::from(
+            r#"#[cfg(test)]
+mod tests {
+    use super::*;
+
+"#,
+        );
+
+        for test_case in test_cases {
+            output.push_str("    ");
+            output.push_str(&test_case.code.replace('\n', "\n    "));
+            output.push_str("\n\n");
+        }
+
+        output.push('}');
+        Ok(output)
+    }
+
+    /// Format TypeScript test file
+    fn format_typescript_test_file(&self, test_cases: &[TestCase]) -> Result<String> {
+        let mut output = String::from("import { describe, test, expect } from 'vitest';\n\n");
+
+        for test_case in test_cases {
+            output.push_str(&test_case.code);
+            output.push_str("\n\n");
+        }
+
+        Ok(output)
+    }
+
+    /// Format Python test file
+    fn format_python_test_file(&self, test_cases: &[TestCase]) -> Result<String> {
+        let mut output = String::from("import pytest\n\n");
+
+        for test_case in test_cases {
+            output.push_str(&test_case.code);
+            output.push('\n');
+        }
+
+        Ok(output)
     }
 }
 
-impl Default for TestQualityReport {
+impl Default for TestGenerationService {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Test quality issue
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestQualityIssue {
-    pub test_name: String,
-    pub issue_type: TestQualityIssueType,
-    pub description: String,
-    pub severity: IssueSeverity,
-}
-
-/// Test quality issue type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TestQualityIssueType {
-    WeakAssertion,
-    AlwaysPasses,
-    TestsImplementation,
-    MissingEdgeCases,
-    NoAssertions,
-    DuplicateTest,
-}
-
-impl TestQualityIssueType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::WeakAssertion => "weak_assertion",
-            Self::AlwaysPasses => "always_passes",
-            Self::TestsImplementation => "tests_implementation",
-            Self::MissingEdgeCases => "missing_edge_cases",
-            Self::NoAssertions => "no_assertions",
-            Self::DuplicateTest => "duplicate_test",
-        }
-    }
-}
-
-/// Issue severity
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IssueSeverity {
-    High,
-    Medium,
-    Low,
-}
-
-impl IssueSeverity {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::High => "high",
-            Self::Medium => "medium",
-            Self::Low => "low",
-        }
-    }
-}
-
-/// Test suggestion for PR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestSuggestion {
-    pub file_path: String,
-    pub function_name: String,
-    pub suggested_tests: Vec<String>,
-    pub reason: String,
-    pub priority: IssueSeverity,
-}
-
-/// Testable unit identified in code
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestableUnit {
-    pub name: String,
-    pub unit_type: TestableUnitType,
-    pub file_path: String,
-    pub line_number: u32,
-    pub parameters: Vec<String>,
-    pub return_type: Option<String>,
-    pub has_tests: bool,
-    pub complexity: u32,
-}
-
-/// Type of testable unit
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TestableUnitType {
-    Function,
-    Method,
-    Class,
-    Module,
-    Trait,
-}
-
-impl TestableUnitType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Function => "function",
-            Self::Method => "method",
-            Self::Class => "class",
-            Self::Module => "module",
-            Self::Trait => "trait",
-        }
     }
 }
 
@@ -575,116 +721,299 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_test_type_from_str() {
-        use std::str::FromStr;
-
-        assert_eq!(TestType::from_str("unit").unwrap(), TestType::Unit);
-        assert_eq!(TestType::from_str("integration").unwrap(), TestType::Integration);
-        assert_eq!(TestType::from_str("e2e").unwrap(), TestType::EndToEnd);
-        assert_eq!(TestType::from_str("property").unwrap(), TestType::Property);
-        assert!(TestType::from_str("unknown").is_err());
+    fn test_language_from_path_rust() {
+        let path = Path::new("src/main.rs");
+        let lang = Language::from_path(path).unwrap();
+        assert_eq!(lang, Language::Rust);
     }
 
     #[test]
-    fn test_framework_detection() {
-        assert_eq!(TestFramework::from_extension("rs"), Some(TestFramework::CargoTest));
-        assert_eq!(TestFramework::from_extension("ts"), Some(TestFramework::Vitest));
-        assert_eq!(TestFramework::from_extension("py"), Some(TestFramework::Pytest));
-        assert_eq!(TestFramework::from_extension("go"), None);
+    fn test_language_from_path_typescript() {
+        let path = Path::new("src/index.ts");
+        let lang = Language::from_path(path).unwrap();
+        assert_eq!(lang, Language::TypeScript);
     }
 
     #[test]
-    fn test_generated_test_creation() {
-        let test = GeneratedTest::new(
-            "test_add_numbers",
-            TestType::Unit,
-            TestFramework::CargoTest,
-            "src/math.rs",
+    fn test_language_from_path_python() {
+        let path = Path::new("src/main.py");
+        let lang = Language::from_path(path).unwrap();
+        assert_eq!(lang, Language::Python);
+    }
+
+    #[test]
+    fn test_language_from_path_unsupported() {
+        let path = Path::new("src/main.java");
+        let result = Language::from_path(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_rust_simple_function() {
+        let service = TestGenerationService::new();
+        let source = r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#;
+        let functions = service.extract_rust_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "add");
+        assert_eq!(functions[0].parameters.len(), 2);
+        assert_eq!(functions[0].return_type, Some("i32".to_string()));
+        assert!(!functions[0].is_async);
+    }
+
+    #[test]
+    fn test_extract_rust_async_function() {
+        let service = TestGenerationService::new();
+        let source = r#"
+pub async fn fetch_data(url: String) -> Result<String> {
+    // implementation
+}
+"#;
+        let functions = service.extract_rust_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "fetch_data");
+        assert!(functions[0].is_async);
+    }
+
+    #[test]
+    fn test_extract_rust_no_params_function() {
+        let service = TestGenerationService::new();
+        let source = r#"
+fn get_default() -> i32 {
+    42
+}
+"#;
+        let functions = service.extract_rust_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "get_default");
+        assert_eq!(functions[0].parameters.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_rust_skip_test_functions() {
+        let service = TestGenerationService::new();
+        let source = r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[test]
+fn test_add() {
+    assert_eq!(add(1, 2), 3);
+}
+"#;
+        let functions = service.extract_rust_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "add");
+    }
+
+    #[test]
+    fn test_extract_typescript_function() {
+        let service = TestGenerationService::new();
+        let source = r#"
+function calculateSum(a: number, b: number): number {
+    return a + b;
+}
+"#;
+        let functions = service.extract_typescript_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "calculateSum");
+    }
+
+    #[test]
+    fn test_extract_typescript_async_function() {
+        let service = TestGenerationService::new();
+        let source = r#"
+async function fetchData(url: string): Promise<string> {
+    return await fetch(url);
+}
+"#;
+        let functions = service.extract_typescript_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "fetchData");
+        assert!(functions[0].is_async);
+    }
+
+    #[test]
+    fn test_extract_python_function() {
+        let service = TestGenerationService::new();
+        let source = r#"
+def calculate_sum(a, b):
+    return a + b
+"#;
+        let functions = service.extract_python_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "calculate_sum");
+    }
+
+    #[test]
+    fn test_extract_python_async_function() {
+        let service = TestGenerationService::new();
+        let source = r#"
+async def fetch_data(url):
+    return await client.get(url)
+"#;
+        let functions = service.extract_python_functions(source).unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "fetch_data");
+        assert!(functions[0].is_async);
+    }
+
+    #[test]
+    fn test_generate_rust_happy_path_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "add".to_string(),
+            parameters: vec![],
+            return_type: Some("i32".to_string()),
+            is_async: false,
+            line_number: 1,
+        };
+
+        let test_case = service
+            .generate_happy_path_test(&function, Language::Rust)
+            .unwrap();
+        assert_eq!(test_case.name, "test_add_happy_path");
+        assert_eq!(test_case.category, TestCategory::HappyPath);
+        assert!(test_case.code.contains("#[test]"));
+        assert!(test_case.code.contains("fn test_add_happy_path()"));
+    }
+
+    #[test]
+    fn test_generate_typescript_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "calculateSum".to_string(),
+            parameters: vec![],
+            return_type: None,
+            is_async: false,
+            line_number: 1,
+        };
+
+        let test_case = service
+            .generate_happy_path_test(&function, Language::TypeScript)
+            .unwrap();
+        assert!(test_case.code.contains("test('test_calculateSum_happy_path'"));
+        assert!(test_case.code.contains("expect(result).toBeDefined()"));
+    }
+
+    #[test]
+    fn test_generate_python_test() {
+        let service = TestGenerationService::new();
+        let function = FunctionSignature {
+            name: "calculate_sum".to_string(),
+            parameters: vec![],
+            return_type: None,
+            is_async: false,
+            line_number: 1,
+        };
+
+        let test_case = service
+            .generate_happy_path_test(&function, Language::Python)
+            .unwrap();
+        assert!(test_case.code.contains("def test_calculate_sum_happy_path()"));
+        assert!(test_case.code.contains("assert result is not None"));
+    }
+
+    #[test]
+    fn test_determine_test_location_rust() {
+        let service = TestGenerationService::new();
+        let source_file = Path::new("/project/src/lib.rs");
+        let test_location = service
+            .determine_test_location(source_file, Language::Rust)
+            .unwrap();
+        // Rust tests typically in same file
+        assert_eq!(test_location, source_file);
+    }
+
+    #[test]
+    fn test_determine_test_location_typescript() {
+        let service = TestGenerationService::new();
+        let source_file = Path::new("/project/src/index.ts");
+        let test_location = service
+            .determine_test_location(source_file, Language::TypeScript)
+            .unwrap();
+        assert_eq!(
+            test_location,
+            Path::new("/project/src/__tests__/index.test.ts")
+        );
+    }
+
+    #[test]
+    fn test_determine_test_location_python() {
+        let service = TestGenerationService::new();
+        let source_file = Path::new("/project/src/main.py");
+        let test_location = service
+            .determine_test_location(source_file, Language::Python)
+            .unwrap();
+        assert_eq!(
+            test_location,
+            Path::new("/project/src/tests/main_test.py")
+        );
+    }
+
+    #[test]
+    fn test_format_rust_test_module() {
+        let service = TestGenerationService::new();
+        let test_cases = vec![TestCase {
+            name: "test_add".to_string(),
+            category: TestCategory::HappyPath,
+            code: "#[test]\nfn test_add() {\n    assert_eq!(1 + 1, 2);\n}".to_string(),
+        }];
+
+        let output = service.format_rust_test_module(&test_cases).unwrap();
+        assert!(output.contains("#[cfg(test)]"));
+        assert!(output.contains("mod tests {"));
+        assert!(output.contains("use super::*;"));
+    }
+
+    #[test]
+    fn test_format_typescript_test_file() {
+        let service = TestGenerationService::new();
+        let test_cases = vec![TestCase {
+            name: "test_add".to_string(),
+            category: TestCategory::HappyPath,
+            code: "test('adds numbers', () => { expect(1 + 1).toBe(2); });".to_string(),
+        }];
+
+        let output = service.format_typescript_test_file(&test_cases).unwrap();
+        assert!(output.contains("import { describe, test, expect } from 'vitest';"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_tests_for_rust_file() {
+        let service = TestGenerationService::new();
+
+        // Create a temporary file
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("test.rs");
+
+        tokio::fs::write(
+            &test_file,
+            r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub fn subtract(a: i32, b: i32) -> i32 {
+    a - b
+}
+"#,
         )
-        .with_function("add_numbers")
-        .with_code("#[test]\nfn test_add_numbers() { assert_eq!(add(2, 3), 5); }");
+        .await
+        .unwrap();
 
-        assert_eq!(test.name, "test_add_numbers");
-        assert_eq!(test.test_type, TestType::Unit);
-        assert_eq!(test.target_function, Some("add_numbers".to_string()));
-        assert!(test.test_code.contains("assert_eq!"));
-    }
+        let result = service.generate_tests(&test_file).await.unwrap();
 
-    #[test]
-    fn test_coverage_report() {
-        let mut report = CoverageReport::new("my-project");
-        report.target_percentage = 80.0;
+        assert_eq!(result.language, Language::Rust);
+        assert_eq!(result.functions.len(), 2);
+        assert_eq!(result.functions[0].name, "add");
+        assert_eq!(result.functions[1].name, "subtract");
 
-        let mut module = ModuleCoverage::new("core", "src/core");
-        module.add_file(FileCoverage::new("src/core/lib.rs", 100, 75));
-        module.add_file(FileCoverage::new("src/core/utils.rs", 50, 40));
-        report.add_module(module);
-
-        assert_eq!(report.modules.len(), 1);
-        assert!((report.overall_percentage - 76.67).abs() < 0.1);
-        assert!(!report.meets_target());
-
-        let summary = report.to_summary();
-        assert!(summary.contains("76."));  // Could be 76.6% or 76.7%
-        assert!(summary.contains("my-project"));
-    }
-
-    #[test]
-    fn test_test_run() {
-        let mut run = TestRun::new("run-001");
-
-        run.add_result(TestResult {
-            name: "test_pass".to_string(),
-            status: TestResultStatus::Passed,
-            duration_ms: Some(10),
-            error_message: None,
-            stack_trace: None,
-        });
-
-        run.add_result(TestResult {
-            name: "test_fail".to_string(),
-            status: TestResultStatus::Failed,
-            duration_ms: Some(20),
-            error_message: Some("assertion failed".to_string()),
-            stack_trace: None,
-        });
-
-        assert_eq!(run.total_tests, 2);
-        assert_eq!(run.passed, 1);
-        assert_eq!(run.failed, 1);
-        assert!(!run.all_passed());
-
-        run.complete(TestRunStatus::Failed);
-        assert_eq!(run.status, TestRunStatus::Failed);
-        assert!(run.completed_at.is_some());
-    }
-
-    #[test]
-    fn test_quality_report() {
-        let mut report = TestQualityReport::new();
-        report.total_tests = 10;
-        report.mutation_score = Some(75.0);
-
-        report.add_issue(TestQualityIssue {
-            test_name: "test_weak".to_string(),
-            issue_type: TestQualityIssueType::WeakAssertion,
-            description: "Uses assertTrue instead of assertEquals".to_string(),
-            severity: IssueSeverity::Medium,
-        });
-
-        assert!(!report.is_high_quality());
-        assert_eq!(report.issues.len(), 1);
-    }
-
-    #[test]
-    fn test_module_coverage() {
-        let mut module = ModuleCoverage::new("api", "src/api");
-
-        module.add_file(FileCoverage::new("src/api/routes.rs", 200, 180));
-        module.add_file(FileCoverage::new("src/api/handlers.rs", 100, 50));
-
-        assert_eq!(module.total_lines, 300);
-        assert_eq!(module.covered_lines, 230);
-        assert!((module.coverage_percentage - 76.67).abs() < 0.1);
+        // Each function should have 3 test cases (happy path, edge case, error)
+        assert_eq!(result.test_cases.len(), 6);
     }
 }
