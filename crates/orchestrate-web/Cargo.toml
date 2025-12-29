@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 orchestrate-core.workspace = true
+orchestrate-github.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower = { workspace = true, features = ["util"] }
@@ -20,7 +21,14 @@ uuid.workspace = true
 futures.workspace = true
 chrono.workspace = true
 secrecy = "0.8"
+hmac = "0.12"
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"
 http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
+hmac = "0.12"
+sha2.workspace = true
+hex.workspace = true

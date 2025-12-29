@@ -1,0 +1,60 @@
+# Orchestrate Webhook Configuration Example
+#
+# This file demonstrates how to configure webhook event handling and filtering.
+# Copy this file to config.yaml and customize for your needs.
+
+webhooks:
+  # Webhook secret for signature verification
+  # Use environment variables for secrets: ${GITHUB_WEBHOOK_SECRET}
+  secret: ${GITHUB_WEBHOOK_SECRET}
+
+  # Event-specific configurations
+  # Each event can have:
+  #   - agent: The agent type to spawn (informational, handlers determine actual type)
+  #   - filter: Rules to filter which events should be processed
+  events:
+    # PR opened events
+    pull_request.opened:
+      agent: pr_shepherd
+      filter:
+        # Only handle PRs targeting these branches
+        base_branch: [main, develop]
+        # Skip PRs from forks (security measure)
+        skip_forks: true
+
+    # PR review events
+    pull_request_review.submitted:
+      agent: issue_fixer
+      filter:
+        # Only handle reviews for specific branches
+        base_branch: [main, develop]
+
+    # CI check run events
+    check_run.completed:
+      agent: issue_fixer
+      filter:
+        # Only handle failures and timeouts
+        conclusion: [failure, timed_out]
+
+    # CI check suite events
+    check_suite.completed:
+      agent: issue_fixer
+      filter:
+        conclusion: [failure, timed_out]
+
+    # Push to main branch
+    push:
+      agent: regression_tester
+      # Note: Push events are filtered by the handler to only process main/master
+      # Additional path filtering could be added here
+
+    # Issue opened events
+    issues.opened:
+      agent: issue_triager
+      filter:
+        # Only handle issues with specific labels
+        labels: [bug, enhancement, security]
+        # Only handle issues from specific authors
+        # author: [team-member-1, team-member-2]
+        # Only handle issues affecting specific paths
+        # paths: [src/, lib/]

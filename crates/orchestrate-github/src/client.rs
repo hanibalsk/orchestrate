@@ -287,6 +287,22 @@ impl GitHubClient {
 
         Ok(())
     }
+
+    /// Post a comment on a PR
+    pub fn post_comment(&self, number: i32, body: &str) -> Result<()> {
+        let output = Command::new("gh")
+            .args(["pr", "comment", &number.to_string(), "--body", body])
+            .output()?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to post comment: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]

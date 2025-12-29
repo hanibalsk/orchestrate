@@ -10,6 +10,7 @@ use crate::instruction::{
     LearningPattern, PatternStatus, PatternType,
 };
 use crate::network::{AgentId, StepOutput, StepOutputType};
+use crate::webhook::{WebhookEvent, WebhookEventStatus};
 use crate::{
     Agent, AgentState, AgentType, Epic, EpicStatus, MergeStrategy, Message, MessageRole, PrStatus,
     PullRequest, Result, Story, StoryStatus,
@@ -38,6 +39,9 @@ impl Default for DatabaseConfig {
 /// Database connection and operations
 #[derive(Clone)]
 pub struct Database {
+    #[cfg(test)]
+    pub(crate) pool: SqlitePool,
+    #[cfg(not(test))]
     pool: SqlitePool,
 }
 
@@ -112,6 +116,10 @@ impl Database {
         let _ = sqlx::query(include_str!("../../../migrations/005_token_tracking.sql"))
             .execute(&self.pool)
             .await;
+        // Webhook events migration
+        sqlx::query(include_str!("../../../migrations/006_webhook_events.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1744,6 +1752,205 @@ impl Database {
 
         Ok(row.into())
     }
+
+    // ==================== Webhook Event Operations ====================
+
+    /// Insert a new webhook event (idempotent by delivery_id)
+    #[tracing::instrument(skip(self, event), level = "debug", fields(delivery_id = %event.delivery_id))]
+    pub async fn insert_webhook_event(&self, event: &WebhookEvent) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO webhook_events (
+                delivery_id, event_type, payload, status, retry_count, max_retries,
+                error_message, next_retry_at, received_at, processed_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(delivery_id) DO NOTHING
+            "#,
+        )
+        .bind(&event.delivery_id)
+        .bind(&event.event_type)
+        .bind(&event.payload)
+        .bind(event.status.as_str())
+        .bind(event.retry_count)
+        .bind(event.max_retries)
+        .bind(&event.error_message)
+        .bind(event.next_retry_at.map(|dt| dt.to_rfc3339()))
+        .bind(event.received_at.to_rfc3339())
+        .bind(event.processed_at.map(|dt| dt.to_rfc3339()))
+        .bind(event.created_at.to_rfc3339())
+        .bind(event.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        // If insert was ignored due to conflict, fetch the existing ID
+        if result.rows_affected() == 0 {
+            let id = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM webhook_events WHERE delivery_id = ?",
+            )
+            .bind(&event.delivery_id)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(id)
+        } else {
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    /// Get webhook event by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_webhook_event(&self, id: i64) -> Result<Option<WebhookEvent>> {
+        let row = sqlx::query_as::<_, WebhookEventRow>(
+            "SELECT * FROM webhook_events WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get webhook event by delivery ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_webhook_event_by_delivery_id(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<WebhookEvent>> {
+        let row = sqlx::query_as::<_, WebhookEventRow>(
+            "SELECT * FROM webhook_events WHERE delivery_id = ?",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get pending webhook events ready for processing
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_pending_webhook_events(&self, limit: i64) -> Result<Vec<WebhookEvent>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = sqlx::query_as::<_, WebhookEventRow>(
+            r#"
+            SELECT * FROM webhook_events
+            WHERE status = 'pending'
+            AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY received_at ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(&now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update webhook event status and metadata
+    #[tracing::instrument(skip(self, event), level = "debug", fields(id = event.id))]
+    pub async fn update_webhook_event(&self, event: &WebhookEvent) -> Result<()> {
+        let id = event.id.ok_or_else(|| {
+            crate::Error::Other("Cannot update webhook event without ID".to_string())
+        })?;
+
+        sqlx::query(
+            r#"
+            UPDATE webhook_events SET
+                status = ?,
+                retry_count = ?,
+                error_message = ?,
+                next_retry_at = ?,
+                processed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(event.status.as_str())
+        .bind(event.retry_count)
+        .bind(&event.error_message)
+        .bind(event.next_retry_at.map(|dt| dt.to_rfc3339()))
+        .bind(event.processed_at.map(|dt| dt.to_rfc3339()))
+        .bind(event.updated_at.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get webhook events by status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_webhook_events_by_status(
+        &self,
+        status: WebhookEventStatus,
+        limit: i64,
+    ) -> Result<Vec<WebhookEvent>> {
+        let rows = sqlx::query_as::<_, WebhookEventRow>(
+            r#"
+            SELECT * FROM webhook_events
+            WHERE status = ?
+            ORDER BY received_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Count webhook events by status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn count_webhook_events_by_status(
+        &self,
+        status: WebhookEventStatus,
+    ) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = ?",
+        )
+        .bind(status.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
+
+    /// Delete old completed webhook events (for cleanup)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_old_webhook_events(&self, days: i64) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM webhook_events
+            WHERE status IN ('completed', 'dead_letter')
+            AND received_at < datetime('now', '-' || ? || ' days')
+            "#,
+        )
+        .bind(days)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Get recent webhook events (all statuses)
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_recent_webhook_events(&self, limit: i64) -> Result<Vec<WebhookEvent>> {
+        let rows = sqlx::query_as::<_, WebhookEventRow>(
+            r#"
+            SELECT * FROM webhook_events
+            ORDER BY received_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
 }
 
 /// Token usage statistics
@@ -2382,6 +2589,63 @@ impl TryFrom<PatternRow> for LearningPattern {
                 .into(),
             instruction_id: row.instruction_id,
             status: PatternStatus::from_str(&row.status)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct WebhookEventRow {
+    id: i64,
+    delivery_id: String,
+    event_type: String,
+    payload: String,
+    status: String,
+    retry_count: i32,
+    max_retries: i32,
+    error_message: Option<String>,
+    next_retry_at: Option<String>,
+    received_at: String,
+    processed_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<WebhookEventRow> for WebhookEvent {
+    type Error = crate::Error;
+
+    fn try_from(row: WebhookEventRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(WebhookEvent {
+            id: Some(row.id),
+            delivery_id: row.delivery_id,
+            event_type: row.event_type,
+            payload: row.payload,
+            status: WebhookEventStatus::from_str(&row.status)?,
+            retry_count: row.retry_count,
+            max_retries: row.max_retries,
+            error_message: row.error_message,
+            next_retry_at: row
+                .next_retry_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            received_at: chrono::DateTime::parse_from_rfc3339(&row.received_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            processed_at: row
+                .processed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
         })
     }
 }

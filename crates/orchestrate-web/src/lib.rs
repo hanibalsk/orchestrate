@@ -5,10 +5,16 @@
 //! - WebSocket for real-time updates
 //! - HTML UI for agent management
 //! - Chat interface
+//! - GitHub webhook receiver
 
 pub mod api;
+pub mod event_handlers;
 pub mod ui;
+pub mod webhook;
+pub mod webhook_processor;
 pub mod websocket;
 
-pub use api::create_router;
+pub use api::{create_router, create_router_with_webhook};
 pub use ui::create_ui_router;
+pub use webhook::{WebhookConfig, WebhookState, github_webhook_handler};
+pub use webhook_processor::{WebhookProcessor, WebhookProcessorConfig};
