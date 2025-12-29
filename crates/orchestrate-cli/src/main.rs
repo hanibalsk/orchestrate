@@ -878,6 +878,64 @@ enum EnvAction {
 
 #[derive(Subcommand)]
 enum DeployAction {
+    /// Deploy a version to an environment
+    #[command(name = "deploy", visible_alias = "run")]
+    Deploy {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Version to deploy
+        #[arg(long)]
+        version: String,
+        /// Deployment strategy (rolling, blue-green, canary, recreate)
+        #[arg(long)]
+        strategy: Option<String>,
+        /// Deployment provider (override environment default)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Timeout in seconds
+        #[arg(long)]
+        timeout: Option<u32>,
+        /// Skip pre-deployment validation
+        #[arg(long)]
+        skip_validation: bool,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Show current deployment status for an environment
+    Status {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Show deployment history for an environment
+    History {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Maximum number of deployments to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Show differences between current and target deployment
+    Diff {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Target version to compare against
+        #[arg(long)]
+        version: String,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Validate environment is ready for deployment
     Validate {
         /// Environment name (e.g., staging, production)
@@ -938,6 +996,39 @@ enum ReleaseAction {
         /// Push tag to remote
         #[arg(long)]
         push: bool,
+    },
+    /// Publish a release (create GitHub release, upload assets)
+    Publish {
+        /// Version to publish (e.g., 1.2.3)
+        #[arg(long)]
+        version: String,
+        /// Path to repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        repo_path: PathBuf,
+        /// GitHub token (or use GITHUB_TOKEN env var)
+        #[arg(long, env = "GITHUB_TOKEN")]
+        token: Option<String>,
+        /// Make release a pre-release
+        #[arg(long)]
+        prerelease: bool,
+        /// Make release a draft
+        #[arg(long)]
+        draft: bool,
+    },
+    /// Generate release notes between two tags
+    Notes {
+        /// Starting tag (e.g., v1.0.0)
+        #[arg(short, long)]
+        from: String,
+        /// Ending tag (e.g., v1.1.0, or HEAD for unreleased)
+        #[arg(short, long)]
+        to: String,
+        /// Path to repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        repo_path: PathBuf,
+        /// Output format (markdown, json)
+        #[arg(long, default_value = "markdown")]
+        format: String,
     },
 }
 
@@ -2682,6 +2773,36 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Deploy { action } => match action {
+            DeployAction::Deploy {
+                env,
+                version,
+                strategy,
+                provider,
+                timeout,
+                skip_validation,
+                format,
+            } => {
+                handle_deploy_deploy(
+                    &db,
+                    &env,
+                    &version,
+                    strategy.as_deref(),
+                    provider.as_deref(),
+                    timeout,
+                    skip_validation,
+                    &format,
+                )
+                .await?;
+            }
+            DeployAction::Status { env, format } => {
+                handle_deploy_status(&db, &env, &format).await?;
+            }
+            DeployAction::History { env, limit, format } => {
+                handle_deploy_history(&db, &env, limit, &format).await?;
+            }
+            DeployAction::Diff { env, version, format } => {
+                handle_deploy_diff(&db, &env, &version, &format).await?;
+            }
             DeployAction::Validate {
                 env,
                 version,
@@ -2723,6 +2844,23 @@ async fn main() -> Result<()> {
                 push,
             } => {
                 handle_release_create(&db, &version, message.as_deref(), push).await?;
+            }
+            ReleaseAction::Publish {
+                version,
+                repo_path,
+                token,
+                prerelease,
+                draft,
+            } => {
+                handle_release_publish(&db, &version, &repo_path, token.as_deref(), prerelease, draft).await?;
+            }
+            ReleaseAction::Notes {
+                from,
+                to,
+                repo_path,
+                format,
+            } => {
+                handle_release_notes(&db, &from, &to, &repo_path, &format).await?;
             }
         },
     }
@@ -4863,6 +5001,289 @@ async fn handle_deploy_rollback(
     Ok(())
 }
 
+async fn handle_deploy_deploy(
+    db: &Database,
+    env: &str,
+    version: &str,
+    strategy: Option<&str>,
+    provider: Option<&str>,
+    timeout: Option<u32>,
+    skip_validation: bool,
+    format: &str,
+) -> Result<()> {
+    use orchestrate_core::{BatchSize, BlueGreenEnvironment, DeploymentExecutor, DeploymentProvider, DeploymentRequest, DeploymentStrategy};
+
+    println!("Deploying version {} to environment '{}'...", version, env);
+    println!();
+
+    // Parse strategy if provided
+    let deployment_strategy = if let Some(strat) = strategy {
+        match strat.to_lowercase().as_str() {
+            "rolling" => Some(DeploymentStrategy::rolling(BatchSize::Count(5), 30)), // Default batch size 5, 30s delay
+            "blue-green" | "bluegreen" => Some(DeploymentStrategy::blue_green(BlueGreenEnvironment::Blue)), // Start with blue
+            "canary" => Some(DeploymentStrategy::canary(vec![10, 50, 100])), // Default traffic steps
+            "recreate" => Some(DeploymentStrategy::recreate()),
+            _ => return Err(anyhow::anyhow!("Invalid deployment strategy: {}. Valid options: rolling, blue-green, canary, recreate", strat)),
+        }
+    } else {
+        None
+    };
+
+    // Parse provider if provided
+    let deployment_provider = if let Some(prov) = provider {
+        let provider_type = match prov.to_lowercase().as_str() {
+            "docker" => DeploymentProvider::Docker,
+            "aws-ecs" => DeploymentProvider::AwsEcs,
+            "aws-lambda" => DeploymentProvider::AwsLambda,
+            "kubernetes" | "k8s" => DeploymentProvider::Kubernetes,
+            "vercel" => DeploymentProvider::Vercel,
+            "netlify" => DeploymentProvider::Netlify,
+            "railway" => DeploymentProvider::Railway,
+            _ => return Err(anyhow::anyhow!("Invalid deployment provider: {}. Valid options: docker, aws-ecs, aws-lambda, kubernetes, vercel, netlify, railway", prov)),
+        };
+        Some(provider_type)
+    } else {
+        None
+    };
+
+    let executor = DeploymentExecutor::new(Arc::new(db.clone()));
+    let request = DeploymentRequest {
+        environment: env.to_string(),
+        version: version.to_string(),
+        provider: deployment_provider,
+        strategy: deployment_strategy,
+        timeout_seconds: timeout,
+        skip_validation,
+    };
+
+    let deployment = executor.deploy(request).await?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&deployment)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment initiated successfully!");
+    println!();
+    println!("Deployment Details:");
+    println!("  ID: {}", deployment.id);
+    println!("  Environment: {}", deployment.environment_name);
+    println!("  Version: {}", deployment.version);
+    println!("  Provider: {}", deployment.provider);
+    println!("  Status: {}", deployment.status);
+    if let Some(strategy) = &deployment.strategy {
+        println!("  Strategy: {:?}", strategy);
+    }
+    println!(
+        "  Started At: {}",
+        deployment.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    use orchestrate_core::DeploymentStatus;
+    match deployment.status {
+        DeploymentStatus::Completed | DeploymentStatus::Failed | DeploymentStatus::RolledBack | DeploymentStatus::TimedOut => {
+            if let Some(completed_at) = deployment.completed_at {
+                println!(
+                    "  Completed At: {}",
+                    completed_at.format("%Y-%m-%d %H:%M:%S UTC")
+                );
+                if let Some(duration) = deployment.duration() {
+                    println!("  Duration: {}s", duration.num_seconds());
+                }
+            }
+        }
+        _ => {
+            println!();
+            println!("Deployment is in progress. Use 'orchestrate deploy status --env {}' to check status.", env);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_deploy_status(db: &Database, env: &str, format: &str) -> Result<()> {
+    // Get the current/latest deployment for this environment
+    let deployments = db.list_deployments(env, Some(1)).await?;
+
+    if deployments.is_empty() {
+        println!("No active deployment found for environment '{}'", env);
+        return Ok(());
+    }
+
+    let deployment = &deployments[0];
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&deployment)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment Status for '{}'", env);
+    println!();
+    println!("  ID: {}", deployment.id);
+    println!("  Version: {}", deployment.version);
+    println!("  Provider: {}", deployment.provider);
+    println!("  Status: {}", deployment.status);
+    if let Some(strategy) = &deployment.strategy {
+        println!("  Strategy: {:?}", strategy);
+    }
+    println!(
+        "  Started At: {}",
+        deployment.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    if let Some(completed_at) = deployment.completed_at {
+        println!(
+            "  Completed At: {}",
+            completed_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        if let Some(duration) = deployment.duration() {
+            println!("  Duration: {}s", duration.num_seconds());
+        }
+    }
+
+    use orchestrate_core::DeploymentStatus;
+    match deployment.status {
+        DeploymentStatus::Completed => {
+            println!();
+            println!("Deployment is healthy and running.");
+        }
+        DeploymentStatus::Pending | DeploymentStatus::Validating | DeploymentStatus::InProgress => {
+            println!();
+            println!("Deployment is in progress...");
+        }
+        DeploymentStatus::Failed | DeploymentStatus::RolledBack | DeploymentStatus::TimedOut => {
+            println!();
+            println!("Deployment has failed or been cancelled.");
+            if let Some(error) = &deployment.error_message {
+                println!("  Error: {}", error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_deploy_history(
+    db: &Database,
+    env: &str,
+    limit: usize,
+    format: &str,
+) -> Result<()> {
+    let deployments = db
+        .list_deployments(env, Some(limit as i64))
+        .await?;
+
+    if deployments.is_empty() {
+        println!("No deployment history found for environment '{}'", env);
+        return Ok(());
+    }
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&deployments)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment History for '{}' (showing {} most recent)", env, deployments.len());
+    println!();
+    println!("{:<6} {:<12} {:<20} {:<15} {:<20} {:<10}", "ID", "Version", "Started At", "Status", "Duration", "Provider");
+    println!("{}", "-".repeat(95));
+
+    for deployment in &deployments {
+        let started = deployment.started_at.format("%Y-%m-%d %H:%M:%S");
+        let duration = if let Some(dur) = deployment.duration() {
+            format!("{}s", dur.num_seconds())
+        } else {
+            "In progress".to_string()
+        };
+
+        println!(
+            "{:<6} {:<12} {:<20} {:<15} {:<20} {:<10}",
+            deployment.id,
+            deployment.version,
+            started,
+            format!("{}", deployment.status),
+            duration,
+            deployment.provider
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_deploy_diff(
+    db: &Database,
+    env: &str,
+    target_version: &str,
+    format: &str,
+) -> Result<()> {
+    // Get current deployment
+    let deployments = db.list_deployments(env, Some(1)).await?;
+
+    if format == "json" {
+        let diff = if let Some(current) = deployments.first() {
+            serde_json::json!({
+                "environment": env,
+                "current_version": current.version,
+                "target_version": target_version,
+                "current_deployment_id": current.id,
+                "is_new_deployment": false
+            })
+        } else {
+            serde_json::json!({
+                "environment": env,
+                "current_version": null,
+                "target_version": target_version,
+                "is_new_deployment": true
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment Diff for '{}'", env);
+    println!();
+
+    if let Some(current) = deployments.first() {
+        println!("Current Deployment:");
+        println!("  Version: {}", current.version);
+        println!("  Status: {}", current.status);
+        println!("  Provider: {}", current.provider);
+        if let Some(strategy) = &current.strategy {
+            println!("  Strategy: {:?}", strategy);
+        }
+        println!(
+            "  Deployed At: {}",
+            current.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        println!();
+        println!("Target Deployment:");
+        println!("  Version: {}", target_version);
+        println!();
+
+        if current.version == target_version {
+            println!("No changes - target version is already deployed.");
+        } else {
+            println!("Changes:");
+            println!("  Version: {} -> {}", current.version, target_version);
+            println!();
+            println!("This will deploy a new version to the environment.");
+        }
+    } else {
+        println!("No current deployment found.");
+        println!();
+        println!("Target Deployment:");
+        println!("  Version: {}", target_version);
+        println!();
+        println!("This will be a new deployment to the environment.");
+    }
+
+    Ok(())
+}
+
 // ==================== Release Management Handlers ====================
 
 async fn handle_release_prepare(
@@ -4998,6 +5419,243 @@ async fn handle_release_create(
     println!("To create a GitHub release, use the GitHub CLI:");
     println!("  gh release create v{} --title \"Release {}\" --notes-file CHANGELOG.md", version, version);
     println!();
+
+    Ok(())
+}
+
+async fn handle_release_publish(
+    _db: &Database,
+    version: &str,
+    repo_path: &PathBuf,
+    token: Option<&str>,
+    prerelease: bool,
+    draft: bool,
+) -> Result<()> {
+    use std::process::Command;
+
+    println!("Publishing release {}...", version);
+    println!();
+
+    // Check if gh CLI is available
+    let gh_check = Command::new("gh").arg("--version").output();
+    if gh_check.is_err() {
+        return Err(anyhow::anyhow!(
+            "GitHub CLI (gh) is not installed. Please install it from https://cli.github.com/"
+        ));
+    }
+
+    // Change to repo directory
+    std::env::set_current_dir(repo_path)?;
+
+    // Verify tag exists
+    let tag = format!("v{}", version);
+    let tag_check = Command::new("git")
+        .args(&["tag", "-l", &tag])
+        .output()?;
+
+    if tag_check.stdout.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Tag {} does not exist. Create it first with 'orchestrate release create'",
+            tag
+        ));
+    }
+
+    // Build gh release create command
+    let mut cmd = Command::new("gh");
+    cmd.args(&["release", "create", &tag]);
+    cmd.args(&["--title", &format!("Release {}", version)]);
+
+    // Check if CHANGELOG.md has an entry for this version
+    let changelog_path = repo_path.join("CHANGELOG.md");
+    if changelog_path.exists() {
+        cmd.args(&["--notes-file", "CHANGELOG.md"]);
+    } else {
+        cmd.args(&["--notes", &format!("Release version {}", version)]);
+    }
+
+    if prerelease {
+        cmd.arg("--prerelease");
+    }
+
+    if draft {
+        cmd.arg("--draft");
+    }
+
+    // Set GitHub token if provided
+    if let Some(t) = token {
+        cmd.env("GITHUB_TOKEN", t);
+    }
+
+    println!("Creating GitHub release...");
+    let output = cmd.output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Failed to create GitHub release: {}", stderr));
+    }
+
+    println!("✓ GitHub release created successfully!");
+    println!();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{}", stdout);
+
+    Ok(())
+}
+
+async fn handle_release_notes(
+    _db: &Database,
+    from_tag: &str,
+    to_tag: &str,
+    repo_path: &PathBuf,
+    format: &str,
+) -> Result<()> {
+    use orchestrate_core::{ReleaseManager, Version};
+    use std::process::Command;
+
+    println!("Generating release notes from {} to {}...", from_tag, to_tag);
+    println!();
+
+    // Change to repo directory
+    std::env::set_current_dir(repo_path)?;
+
+    // Get commits between tags
+    let git_output = Command::new("git")
+        .args(&[
+            "log",
+            &format!("{}..{}", from_tag, to_tag),
+            "--pretty=format:%H|%s|%b",
+            "--no-merges",
+        ])
+        .output()?;
+
+    if !git_output.status.success() {
+        return Err(anyhow::anyhow!("Failed to get git log"));
+    }
+
+    let log_output = String::from_utf8_lossy(&git_output.stdout);
+    let commits: Vec<_> = log_output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let parts: Vec<&str> = line.splitn(3, '|').collect();
+            let hash = parts.get(0).unwrap_or(&"").to_string();
+            let subject = parts.get(1).unwrap_or(&"").to_string();
+            let body = parts.get(2).unwrap_or(&"").to_string();
+
+            // Combine subject and body for the message
+            let message = if body.is_empty() {
+                subject
+            } else {
+                format!("{}\n\n{}", subject, body)
+            };
+
+            orchestrate_core::Commit {
+                hash: hash.clone(),
+                message,
+                author: "Unknown".to_string(),
+                date: chrono::Utc::now(), // We could parse this from git too
+            }
+        })
+        .collect();
+
+    if commits.is_empty() {
+        println!("No commits found between {} and {}", from_tag, to_tag);
+        return Ok(());
+    }
+
+    // Parse version if to_tag looks like a version
+    let to_version = if to_tag.starts_with('v') {
+        Version::parse(&to_tag[1..]).ok()
+    } else {
+        Version::parse(to_tag).ok()
+    };
+
+    // Create release manager
+    let manager = ReleaseManager::new(_db.clone());
+
+    // Generate changelog - we need a version for this
+    let version = to_version.unwrap_or_else(|| Version::parse("0.0.0").unwrap());
+    let changelog = manager.generate_changelog(&commits, &version);
+
+    if format == "json" {
+        // Convert changelog to JSON manually since it doesn't implement Serialize
+        let json = serde_json::json!({
+            "version": version.to_string(),
+            "entries": changelog.entries.iter().map(|entry| {
+                serde_json::json!({
+                    "type": format!("{:?}", entry.commit_type),
+                    "description": entry.description,
+                    "pr_number": entry.pr_number,
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        return Ok(());
+    }
+
+    // Markdown format
+    println!("{}", "=".repeat(60));
+    println!("Release Notes: {} → {}", from_tag, to_tag);
+    println!("{}", "=".repeat(60));
+    println!();
+
+    println!("## [{}]", version);
+    println!();
+
+    let mut has_added = false;
+    let mut has_changed = false;
+    let mut has_fixed = false;
+    let mut has_other = false;
+
+    for entry in &changelog.entries {
+        match entry.commit_type {
+            orchestrate_core::CommitType::Feature => {
+                if !has_added {
+                    println!("### Added");
+                    println!();
+                    has_added = true;
+                }
+                println!("- {}", entry.description);
+            }
+            orchestrate_core::CommitType::Fix => {
+                if !has_fixed {
+                    if has_added {
+                        println!();
+                    }
+                    println!("### Fixed");
+                    println!();
+                    has_fixed = true;
+                }
+                println!("- {}", entry.description);
+            }
+            orchestrate_core::CommitType::Change => {
+                if !has_changed {
+                    if has_added || has_fixed {
+                        println!();
+                    }
+                    println!("### Changed");
+                    println!();
+                    has_changed = true;
+                }
+                println!("- {}", entry.description);
+            }
+            _ => {
+                if !has_other {
+                    if has_added || has_fixed || has_changed {
+                        println!();
+                    }
+                    println!("### Other Changes");
+                    println!();
+                    has_other = true;
+                }
+                println!("- {}", entry.description);
+            }
+        }
+    }
+
+    println!();
+    println!("Total commits: {}", commits.len());
 
     Ok(())
 }
