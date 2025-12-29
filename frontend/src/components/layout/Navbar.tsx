@@ -7,7 +7,10 @@ export function Navbar() {
   const navLinks = [
     { to: '/', label: 'Dashboard' },
     { to: '/agents', label: 'Agents' },
-    { to: '/tests', label: 'Tests' },
+    { to: '/pipelines', label: 'Pipelines' },
+    { to: '/schedules', label: 'Schedules' },
+    { to: '/deployments', label: 'Deployments' },
+    { to: '/releases', label: 'Releases' },
   ];
 
   return (

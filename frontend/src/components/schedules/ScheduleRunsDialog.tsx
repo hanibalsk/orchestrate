@@ -110,7 +110,7 @@ export function ScheduleRunsDialog({
                       {formatDateTime(run.started_at)}
                     </td>
                     <td className="py-3 px-4 text-sm">
-                      {calculateDuration(run.started_at, run.completed_at)}
+                      {run.started_at ? calculateDuration(run.started_at, run.completed_at) : '-'}
                     </td>
                     <td className="py-3 px-4">
                       <ScheduleRunStatusBadge status={run.status} />
