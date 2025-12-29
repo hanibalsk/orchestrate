@@ -22,6 +22,7 @@ pub mod pr;
 pub mod session;
 pub mod shell_state;
 pub mod test_generation;
+pub mod test_quality;
 pub mod webhook;
 pub mod webhook_config;
 pub mod worktree;
@@ -69,4 +70,10 @@ pub use test_generation::{
 // Re-export coverage types
 pub use coverage::{
     CoverageFormat, CoverageReport, CoverageService, FileCoverage, ModuleCoverage,
+};
+
+// Re-export test quality types
+pub use test_quality::{
+    MutationDetail, MutationTestResult, MutationType, TestIssueType, TestQualityIssue,
+    TestQualityReport, TestQualityService,
 };

@@ -581,6 +581,24 @@ enum TestAction {
         #[arg(long, default_value = "10")]
         limit: i64,
     },
+    /// Validate test quality
+    Validate {
+        /// Test file to validate
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Run mutation testing
+        #[arg(long)]
+        mutation: bool,
+        /// Source file for mutation testing
+        #[arg(long, requires = "mutation")]
+        source: Option<PathBuf>,
+        /// Store report in database
+        #[arg(long)]
+        store: bool,
+        /// Output format (text, json)
+        #[arg(short, long, default_value = "text")]
+        output: String,
+    },
 }
 
 #[tokio::main]
@@ -1868,6 +1886,16 @@ async fn main() -> Result<()> {
                     limit,
                 )
                 .await?;
+            }
+            TestAction::Validate {
+                file,
+                mutation,
+                source,
+                store,
+                output,
+            } => {
+                handle_test_validate(&db, &file, mutation, source.as_deref(), store, &output)
+                    .await?;
             }
         },
     }
@@ -3472,4 +3500,185 @@ async fn handle_test_coverage(
     }
 
     Ok(())
+}
+
+async fn handle_test_validate(
+    db: &Database,
+    file: &std::path::Path,
+    run_mutation: bool,
+    source_file: Option<&std::path::Path>,
+    store_report: bool,
+    output_format: &str,
+) -> Result<()> {
+    use orchestrate_core::TestQualityService;
+
+    let service = TestQualityService::new(db.clone());
+
+    println!("🔍 Validating test file: {}", file.display());
+    println!();
+
+    // Validate test file
+    let mut report = service.validate_test_file(file).await?;
+
+    // Run mutation testing if requested
+    if run_mutation {
+        if let Some(source) = source_file {
+            println!("🧬 Running mutation testing...");
+            match service.run_mutation_testing(file, source).await {
+                Ok(mutation_result) => {
+                    report.set_mutation_result(mutation_result);
+                    println!("✅ Mutation testing complete");
+                }
+                Err(e) => {
+                    warn!("Mutation testing failed: {}", e);
+                    println!("⚠️  Mutation testing failed: {}", e);
+                }
+            }
+        } else {
+            println!("⚠️  Mutation testing requires --source <file>");
+        }
+    }
+
+    // Store report if requested
+    if store_report {
+        let report_id = service.store_quality_report(&report).await?;
+        println!("💾 Stored quality report with ID: {}", report_id);
+    }
+
+    // Output report
+    match output_format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        "text" | _ => {
+            print_quality_report(&report);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_quality_report(report: &orchestrate_core::TestQualityReport) {
+    use orchestrate_core::TestIssueType;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║              Test Quality Validation Report                  ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  File: {}", report.file_path);
+    println!();
+
+    // Quality score with visual indicator
+    let score_indicator = if report.quality_score >= 90.0 {
+        "✅"
+    } else if report.quality_score >= 70.0 {
+        "⚠️"
+    } else {
+        "❌"
+    };
+    println!("  Quality Score: {:.1}% {}", report.quality_score, score_indicator);
+    println!();
+
+    // Issues by category
+    if !report.issues.is_empty() {
+        println!("  Issues Found: {}", report.issues.len());
+        println!();
+
+        // Group issues by type
+        let mut weak_assertions = Vec::new();
+        let mut always_passes = Vec::new();
+        let mut implementation_focused = Vec::new();
+        let mut mutation_survived = Vec::new();
+        let mut improper_setup = Vec::new();
+
+        for issue in &report.issues {
+            match issue.issue_type {
+                TestIssueType::WeakAssertion => weak_assertions.push(issue),
+                TestIssueType::AlwaysPasses => always_passes.push(issue),
+                TestIssueType::ImplementationFocused => implementation_focused.push(issue),
+                TestIssueType::MutationSurvived => mutation_survived.push(issue),
+                TestIssueType::ImproperSetup => improper_setup.push(issue),
+            }
+        }
+
+        if !weak_assertions.is_empty() {
+            println!("  ❌ Weak Assertions ({}):", weak_assertions.len());
+            for issue in weak_assertions {
+                print_issue(issue);
+            }
+            println!();
+        }
+
+        if !always_passes.is_empty() {
+            println!("  ❌ Always Passes ({}):", always_passes.len());
+            for issue in always_passes {
+                print_issue(issue);
+            }
+            println!();
+        }
+
+        if !implementation_focused.is_empty() {
+            println!("  ⚠️  Implementation-Focused ({}):", implementation_focused.len());
+            for issue in implementation_focused {
+                print_issue(issue);
+            }
+            println!();
+        }
+
+        if !mutation_survived.is_empty() {
+            println!("  ❌ Mutations Survived ({}):", mutation_survived.len());
+            for issue in mutation_survived {
+                print_issue(issue);
+            }
+            println!();
+        }
+
+        if !improper_setup.is_empty() {
+            println!("  ⚠️  Improper Setup ({}):", improper_setup.len());
+            for issue in improper_setup {
+                print_issue(issue);
+            }
+            println!();
+        }
+    } else {
+        println!("  ✅ No issues found");
+        println!();
+    }
+
+    // Mutation testing results
+    if let Some(ref mutation) = report.mutation_result {
+        println!("  Mutation Testing:");
+        println!("    Total mutations:     {}", mutation.total_mutations);
+        println!("    Mutations caught:    {} ✅", mutation.mutations_caught);
+        println!("    Mutations survived:  {} ❌", mutation.mutations_survived);
+        println!("    Mutation score:      {:.1}%", mutation.mutation_score);
+        println!();
+
+        if !mutation.survived_mutations.is_empty() {
+            println!("  Survived Mutations:");
+            for (i, detail) in mutation.survived_mutations.iter().enumerate().take(5) {
+                println!("    {}. {}:{}", i + 1, detail.file_path, detail.line_number);
+                println!("       Original: {}", detail.original);
+                println!("       Mutated:  {}", detail.mutated);
+            }
+            if mutation.survived_mutations.len() > 5 {
+                println!("    ... and {} more", mutation.survived_mutations.len() - 5);
+            }
+            println!();
+        }
+    }
+
+    println!("╚══════════════════════════════════════════════════════════════╝");
+}
+
+fn print_issue(issue: &orchestrate_core::TestQualityIssue) {
+    if let Some(line) = issue.line_number {
+        println!("     • {} (line {})", issue.test_name, line);
+    } else {
+        println!("     • {}", issue.test_name);
+    }
+    println!("       {}", issue.description);
+    if let Some(ref suggestion) = issue.suggestion {
+        println!("       💡 {}", suggestion);
+    }
 }

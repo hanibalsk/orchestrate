@@ -124,6 +124,10 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/007_test_coverage.sql"))
             .execute(&self.pool)
             .await?;
+        // Test quality migration
+        sqlx::query(include_str!("../../../migrations/008_test_quality.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
