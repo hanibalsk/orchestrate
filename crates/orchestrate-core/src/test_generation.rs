@@ -104,6 +104,10 @@ pub enum TestType {
     Unit,
     /// Integration tests for cross-module interactions
     Integration,
+    /// End-to-end tests from user stories
+    E2e,
+    /// Property-based tests
+    Property,
 }
 
 /// Represents a module boundary in the codebase
@@ -167,6 +171,48 @@ pub struct TestFixture {
     pub teardown_code: String,
     /// Whether this fixture needs async support
     pub is_async: bool,
+}
+
+/// Type of E2E test platform
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum E2ETestPlatform {
+    /// Playwright for web UI tests
+    Playwright,
+    /// Cypress for web UI tests
+    Cypress,
+    /// API tests using HTTP client
+    Api,
+    /// CLI tests
+    Cli,
+}
+
+/// Acceptance criterion from a story
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceCriterion {
+    /// Criterion description
+    pub description: String,
+    /// Whether this is checked/completed
+    pub checked: bool,
+}
+
+/// Result of E2E test generation from a story
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2ETestResult {
+    /// Story ID that was used
+    pub story_id: String,
+    /// Story title
+    pub story_title: String,
+    /// Acceptance criteria parsed from the story
+    pub acceptance_criteria: Vec<AcceptanceCriterion>,
+    /// Generated test cases
+    pub test_cases: Vec<TestCase>,
+    /// Test platform detected/used
+    pub platform: E2ETestPlatform,
+    /// Test file path
+    pub test_file_path: std::path::PathBuf,
+    /// Test fixtures/setup
+    pub fixtures: Vec<TestFixture>,
 }
 
 /// Result of test generation for a file
@@ -1462,6 +1508,470 @@ mod tests {
 
         Ok(output)
     }
+
+    /// Generate E2E tests from a story
+    pub async fn generate_e2e_tests_from_story(
+        &self,
+        story: &crate::Story,
+        platform: Option<E2ETestPlatform>,
+    ) -> Result<E2ETestResult> {
+        // Parse acceptance criteria from the story
+        let acceptance_criteria = self.parse_acceptance_criteria(story)?;
+
+        // Detect test platform from story content or use provided platform
+        let detected_platform = platform.unwrap_or_else(|| {
+            self.detect_e2e_platform(&story.title, &story.description.as_deref().unwrap_or(""))
+        });
+
+        // Generate test cases for each acceptance criterion
+        let test_cases = self.generate_e2e_test_cases(
+            &story.title,
+            &acceptance_criteria,
+            detected_platform,
+        )?;
+
+        // Generate test fixtures
+        let fixtures = self.generate_e2e_fixtures(detected_platform)?;
+
+        // Determine test file location
+        let test_file_path = self.determine_e2e_test_location(&story.id, detected_platform)?;
+
+        Ok(E2ETestResult {
+            story_id: story.id.clone(),
+            story_title: story.title.clone(),
+            acceptance_criteria,
+            test_cases,
+            platform: detected_platform,
+            test_file_path,
+            fixtures,
+        })
+    }
+
+    /// Parse acceptance criteria from story
+    fn parse_acceptance_criteria(&self, story: &crate::Story) -> Result<Vec<AcceptanceCriterion>> {
+        let mut criteria = Vec::new();
+
+        // If acceptance_criteria is in JSON format
+        if let Some(ac_value) = &story.acceptance_criteria {
+            if let Some(array) = ac_value.as_array() {
+                for item in array {
+                    if let Some(obj) = item.as_object() {
+                        let description = obj
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let checked = obj
+                            .get("checked")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        criteria.push(AcceptanceCriterion {
+                            description,
+                            checked,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Also parse from description if in markdown format
+        if let Some(desc) = &story.description {
+            for line in desc.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]") {
+                    let checked = trimmed.starts_with("- [x]");
+                    let description = if checked {
+                        trimmed[5..].trim().to_string()
+                    } else {
+                        trimmed[5..].trim().to_string()
+                    };
+                    if !description.is_empty() {
+                        criteria.push(AcceptanceCriterion {
+                            description,
+                            checked,
+                        });
+                    }
+                }
+            }
+        }
+
+        if criteria.is_empty() {
+            // Default criterion from title
+            criteria.push(AcceptanceCriterion {
+                description: story.title.clone(),
+                checked: false,
+            });
+        }
+
+        Ok(criteria)
+    }
+
+    /// Detect E2E test platform from story content
+    fn detect_e2e_platform(&self, title: &str, description: &str) -> E2ETestPlatform {
+        let content = format!("{} {}", title, description).to_lowercase();
+
+        if content.contains("web ui")
+            || content.contains("webpage")
+            || content.contains("browser")
+            || content.contains("click")
+            || content.contains("button")
+            || content.contains("login")
+        {
+            E2ETestPlatform::Playwright
+        } else if content.contains("api")
+            || content.contains("endpoint")
+            || content.contains("rest")
+            || content.contains("http")
+        {
+            E2ETestPlatform::Api
+        } else if content.contains("cli")
+            || content.contains("command")
+            || content.contains("orchestrate")
+        {
+            E2ETestPlatform::Cli
+        } else {
+            // Default to Playwright for web UI
+            E2ETestPlatform::Playwright
+        }
+    }
+
+    /// Generate E2E test cases from acceptance criteria
+    fn generate_e2e_test_cases(
+        &self,
+        story_title: &str,
+        criteria: &[AcceptanceCriterion],
+        platform: E2ETestPlatform,
+    ) -> Result<Vec<TestCase>> {
+        let mut test_cases = Vec::new();
+
+        for criterion in criteria {
+            let test_name = self.generate_test_name_from_criterion(&criterion.description);
+            let code = match platform {
+                E2ETestPlatform::Playwright => {
+                    self.generate_playwright_test(story_title, &criterion.description, &test_name)
+                }
+                E2ETestPlatform::Cypress => {
+                    self.generate_cypress_test(story_title, &criterion.description, &test_name)
+                }
+                E2ETestPlatform::Api => {
+                    self.generate_api_test(story_title, &criterion.description, &test_name)
+                }
+                E2ETestPlatform::Cli => {
+                    self.generate_cli_test(story_title, &criterion.description, &test_name)
+                }
+            };
+
+            test_cases.push(TestCase {
+                name: test_name,
+                category: TestCategory::HappyPath,
+                code,
+            });
+        }
+
+        Ok(test_cases)
+    }
+
+    /// Generate test name from acceptance criterion
+    fn generate_test_name_from_criterion(&self, criterion: &str) -> String {
+        // Convert criterion to snake_case test name
+        let cleaned = criterion
+            .to_lowercase()
+            .replace("can ", "")
+            .replace("should ", "")
+            .replace("must ", "")
+            .replace("will ", "");
+
+        let words: Vec<&str> = cleaned
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        format!("test_{}", words.join("_"))
+    }
+
+    /// Generate Playwright test code
+    fn generate_playwright_test(
+        &self,
+        _story_title: &str,
+        criterion: &str,
+        test_name: &str,
+    ) -> String {
+        format!(
+            r#"test('{}', async ({{ page }}) => {{
+  // Arrange
+  await page.goto('/');
+
+  // Act
+  // TODO: Implement test steps for: {}
+
+  // Assert
+  // TODO: Add assertions
+}});"#,
+            test_name, criterion
+        )
+    }
+
+    /// Generate Cypress test code
+    fn generate_cypress_test(
+        &self,
+        _story_title: &str,
+        criterion: &str,
+        test_name: &str,
+    ) -> String {
+        format!(
+            r#"it('{}', () => {{
+  // Arrange
+  cy.visit('/');
+
+  // Act
+  // TODO: Implement test steps for: {}
+
+  // Assert
+  // TODO: Add assertions
+}});"#,
+            test_name, criterion
+        )
+    }
+
+    /// Generate API test code
+    fn generate_api_test(&self, _story_title: &str, criterion: &str, test_name: &str) -> String {
+        format!(
+            r#"test('{}', async () => {{
+  // Arrange
+  const testData = {{}};
+
+  // Act
+  const response = await fetch('/api/endpoint', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify(testData),
+  }});
+
+  // Assert
+  expect(response.status).toBe(200);
+  // TODO: Implement test for: {}
+}});"#,
+            test_name, criterion
+        )
+    }
+
+    /// Generate CLI test code
+    fn generate_cli_test(&self, _story_title: &str, criterion: &str, test_name: &str) -> String {
+        format!(
+            r#"#[test]
+fn {}() {{
+    // Arrange
+    let output = std::process::Command::new("orchestrate")
+        .args(&["--help"])
+        .output()
+        .expect("Failed to execute command");
+
+    // Act
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Assert
+    assert!(output.status.success());
+    // TODO: Implement test for: {}
+}}"#,
+            test_name, criterion
+        )
+    }
+
+    /// Generate E2E test fixtures
+    fn generate_e2e_fixtures(&self, platform: E2ETestPlatform) -> Result<Vec<TestFixture>> {
+        let mut fixtures = Vec::new();
+
+        match platform {
+            E2ETestPlatform::Playwright | E2ETestPlatform::Cypress => {
+                fixtures.push(TestFixture {
+                    name: "browser_setup".to_string(),
+                    setup_code: r#"async function setupBrowser() {
+  // Setup browser context, authentication, etc.
+}"#
+                    .to_string(),
+                    teardown_code: r#"async function teardownBrowser() {
+  // Cleanup browser state
+}"#
+                    .to_string(),
+                    is_async: true,
+                });
+            }
+            E2ETestPlatform::Api => {
+                fixtures.push(TestFixture {
+                    name: "api_setup".to_string(),
+                    setup_code: r#"async function setupApiTest() {
+  // Setup test database, auth tokens, etc.
+}"#
+                    .to_string(),
+                    teardown_code: r#"async function teardownApiTest() {
+  // Cleanup test data
+}"#
+                    .to_string(),
+                    is_async: true,
+                });
+            }
+            E2ETestPlatform::Cli => {
+                fixtures.push(TestFixture {
+                    name: "cli_setup".to_string(),
+                    setup_code: r#"fn setup_cli_test() {
+    // Setup test environment, temp directories, etc.
+}"#
+                    .to_string(),
+                    teardown_code: r#"fn teardown_cli_test() {
+    // Cleanup test artifacts
+}"#
+                    .to_string(),
+                    is_async: false,
+                });
+            }
+        }
+
+        Ok(fixtures)
+    }
+
+    /// Determine E2E test file location
+    fn determine_e2e_test_location(
+        &self,
+        story_id: &str,
+        platform: E2ETestPlatform,
+    ) -> Result<PathBuf> {
+        let sanitized_id = story_id
+            .replace('.', "_")
+            .replace('-', "_")
+            .to_lowercase();
+
+        match platform {
+            E2ETestPlatform::Playwright => Ok(PathBuf::from(format!(
+                "tests/e2e/playwright/{}.spec.ts",
+                sanitized_id
+            ))),
+            E2ETestPlatform::Cypress => Ok(PathBuf::from(format!(
+                "cypress/e2e/{}.cy.ts",
+                sanitized_id
+            ))),
+            E2ETestPlatform::Api => Ok(PathBuf::from(format!(
+                "tests/e2e/api/{}.test.ts",
+                sanitized_id
+            ))),
+            E2ETestPlatform::Cli => Ok(PathBuf::from(format!(
+                "tests/e2e/cli/{}_test.rs",
+                sanitized_id
+            ))),
+        }
+    }
+
+    /// Format E2E test output
+    pub fn format_e2e_test_output(&self, result: &E2ETestResult) -> Result<String> {
+        match result.platform {
+            E2ETestPlatform::Playwright => self.format_playwright_test_file(result),
+            E2ETestPlatform::Cypress => self.format_cypress_test_file(result),
+            E2ETestPlatform::Api => self.format_api_test_file(result),
+            E2ETestPlatform::Cli => self.format_cli_test_file(result),
+        }
+    }
+
+    /// Format Playwright test file
+    fn format_playwright_test_file(&self, result: &E2ETestResult) -> Result<String> {
+        let mut output = format!(
+            r#"import {{ test, expect }} from '@playwright/test';
+
+// Generated from Story: {}
+// Story ID: {}
+
+"#,
+            result.story_title, result.story_id
+        );
+
+        // Add fixtures if any
+        for fixture in &result.fixtures {
+            output.push_str(&fixture.setup_code);
+            output.push_str("\n\n");
+        }
+
+        // Add test cases
+        for test_case in &result.test_cases {
+            output.push_str(&test_case.code);
+            output.push_str("\n\n");
+        }
+
+        Ok(output)
+    }
+
+    /// Format Cypress test file
+    fn format_cypress_test_file(&self, result: &E2ETestResult) -> Result<String> {
+        let mut output = format!(
+            r#"// Generated from Story: {}
+// Story ID: {}
+
+describe('{}', () => {{
+"#,
+            result.story_title, result.story_id, result.story_title
+        );
+
+        // Add test cases
+        for test_case in &result.test_cases {
+            output.push_str("  ");
+            output.push_str(&test_case.code.replace('\n', "\n  "));
+            output.push_str("\n\n");
+        }
+
+        output.push_str("});\n");
+
+        Ok(output)
+    }
+
+    /// Format API test file
+    fn format_api_test_file(&self, result: &E2ETestResult) -> Result<String> {
+        let mut output = format!(
+            r#"// Generated from Story: {}
+// Story ID: {}
+
+import {{ describe, test, expect }} from 'vitest';
+
+"#,
+            result.story_title, result.story_id
+        );
+
+        // Add fixtures
+        for fixture in &result.fixtures {
+            output.push_str(&fixture.setup_code);
+            output.push_str("\n\n");
+        }
+
+        // Add test cases
+        for test_case in &result.test_cases {
+            output.push_str(&test_case.code);
+            output.push_str("\n\n");
+        }
+
+        Ok(output)
+    }
+
+    /// Format CLI test file
+    fn format_cli_test_file(&self, result: &E2ETestResult) -> Result<String> {
+        let mut output = format!(
+            r#"// Generated from Story: {}
+// Story ID: {}
+
+#[cfg(test)]
+mod tests {{
+    use super::*;
+
+"#,
+            result.story_title, result.story_id
+        );
+
+        // Add test cases
+        for test_case in &result.test_cases {
+            output.push_str("    ");
+            output.push_str(&test_case.code.replace('\n', "\n    "));
+            output.push_str("\n\n");
+        }
+
+        output.push_str("}\n");
+
+        Ok(output)
+    }
 }
 
 impl Default for TestGenerationService {
@@ -2104,5 +2614,347 @@ pub fn process(input: &str) -> String {
             test_location,
             Path::new("/project/src/tests/integration/test_storage_integration.py")
         );
+    }
+
+    // E2E test generation tests
+
+    #[tokio::test]
+    async fn test_generate_e2e_tests_from_story_with_playwright() {
+        use crate::Story;
+        use chrono::Utc;
+
+        let service = TestGenerationService::new();
+        let story = Story {
+            id: "epic-005.4".to_string(),
+            epic_id: "epic-005".to_string(),
+            title: "User can login with valid credentials".to_string(),
+            description: Some(
+                r#"
+Acceptance Criteria:
+- [ ] User can navigate to login page
+- [ ] User can enter email and password
+- [ ] User can click login button
+- [ ] User is redirected to dashboard after successful login
+"#
+                .to_string(),
+            ),
+            acceptance_criteria: None,
+            status: crate::StoryStatus::Pending,
+            agent_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let result = service
+            .generate_e2e_tests_from_story(&story, Some(E2ETestPlatform::Playwright))
+            .await
+            .unwrap();
+
+        assert_eq!(result.story_id, "epic-005.4");
+        assert_eq!(result.platform, E2ETestPlatform::Playwright);
+        assert_eq!(result.acceptance_criteria.len(), 4);
+        assert_eq!(result.test_cases.len(), 4);
+        assert!(!result.fixtures.is_empty());
+        assert!(result
+            .test_file_path
+            .to_string_lossy()
+            .contains("playwright"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_acceptance_criteria_from_markdown() {
+        use crate::Story;
+        use chrono::Utc;
+
+        let service = TestGenerationService::new();
+        let story = Story {
+            id: "test-1".to_string(),
+            epic_id: "test".to_string(),
+            title: "Test Story".to_string(),
+            description: Some(
+                r#"
+Some description here.
+
+- [ ] First criterion
+- [x] Second criterion (completed)
+- [ ] Third criterion
+"#
+                .to_string(),
+            ),
+            acceptance_criteria: None,
+            status: crate::StoryStatus::Pending,
+            agent_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let criteria = service.parse_acceptance_criteria(&story).unwrap();
+
+        assert_eq!(criteria.len(), 3);
+        assert_eq!(criteria[0].description, "First criterion");
+        assert!(!criteria[0].checked);
+        assert_eq!(criteria[1].description, "Second criterion (completed)");
+        assert!(criteria[1].checked);
+        assert_eq!(criteria[2].description, "Third criterion");
+        assert!(!criteria[2].checked);
+    }
+
+    #[tokio::test]
+    async fn test_parse_acceptance_criteria_from_json() {
+        use crate::Story;
+        use chrono::Utc;
+        use serde_json::json;
+
+        let service = TestGenerationService::new();
+        let story = Story {
+            id: "test-1".to_string(),
+            epic_id: "test".to_string(),
+            title: "Test Story".to_string(),
+            description: None,
+            acceptance_criteria: Some(json!([
+                {"description": "Criterion 1", "checked": false},
+                {"description": "Criterion 2", "checked": true}
+            ])),
+            status: crate::StoryStatus::Pending,
+            agent_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let criteria = service.parse_acceptance_criteria(&story).unwrap();
+
+        assert_eq!(criteria.len(), 2);
+        assert_eq!(criteria[0].description, "Criterion 1");
+        assert!(!criteria[0].checked);
+        assert_eq!(criteria[1].description, "Criterion 2");
+        assert!(criteria[1].checked);
+    }
+
+    #[test]
+    fn test_detect_e2e_platform_web_ui() {
+        let service = TestGenerationService::new();
+
+        let platform = service.detect_e2e_platform(
+            "User can login to the web UI",
+            "User clicks the login button and is redirected to dashboard",
+        );
+        assert_eq!(platform, E2ETestPlatform::Playwright);
+    }
+
+    #[test]
+    fn test_detect_e2e_platform_api() {
+        let service = TestGenerationService::new();
+
+        let platform =
+            service.detect_e2e_platform("Create user API endpoint", "POST /api/users endpoint");
+        assert_eq!(platform, E2ETestPlatform::Api);
+    }
+
+    #[test]
+    fn test_detect_e2e_platform_cli() {
+        let service = TestGenerationService::new();
+
+        let platform = service.detect_e2e_platform(
+            "orchestrate test generate command",
+            "CLI command to generate tests",
+        );
+        assert_eq!(platform, E2ETestPlatform::Cli);
+    }
+
+    #[test]
+    fn test_generate_test_name_from_criterion() {
+        let service = TestGenerationService::new();
+
+        let name = service.generate_test_name_from_criterion("User can login with credentials");
+        assert_eq!(name, "test_user_login_with_credentials");
+
+        let name2 = service.generate_test_name_from_criterion("Should display error message");
+        assert_eq!(name2, "test_display_error_message");
+    }
+
+    #[test]
+    fn test_generate_playwright_test() {
+        let service = TestGenerationService::new();
+
+        let code = service.generate_playwright_test(
+            "User login",
+            "User can login with valid credentials",
+            "test_user_can_login",
+        );
+
+        assert!(code.contains("test('test_user_can_login'"));
+        assert!(code.contains("async ({ page })"));
+        assert!(code.contains("await page.goto"));
+        assert!(code.contains("User can login with valid credentials"));
+    }
+
+    #[test]
+    fn test_generate_cypress_test() {
+        let service = TestGenerationService::new();
+
+        let code = service.generate_cypress_test(
+            "User login",
+            "User can login with valid credentials",
+            "test_user_can_login",
+        );
+
+        assert!(code.contains("it('test_user_can_login'"));
+        assert!(code.contains("cy.visit"));
+        assert!(code.contains("User can login with valid credentials"));
+    }
+
+    #[test]
+    fn test_generate_api_test() {
+        let service = TestGenerationService::new();
+
+        let code = service.generate_api_test(
+            "Create user",
+            "API creates new user",
+            "test_api_creates_user",
+        );
+
+        assert!(code.contains("test('test_api_creates_user'"));
+        assert!(code.contains("async ()"));
+        assert!(code.contains("fetch"));
+        assert!(code.contains("API creates new user"));
+    }
+
+    #[test]
+    fn test_generate_cli_test() {
+        let service = TestGenerationService::new();
+
+        let code = service.generate_cli_test(
+            "Test generate command",
+            "orchestrate test generate works",
+            "test_orchestrate_generate",
+        );
+
+        assert!(code.contains("#[test]"));
+        assert!(code.contains("fn test_orchestrate_generate()"));
+        assert!(code.contains("Command::new(\"orchestrate\")"));
+        assert!(code.contains("orchestrate test generate works"));
+    }
+
+    #[test]
+    fn test_determine_e2e_test_location_playwright() {
+        let service = TestGenerationService::new();
+
+        let path = service
+            .determine_e2e_test_location("epic-005.4", E2ETestPlatform::Playwright)
+            .unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("tests/e2e/playwright/epic_005_4.spec.ts")
+        );
+    }
+
+    #[test]
+    fn test_determine_e2e_test_location_cypress() {
+        let service = TestGenerationService::new();
+
+        let path = service
+            .determine_e2e_test_location("epic-005.4", E2ETestPlatform::Cypress)
+            .unwrap();
+        assert_eq!(path, PathBuf::from("cypress/e2e/epic_005_4.cy.ts"));
+    }
+
+    #[test]
+    fn test_determine_e2e_test_location_api() {
+        let service = TestGenerationService::new();
+
+        let path = service
+            .determine_e2e_test_location("epic-005.4", E2ETestPlatform::Api)
+            .unwrap();
+        assert_eq!(path, PathBuf::from("tests/e2e/api/epic_005_4.test.ts"));
+    }
+
+    #[test]
+    fn test_determine_e2e_test_location_cli() {
+        let service = TestGenerationService::new();
+
+        let path = service
+            .determine_e2e_test_location("epic-005.4", E2ETestPlatform::Cli)
+            .unwrap();
+        assert_eq!(path, PathBuf::from("tests/e2e/cli/epic_005_4_test.rs"));
+    }
+
+    #[test]
+    fn test_format_playwright_test_file() {
+        let service = TestGenerationService::new();
+
+        let result = E2ETestResult {
+            story_id: "epic-005.4".to_string(),
+            story_title: "User login".to_string(),
+            acceptance_criteria: vec![],
+            test_cases: vec![TestCase {
+                name: "test_login".to_string(),
+                category: TestCategory::HappyPath,
+                code: "test('login', async ({ page }) => {});".to_string(),
+            }],
+            platform: E2ETestPlatform::Playwright,
+            test_file_path: PathBuf::from("test.spec.ts"),
+            fixtures: vec![],
+        };
+
+        let output = service.format_playwright_test_file(&result).unwrap();
+
+        assert!(output.contains("import { test, expect } from '@playwright/test'"));
+        assert!(output.contains("// Generated from Story: User login"));
+        assert!(output.contains("// Story ID: epic-005.4"));
+        assert!(output.contains("test('login'"));
+    }
+
+    #[test]
+    fn test_format_cypress_test_file() {
+        let service = TestGenerationService::new();
+
+        let result = E2ETestResult {
+            story_id: "epic-005.4".to_string(),
+            story_title: "User login".to_string(),
+            acceptance_criteria: vec![],
+            test_cases: vec![TestCase {
+                name: "test_login".to_string(),
+                category: TestCategory::HappyPath,
+                code: "it('login', () => {});".to_string(),
+            }],
+            platform: E2ETestPlatform::Cypress,
+            test_file_path: PathBuf::from("test.cy.ts"),
+            fixtures: vec![],
+        };
+
+        let output = service.format_cypress_test_file(&result).unwrap();
+
+        assert!(output.contains("describe('User login'"));
+        assert!(output.contains("// Story ID: epic-005.4"));
+        assert!(output.contains("it('login'"));
+    }
+
+    #[test]
+    fn test_format_cli_test_file() {
+        let service = TestGenerationService::new();
+
+        let result = E2ETestResult {
+            story_id: "epic-005.4".to_string(),
+            story_title: "CLI test generation".to_string(),
+            acceptance_criteria: vec![],
+            test_cases: vec![TestCase {
+                name: "test_generate".to_string(),
+                category: TestCategory::HappyPath,
+                code: "#[test]\nfn test_generate() {}".to_string(),
+            }],
+            platform: E2ETestPlatform::Cli,
+            test_file_path: PathBuf::from("test.rs"),
+            fixtures: vec![],
+        };
+
+        let output = service.format_cli_test_file(&result).unwrap();
+
+        assert!(output.contains("#[cfg(test)]"));
+        assert!(output.contains("mod tests {"));
+        assert!(output.contains("// Story ID: epic-005.4"));
+        assert!(output.contains("fn test_generate()"));
     }
 }

@@ -541,15 +541,21 @@ enum TestAction {
         /// Type of tests to generate (unit, integration, e2e, property)
         #[arg(short = 't', long, default_value = "unit")]
         test_type: String,
-        /// Target file to generate tests for
-        #[arg(long)]
-        target: PathBuf,
+        /// Target file to generate tests for (for unit/integration tests)
+        #[arg(long, conflicts_with = "story")]
+        target: Option<PathBuf>,
+        /// Story ID to generate E2E tests from (for e2e tests)
+        #[arg(long, conflicts_with = "target")]
+        story: Option<String>,
         /// Output file path (defaults to language-appropriate location)
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Write tests to file (default: print to stdout)
         #[arg(short, long)]
         write: bool,
+        /// Platform for E2E tests (playwright, cypress, api, cli)
+        #[arg(long)]
+        platform: Option<String>,
     },
 }
 
@@ -1802,10 +1808,21 @@ async fn main() -> Result<()> {
             TestAction::Generate {
                 test_type,
                 target,
+                story,
                 output,
                 write,
+                platform,
             } => {
-                handle_test_generate(&test_type, target.as_path(), output.as_deref(), write).await?;
+                handle_test_generate(
+                    &db,
+                    &test_type,
+                    target.as_deref(),
+                    story.as_deref(),
+                    output.as_deref(),
+                    write,
+                    platform.as_deref(),
+                )
+                .await?;
             }
         },
     }
@@ -3025,63 +3042,81 @@ fn generate_test_payload(event_type: &str) -> String {
 
 /// Handle test generation command
 async fn handle_test_generate(
+    db: &Database,
     test_type: &str,
-    target: &std::path::Path,
+    target: Option<&std::path::Path>,
+    story_id: Option<&str>,
     output: Option<&std::path::Path>,
     write: bool,
+    platform: Option<&str>,
 ) -> Result<()> {
-    use orchestrate_core::TestGenerationService;
+    use orchestrate_core::{E2ETestPlatform, TestGenerationService};
 
     // Validate test type
-    if test_type != "unit" && test_type != "integration" {
+    if test_type != "unit" && test_type != "integration" && test_type != "e2e" {
         anyhow::bail!(
-            "Supported test types: 'unit', 'integration'. Got: {}",
+            "Supported test types: 'unit', 'integration', 'e2e'. Got: {}",
             test_type
         );
     }
 
-    // Check if target file exists
-    if !target.exists() {
-        anyhow::bail!("Target file does not exist: {}", target.display());
-    }
-
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                   Test Generation                            ║");
-    println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Type:     {:<50} ║", test_type);
-    println!("║  Target:   {:<50} ║", target.display().to_string());
-    println!("╚══════════════════════════════════════════════════════════════╝");
-    println!();
-
     // Create test generation service
     let service = TestGenerationService::new();
 
-    if test_type == "unit" {
-        // Generate unit tests
-        info!("Analyzing source file: {}", target.display());
-        let result = service.generate_tests(target).await?;
+    if test_type == "e2e" {
+        // E2E test generation from story
+        let story_id = story_id.ok_or_else(|| {
+            anyhow::anyhow!("Story ID required for E2E test generation. Use --story <story-id>")
+        })?;
 
-        println!("📊 Analysis Results:");
-        println!("   Language:  {:?}", result.language);
-        println!("   Functions: {}", result.functions.len());
-        println!("   Test Cases: {}", result.test_cases.len());
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║              E2E Test Generation from Story                  ║");
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  Story ID: {:<50} ║", story_id);
+        println!("╚══════════════════════════════════════════════════════════════╝");
         println!();
 
-        if result.functions.is_empty() {
-            warn!("No testable functions found in {}", target.display());
-            return Ok(());
-        }
+        // Fetch story from database
+        info!("Fetching story: {}", story_id);
+        let story = db
+            .get_story(story_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Story not found: {}", story_id))?;
 
-        // Display found functions
-        println!("📝 Functions Found:");
-        for func in &result.functions {
-            let async_marker = if func.is_async { " (async)" } else { "" };
-            println!("   - {}{}", func.name, async_marker);
+        // Parse platform if provided
+        let e2e_platform = if let Some(p) = platform {
+            Some(match p.to_lowercase().as_str() {
+                "playwright" => E2ETestPlatform::Playwright,
+                "cypress" => E2ETestPlatform::Cypress,
+                "api" => E2ETestPlatform::Api,
+                "cli" => E2ETestPlatform::Cli,
+                _ => anyhow::bail!("Unknown E2E platform: {}. Use: playwright, cypress, api, cli", p),
+            })
+        } else {
+            None
+        };
+
+        // Generate E2E tests
+        info!("Generating E2E tests for story: {}", story.title);
+        let result = service.generate_e2e_tests_from_story(&story, e2e_platform).await?;
+
+        println!("📊 Generation Results:");
+        println!("   Story:     {}", result.story_title);
+        println!("   Platform:  {:?}", result.platform);
+        println!("   Criteria:  {}", result.acceptance_criteria.len());
+        println!("   Tests:     {}", result.test_cases.len());
+        println!();
+
+        // Display acceptance criteria
+        println!("📝 Acceptance Criteria:");
+        for (i, criterion) in result.acceptance_criteria.iter().enumerate() {
+            let checkbox = if criterion.checked { "☑" } else { "☐" };
+            println!("   {}. {} {}", i + 1, checkbox, criterion.description);
         }
         println!();
 
         // Format test output
-        let test_code = service.format_test_output(&result)?;
+        let test_code = service.format_e2e_test_output(&result)?;
 
         // Determine output location
         let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
@@ -3096,19 +3131,88 @@ async fn handle_test_generate(
             }
 
             tokio::fs::write(output_path, &test_code).await?;
-            println!("✅ Tests written to: {}", output_path.display());
+            println!("✅ E2E tests written to: {}", output_path.display());
         } else {
             // Print to stdout
-            println!("Generated Test Code:");
+            println!("Generated E2E Test Code:");
             println!("═══════════════════════════════════════════════════════════════");
             println!("{}", test_code);
             println!("═══════════════════════════════════════════════════════════════");
             println!();
             println!("💡 Tip: Add --write to save tests to file");
-            println!("   Default location: {}", result.test_file_path.display());
         }
     } else {
-        // Generate integration tests
+        // Unit or integration test generation
+        let target = target.ok_or_else(|| {
+            anyhow::anyhow!("Target file required for {} test generation. Use --target <file>", test_type)
+        })?;
+
+        // Check if target file exists
+        if !target.exists() {
+            anyhow::bail!("Target file does not exist: {}", target.display());
+        }
+
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║                   Test Generation                            ║");
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  Type:     {:<50} ║", test_type);
+        println!("║  Target:   {:<50} ║", target.display().to_string());
+        println!("╚══════════════════════════════════════════════════════════════╝");
+        println!();
+
+        if test_type == "unit" {
+            // Generate unit tests
+            info!("Analyzing source file: {}", target.display());
+            let result = service.generate_tests(target).await?;
+
+            println!("📊 Analysis Results:");
+            println!("   Language:  {:?}", result.language);
+            println!("   Functions: {}", result.functions.len());
+            println!("   Test Cases: {}", result.test_cases.len());
+            println!();
+
+            if result.functions.is_empty() {
+                warn!("No testable functions found in {}", target.display());
+                return Ok(());
+            }
+
+            // Display found functions
+            println!("📝 Functions Found:");
+            for func in &result.functions {
+                let async_marker = if func.is_async { " (async)" } else { "" };
+                println!("   - {}{}", func.name, async_marker);
+            }
+            println!();
+
+            // Format test output
+            let test_code = service.format_test_output(&result)?;
+
+            // Determine output location
+            let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
+
+            if write {
+                // Write to file
+                if let Some(parent) = output_path.parent() {
+                    if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
+                        info!("Creating directory: {}", parent.display());
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+
+                tokio::fs::write(output_path, &test_code).await?;
+                println!("✅ Tests written to: {}", output_path.display());
+            } else {
+                // Print to stdout
+                println!("Generated Test Code:");
+                println!("═══════════════════════════════════════════════════════════════");
+                println!("{}", test_code);
+                println!("═══════════════════════════════════════════════════════════════");
+                println!();
+                println!("💡 Tip: Add --write to save tests to file");
+                println!("   Default location: {}", result.test_file_path.display());
+            }
+        } else {
+            // Generate integration tests
         info!("Analyzing module: {}", target.display());
         let result = service.generate_integration_tests(target).await?;
 
@@ -3182,6 +3286,7 @@ async fn handle_test_generate(
             println!();
             println!("💡 Tip: Add --write to save tests to file");
             println!("   Default location: {}", result.test_file_path.display());
+            }
         }
     }
 

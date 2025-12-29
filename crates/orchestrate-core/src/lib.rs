@@ -60,7 +60,7 @@ pub use webhook_config::{EventConfig, EventFilter, WebhookConfig};
 
 // Re-export test generation types
 pub use test_generation::{
-    FunctionSignature, IntegrationTestResult, InterfaceInfo, InterfaceType, Language,
-    ModuleInfo, Parameter, TestCase, TestCategory, TestFixture, TestGenerationResult,
-    TestGenerationService, TestType,
+    AcceptanceCriterion, E2ETestPlatform, E2ETestResult, FunctionSignature,
+    IntegrationTestResult, InterfaceInfo, InterfaceType, Language, ModuleInfo, Parameter,
+    TestCase, TestCategory, TestFixture, TestGenerationResult, TestGenerationService, TestType,
 };
