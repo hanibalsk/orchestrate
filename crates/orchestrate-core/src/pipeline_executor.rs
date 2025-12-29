@@ -11,6 +11,7 @@
 //! - Variable passing between stages
 
 use crate::{
+    condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationResult},
     pipeline::{PipelineRun, PipelineStage},
     pipeline_parser::{FailureAction, PipelineDefinition, StageDefinition},
     Database, Error, Result,
@@ -23,6 +24,7 @@ use tracing::{debug, error, info, warn};
 /// Pipeline execution engine
 pub struct PipelineExecutor {
     database: Arc<Database>,
+    condition_evaluator: ConditionEvaluator,
 }
 
 /// Context for pipeline execution containing runtime variables
@@ -32,6 +34,12 @@ pub struct ExecutionContext {
     pub variables: HashMap<String, String>,
     /// Trigger event that initiated the pipeline
     pub trigger_event: Option<String>,
+    /// Current branch (for condition evaluation)
+    pub branch: Option<String>,
+    /// Changed file paths (for condition evaluation)
+    pub changed_paths: Vec<String>,
+    /// Labels (for condition evaluation)
+    pub labels: Vec<String>,
 }
 
 impl ExecutionContext {
@@ -40,6 +48,9 @@ impl ExecutionContext {
         Self {
             variables: HashMap::new(),
             trigger_event: None,
+            branch: None,
+            changed_paths: Vec::new(),
+            labels: Vec::new(),
         }
     }
 
@@ -52,6 +63,24 @@ impl ExecutionContext {
     /// Create with trigger event
     pub fn with_trigger(mut self, trigger_event: String) -> Self {
         self.trigger_event = Some(trigger_event);
+        self
+    }
+
+    /// Set branch name
+    pub fn with_branch(mut self, branch: String) -> Self {
+        self.branch = Some(branch);
+        self
+    }
+
+    /// Set changed paths
+    pub fn with_changed_paths(mut self, paths: Vec<String>) -> Self {
+        self.changed_paths = paths;
+        self
+    }
+
+    /// Set labels
+    pub fn with_labels(mut self, labels: Vec<String>) -> Self {
+        self.labels = labels;
         self
     }
 
@@ -74,6 +103,16 @@ impl ExecutionContext {
         }
         result
     }
+
+    /// Convert to ConditionContext for condition evaluation
+    pub fn to_condition_context(&self) -> ConditionContext {
+        ConditionContext {
+            branch: self.branch.clone(),
+            changed_paths: self.changed_paths.clone(),
+            labels: self.labels.clone(),
+            variables: self.variables.clone(),
+        }
+    }
 }
 
 impl Default for ExecutionContext {
@@ -85,7 +124,10 @@ impl Default for ExecutionContext {
 impl PipelineExecutor {
     /// Create a new pipeline executor
     pub fn new(database: Arc<Database>) -> Self {
-        Self { database }
+        Self {
+            database,
+            condition_evaluator: ConditionEvaluator::new(),
+        }
     }
 
     /// Create a pipeline run from a trigger event
@@ -300,6 +342,29 @@ impl PipelineExecutor {
                 Error::Other(format!("Stage '{}' not found in database", stage_def.name))
             })?;
 
+        // Evaluate condition if present
+        if let Some(ref condition) = stage_def.when {
+            let condition_context = context.to_condition_context();
+            let eval_result = self
+                .condition_evaluator
+                .evaluate(condition, &condition_context)?;
+
+            if let EvaluationResult::Skip(reason) = eval_result {
+                info!(
+                    stage = %stage_def.name,
+                    reason = %reason,
+                    "Skipping stage due to condition"
+                );
+
+                // Mark stage as skipped
+                stage.mark_skipped();
+                self.database.update_pipeline_stage(&stage).await?;
+
+                // Return success (skipped stages don't fail the pipeline)
+                return Ok(());
+            }
+        }
+
         // Mark stage as running
         // TODO: Set actual agent_id when agent spawning is implemented
         stage.mark_running(None);
@@ -434,6 +499,7 @@ impl PipelineExecutor {
     fn clone_for_stage(&self) -> Self {
         Self {
             database: Arc::clone(&self.database),
+            condition_evaluator: ConditionEvaluator::new(),
         }
     }
 }
@@ -479,6 +545,7 @@ fn parse_timeout(timeout_str: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{PipelineRunStatus, PipelineStageStatus};
 
     #[test]
     fn test_execution_context_new() {
@@ -966,5 +1033,319 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2); // a and b in parallel
         assert_eq!(groups[1].len(), 1); // c alone
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_with_condition_branch_match() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+        let executor = PipelineExecutor::new(database.clone());
+
+        let pipeline = crate::Pipeline::new(
+            "conditional-pipeline".to_string(),
+            "name: conditional\nstages: []".to_string(),
+        );
+        let pipeline_id = database.insert_pipeline(&pipeline).await.unwrap();
+        let run_id = executor.create_run(pipeline_id, None).await.unwrap();
+
+        let definition = PipelineDefinition {
+            name: "conditional-pipeline".to_string(),
+            description: "Pipeline with branch condition".to_string(),
+            version: 1,
+            triggers: vec![],
+            variables: HashMap::new(),
+            stages: vec![StageDefinition {
+                name: "deploy".to_string(),
+                agent: "deployer".to_string(),
+                task: "Deploy".to_string(),
+                timeout: None,
+                on_failure: None,
+                rollback_to: None,
+                requires_approval: false,
+                approvers: vec![],
+                environment: None,
+                depends_on: vec![],
+                parallel_with: None,
+                when: Some(crate::StageCondition {
+                    branch: Some(vec!["main".to_string()]),
+                    paths: None,
+                    labels: None,
+                    variable: None,
+                    or: None,
+                }),
+            }],
+        };
+
+        // Create initial stages
+        for stage_def in &definition.stages {
+            let stage = PipelineStage::new(run_id, stage_def.name.clone());
+            database.insert_pipeline_stage(&stage).await.unwrap();
+        }
+
+        // Execute with matching branch
+        let mut context = ExecutionContext::new().with_branch("main".to_string());
+
+        // Execute stages manually to test with context
+        let result = executor.execute_stages(run_id, &definition, &mut context).await;
+        assert!(result.is_ok());
+
+        let stages = database.list_pipeline_stages(run_id).await.unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, PipelineStageStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_with_condition_branch_mismatch() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+        let executor = PipelineExecutor::new(database.clone());
+
+        let pipeline = crate::Pipeline::new(
+            "conditional-pipeline".to_string(),
+            "name: conditional\nstages: []".to_string(),
+        );
+        let pipeline_id = database.insert_pipeline(&pipeline).await.unwrap();
+        let run_id = executor.create_run(pipeline_id, None).await.unwrap();
+
+        let definition = PipelineDefinition {
+            name: "conditional-pipeline".to_string(),
+            description: "Pipeline with branch condition".to_string(),
+            version: 1,
+            triggers: vec![],
+            variables: HashMap::new(),
+            stages: vec![StageDefinition {
+                name: "deploy".to_string(),
+                agent: "deployer".to_string(),
+                task: "Deploy".to_string(),
+                timeout: None,
+                on_failure: None,
+                rollback_to: None,
+                requires_approval: false,
+                approvers: vec![],
+                environment: None,
+                depends_on: vec![],
+                parallel_with: None,
+                when: Some(crate::StageCondition {
+                    branch: Some(vec!["main".to_string()]),
+                    paths: None,
+                    labels: None,
+                    variable: None,
+                    or: None,
+                }),
+            }],
+        };
+
+        // Create initial stages
+        for stage_def in &definition.stages {
+            let stage = PipelineStage::new(run_id, stage_def.name.clone());
+            database.insert_pipeline_stage(&stage).await.unwrap();
+        }
+
+        // Execute with non-matching branch
+        let mut context = ExecutionContext::new().with_branch("feature".to_string());
+        let result = executor.execute_stages(run_id, &definition, &mut context).await;
+        assert!(result.is_ok());
+
+        let stages = database.list_pipeline_stages(run_id).await.unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, PipelineStageStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_with_condition_paths() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+        let executor = PipelineExecutor::new(database.clone());
+
+        let pipeline = crate::Pipeline::new(
+            "docs-pipeline".to_string(),
+            "name: docs\nstages: []".to_string(),
+        );
+        let pipeline_id = database.insert_pipeline(&pipeline).await.unwrap();
+        let run_id = executor.create_run(pipeline_id, None).await.unwrap();
+
+        let definition = PipelineDefinition {
+            name: "docs-pipeline".to_string(),
+            description: "Pipeline with path condition".to_string(),
+            version: 1,
+            triggers: vec![],
+            variables: HashMap::new(),
+            stages: vec![StageDefinition {
+                name: "deploy-docs".to_string(),
+                agent: "doc-deployer".to_string(),
+                task: "Deploy docs".to_string(),
+                timeout: None,
+                on_failure: None,
+                rollback_to: None,
+                requires_approval: false,
+                approvers: vec![],
+                environment: None,
+                depends_on: vec![],
+                parallel_with: None,
+                when: Some(crate::StageCondition {
+                    branch: None,
+                    paths: Some(vec!["docs/**".to_string()]),
+                    labels: None,
+                    variable: None,
+                    or: None,
+                }),
+            }],
+        };
+
+        // Create initial stages
+        for stage_def in &definition.stages {
+            let stage = PipelineStage::new(run_id, stage_def.name.clone());
+            database.insert_pipeline_stage(&stage).await.unwrap();
+        }
+
+        // Execute with matching paths
+        let mut context = ExecutionContext::new()
+            .with_changed_paths(vec!["docs/README.md".to_string()]);
+        let result = executor.execute_stages(run_id, &definition, &mut context).await;
+        assert!(result.is_ok());
+
+        let stages = database.list_pipeline_stages(run_id).await.unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, PipelineStageStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_with_condition_or() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+        let executor = PipelineExecutor::new(database.clone());
+
+        let pipeline = crate::Pipeline::new(
+            "or-pipeline".to_string(),
+            "name: or\nstages: []".to_string(),
+        );
+        let pipeline_id = database.insert_pipeline(&pipeline).await.unwrap();
+        let run_id = executor.create_run(pipeline_id, None).await.unwrap();
+
+        let definition = PipelineDefinition {
+            name: "or-pipeline".to_string(),
+            description: "Pipeline with OR condition".to_string(),
+            version: 1,
+            triggers: vec![],
+            variables: HashMap::new(),
+            stages: vec![StageDefinition {
+                name: "full-test".to_string(),
+                agent: "tester".to_string(),
+                task: "Run tests".to_string(),
+                timeout: None,
+                on_failure: None,
+                rollback_to: None,
+                requires_approval: false,
+                approvers: vec![],
+                environment: None,
+                depends_on: vec![],
+                parallel_with: None,
+                when: Some(crate::StageCondition {
+                    branch: None,
+                    paths: None,
+                    labels: Some(vec!["needs-full-test".to_string()]),
+                    variable: None,
+                    or: Some(Box::new(crate::StageCondition {
+                        branch: None,
+                        paths: Some(vec!["src/core/**".to_string()]),
+                        labels: None,
+                        variable: None,
+                        or: None,
+                    })),
+                }),
+            }],
+        };
+
+        // Create initial stages
+        for stage_def in &definition.stages {
+            let stage = PipelineStage::new(run_id, stage_def.name.clone());
+            database.insert_pipeline_stage(&stage).await.unwrap();
+        }
+
+        // Execute with OR condition met by second clause
+        let mut context = ExecutionContext::new()
+            .with_changed_paths(vec!["src/core/main.rs".to_string()]);
+        let result = executor.execute_stages(run_id, &definition, &mut context).await;
+        assert!(result.is_ok());
+
+        let stages = database.list_pipeline_stages(run_id).await.unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, PipelineStageStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_with_multiple_stages_some_skipped() {
+        let database = Arc::new(Database::in_memory().await.unwrap());
+        let executor = PipelineExecutor::new(database.clone());
+
+        let pipeline = crate::Pipeline::new(
+            "mixed-pipeline".to_string(),
+            "name: mixed\nstages: []".to_string(),
+        );
+        let pipeline_id = database.insert_pipeline(&pipeline).await.unwrap();
+        let run_id = executor.create_run(pipeline_id, None).await.unwrap();
+
+        let definition = PipelineDefinition {
+            name: "mixed-pipeline".to_string(),
+            description: "Pipeline with mixed conditions".to_string(),
+            version: 1,
+            triggers: vec![],
+            variables: HashMap::new(),
+            stages: vec![
+                StageDefinition {
+                    name: "always-run".to_string(),
+                    agent: "builder".to_string(),
+                    task: "Build".to_string(),
+                    timeout: None,
+                    on_failure: None,
+                    rollback_to: None,
+                    requires_approval: false,
+                    approvers: vec![],
+                    environment: None,
+                    depends_on: vec![],
+                    parallel_with: None,
+                    when: None, // No condition - always runs
+                },
+                StageDefinition {
+                    name: "docs-deploy".to_string(),
+                    agent: "doc-deployer".to_string(),
+                    task: "Deploy docs".to_string(),
+                    timeout: None,
+                    on_failure: None,
+                    rollback_to: None,
+                    requires_approval: false,
+                    approvers: vec![],
+                    environment: None,
+                    depends_on: vec![],
+                    parallel_with: None,
+                    when: Some(crate::StageCondition {
+                        branch: None,
+                        paths: Some(vec!["docs/**".to_string()]),
+                        labels: None,
+                        variable: None,
+                        or: None,
+                    }),
+                },
+            ],
+        };
+
+        // Create initial stages
+        for stage_def in &definition.stages {
+            let stage = PipelineStage::new(run_id, stage_def.name.clone());
+            database.insert_pipeline_stage(&stage).await.unwrap();
+        }
+
+        // Execute with no docs changes
+        let mut context = ExecutionContext::new()
+            .with_changed_paths(vec!["src/main.rs".to_string()]);
+        let result = executor.execute_stages(run_id, &definition, &mut context).await;
+        assert!(result.is_ok());
+
+        let stages = database.list_pipeline_stages(run_id).await.unwrap();
+        assert_eq!(stages.len(), 2);
+
+        // First stage should succeed
+        let always_run = stages.iter().find(|s| s.stage_name == "always-run").unwrap();
+        assert_eq!(always_run.status, PipelineStageStatus::Succeeded);
+
+        // Second stage should be skipped
+        let docs_deploy = stages.iter().find(|s| s.stage_name == "docs-deploy").unwrap();
+        assert_eq!(docs_deploy.status, PipelineStageStatus::Skipped);
     }
 }

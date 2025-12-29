@@ -8,6 +8,7 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod condition_evaluator;
 pub mod database;
 #[cfg(test)]
 mod database_webhook_tests;
@@ -68,3 +69,6 @@ pub use pipeline_executor::{ExecutionContext, PipelineExecutor};
 pub use pipeline_parser::{
     FailureAction, PipelineDefinition, StageCondition, StageDefinition, TriggerDefinition,
 };
+
+// Re-export condition evaluator types
+pub use condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationResult, SkipReason};
