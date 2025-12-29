@@ -21,6 +21,7 @@ pub mod pr;
 pub mod session;
 pub mod shell_state;
 pub mod webhook;
+pub mod webhook_config;
 pub mod worktree;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
@@ -54,3 +55,4 @@ pub use shell_state::{QueueEntry, ShellState, ShepherdLock};
 
 // Re-export webhook types
 pub use webhook::{WebhookEvent, WebhookEventStatus};
+pub use webhook_config::{EventConfig, EventFilter, WebhookConfig};

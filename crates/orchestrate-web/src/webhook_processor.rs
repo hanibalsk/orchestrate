@@ -2,7 +2,7 @@
 //!
 //! Polls the webhook_events queue and processes events asynchronously.
 
-use orchestrate_core::{Database, WebhookEvent, WebhookEventStatus};
+use orchestrate_core::{Database, WebhookConfig, WebhookEvent, WebhookEventStatus};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
@@ -32,12 +32,23 @@ impl Default for WebhookProcessorConfig {
 pub struct WebhookProcessor {
     database: Arc<Database>,
     config: WebhookProcessorConfig,
+    webhook_config: Option<Arc<WebhookConfig>>,
 }
 
 impl WebhookProcessor {
     /// Create a new webhook processor
     pub fn new(database: Arc<Database>, config: WebhookProcessorConfig) -> Self {
-        Self { database, config }
+        Self {
+            database,
+            config,
+            webhook_config: None,
+        }
+    }
+
+    /// Set webhook configuration
+    pub fn with_config(mut self, webhook_config: WebhookConfig) -> Self {
+        self.webhook_config = Some(Arc::new(webhook_config));
+        self
     }
 
     /// Run the processor loop (blocking)
@@ -58,7 +69,7 @@ impl WebhookProcessor {
     }
 
     /// Process a batch of events
-    async fn process_batch(&self) -> orchestrate_core::Result<()> {
+    pub async fn process_batch(&self) -> orchestrate_core::Result<()> {
         let events = self
             .database
             .get_pending_webhook_events(self.config.batch_size)
@@ -133,12 +144,40 @@ impl WebhookProcessor {
 
     /// Handle event processing
     async fn handle_event(&self, event: &WebhookEvent) -> orchestrate_core::Result<()> {
+        // If config is set, check if event should be handled
+        if let Some(config) = &self.webhook_config {
+            // Build full event name with action
+            let event_key = self.get_event_key(event);
+
+            // Check if this event is configured
+            if !config.should_handle_event(&event_key) {
+                // Event not in config - skip silently
+                debug!(
+                    event_type = %event.event_type,
+                    event_key = %event_key,
+                    "Event not configured, skipping"
+                );
+                return Ok(());
+            }
+
+            // Check filter before processing
+            if !self.should_process_event(event, &event_key, config).await? {
+                debug!(
+                    event_type = %event.event_type,
+                    event_key = %event_key,
+                    "Event filtered out by configuration"
+                );
+                return Ok(());
+            }
+        }
+
         match event.event_type.as_str() {
             "pull_request" => {
                 crate::event_handlers::handle_pr_opened(self.database.clone(), event).await
             }
             "pull_request_review" => {
-                crate::event_handlers::handle_pr_review_submitted(self.database.clone(), event).await
+                crate::event_handlers::handle_pr_review_submitted(self.database.clone(), event)
+                    .await
             }
             "check_run" | "check_suite" => {
                 crate::event_handlers::handle_ci_status(self.database.clone(), event).await
@@ -155,6 +194,129 @@ impl WebhookProcessor {
                 Ok(())
             }
         }
+    }
+
+    /// Get the event key for configuration lookup (e.g., "pull_request.opened")
+    fn get_event_key(&self, event: &WebhookEvent) -> String {
+        // Parse payload to get action
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+            if let Some(action) = payload.get("action").and_then(|v| v.as_str()) {
+                return format!("{}.{}", event.event_type, action);
+            }
+        }
+
+        // For push events, there's no action field
+        if event.event_type == "push" {
+            return "push".to_string();
+        }
+
+        // Fallback to just event type
+        event.event_type.clone()
+    }
+
+    /// Check if event should be processed based on filters
+    async fn should_process_event(
+        &self,
+        event: &WebhookEvent,
+        event_key: &str,
+        config: &WebhookConfig,
+    ) -> orchestrate_core::Result<bool> {
+        let filter = match config.get_filter(event_key) {
+            Some(f) => f,
+            None => return Ok(true), // No filter = allow
+        };
+
+        // Parse payload for filtering
+        let payload: serde_json::Value = serde_json::from_str(&event.payload)?;
+
+        // Apply filters based on event type
+        match event.event_type.as_str() {
+            "pull_request" | "pull_request_review" => {
+                let pr = payload.get("pull_request");
+
+                // Check base branch filter
+                if let Some(pr) = pr {
+                    if let Some(base_ref) = pr
+                        .get("base")
+                        .and_then(|b| b.get("ref"))
+                        .and_then(|r| r.as_str())
+                    {
+                        if !filter.allows_branch(base_ref) {
+                            return Ok(false);
+                        }
+                    }
+
+                    // Check fork filter
+                    if let Some(is_fork) = pr
+                        .get("head")
+                        .and_then(|h| h.get("repo"))
+                        .and_then(|r| r.get("fork"))
+                        .and_then(|f| f.as_bool())
+                    {
+                        if !filter.allows_fork(is_fork) {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            "check_run" => {
+                // Check conclusion filter
+                if let Some(conclusion) = payload
+                    .get("check_run")
+                    .and_then(|cr| cr.get("conclusion"))
+                    .and_then(|c| c.as_str())
+                {
+                    if !filter.allows_conclusion(conclusion) {
+                        return Ok(false);
+                    }
+                }
+            }
+            "check_suite" => {
+                // Check conclusion filter
+                if let Some(conclusion) = payload
+                    .get("check_suite")
+                    .and_then(|cs| cs.get("conclusion"))
+                    .and_then(|c| c.as_str())
+                {
+                    if !filter.allows_conclusion(conclusion) {
+                        return Ok(false);
+                    }
+                }
+            }
+            "issues" => {
+                // Check labels filter
+                if let Some(labels) = payload
+                    .get("issue")
+                    .and_then(|i| i.get("labels"))
+                    .and_then(|l| l.as_array())
+                {
+                    let label_names: Vec<String> = labels
+                        .iter()
+                        .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                        .collect();
+
+                    if !filter.allows_labels(&label_names) {
+                        return Ok(false);
+                    }
+                }
+
+                // Check author filter
+                if let Some(author) = payload
+                    .get("issue")
+                    .and_then(|i| i.get("user"))
+                    .and_then(|u| u.get("login"))
+                    .and_then(|l| l.as_str())
+                {
+                    if !filter.allows_author(author) {
+                        return Ok(false);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(true)
     }
 }
 
