@@ -4,8 +4,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_claude::{AgentLoop, ClaudeCliClient, ClaudeClient};
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CreateEnvironment, CustomInstruction, Database, Epic, EpicStatus,
-    Environment, EnvironmentType, LearningEngine, PatternStatus, Schedule, ScheduleRun, ShellState, Story, StoryStatus, Worktree,
+    Agent, AgentState, AgentType, CreateEnvironment, CustomInstruction, Database,
+    Epic, EpicStatus, EnvironmentType, LearningEngine, PatternStatus, PreDeployValidator,
+    Schedule, ScheduleRun, ShellState, Story, StoryStatus, ValidationStatus, Worktree,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,6 +172,11 @@ enum Commands {
     Env {
         #[command(subcommand)]
         action: EnvAction,
+    },
+    /// Deployment management
+    Deploy {
+        #[command(subcommand)]
+        action: DeployAction,
     },
 }
 
@@ -861,6 +867,22 @@ enum EnvAction {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployAction {
+    /// Validate environment is ready for deployment
+    Validate {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Version to validate (optional)
+        #[arg(long)]
+        version: Option<String>,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
     },
 }
 
@@ -2602,6 +2624,15 @@ async fn main() -> Result<()> {
             }
             EnvAction::Delete { name, yes } => {
                 handle_env_delete(&db, &name, yes).await?;
+            }
+        },
+        Commands::Deploy { action } => match action {
+            DeployAction::Validate {
+                env,
+                version,
+                format,
+            } => {
+                handle_deploy_validate(&db, &env, version.as_deref(), &format).await?;
             }
         },
     }
@@ -4610,6 +4641,64 @@ async fn handle_env_delete(db: &Database, name: &str, yes: bool) -> Result<()> {
         println!("Environment '{}' not found", name);
     }
 
+    Ok(())
+}
+
+async fn handle_deploy_validate(
+    db: &Database,
+    env: &str,
+    version: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let validator = PreDeployValidator::with_db(Arc::new(db.clone()));
+    let validation = validator.validate(env, version).await?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&validation)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Pre-Deployment Validation for '{}'", env);
+    if let Some(v) = &validation.version {
+        println!("Version: {}", v);
+    }
+    println!("Validated at: {}", validation.validated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!();
+
+    println!("Overall Status: {}", match validation.overall_status {
+        ValidationStatus::Passed => "PASSED",
+        ValidationStatus::Failed => "FAILED",
+        ValidationStatus::Warning => "WARNING",
+        ValidationStatus::Skipped => "SKIPPED",
+    });
+    println!();
+
+    println!("Validation Checks:");
+    println!("{:<30} {:<10} {}", "Check", "Status", "Message");
+    println!("{}", "-".repeat(80));
+
+    for check in &validation.checks {
+        let status_symbol = match check.status {
+            ValidationStatus::Passed => "✓ PASS",
+            ValidationStatus::Failed => "✗ FAIL",
+            ValidationStatus::Warning => "⚠ WARN",
+            ValidationStatus::Skipped => "- SKIP",
+        };
+        println!("{:<30} {:<10} {}", check.name, status_symbol, check.message);
+    }
+
+    println!();
+
+    if !validation.is_valid() {
+        println!("Validation FAILED. The following checks failed:");
+        for check in validation.failed_checks() {
+            println!("  - {}: {}", check.name, check.message);
+        }
+        std::process::exit(1);
+    }
+
+    println!("All checks passed. Environment is ready for deployment.");
     Ok(())
 }
 

@@ -24,6 +24,7 @@ mod database_environment_tests;
 pub mod deployment_strategy;
 pub mod environment;
 pub mod epic;
+pub mod pre_deploy_validation;
 pub mod error;
 pub mod feedback;
 pub mod instruction;
@@ -120,4 +121,9 @@ pub use secrets::{get_encryption_key, SecretsManager};
 pub use deployment_strategy::{
     BatchSize, BlueGreenConfig, CanaryConfig, DeploymentStrategy, Environment as BlueGreenEnvironment,
     HealthCheck, RecreateConfig, RollingConfig, StrategyType,
+};
+
+// Re-export pre-deployment validation types
+pub use pre_deploy_validation::{
+    DeploymentValidation, PreDeployValidator, ValidationCheck, ValidationStatus,
 };
