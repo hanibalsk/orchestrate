@@ -221,7 +221,12 @@ async fn create_agent(
     // Validate request
     req.validate()?;
 
-    let agent = Agent::new(req.agent_type, req.task);
+    let mut agent = Agent::new(req.agent_type, req.task);
+
+    // Set worktree if provided
+    if let Some(worktree_id) = req.worktree_id {
+        agent = agent.with_worktree(worktree_id);
+    }
 
     state
         .db
@@ -718,6 +723,8 @@ async fn cleanup_instructions(
 pub struct CreateAgentRequest {
     pub agent_type: AgentType,
     pub task: String,
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 impl CreateAgentRequest {
