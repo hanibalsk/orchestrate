@@ -1,0 +1,26 @@
+name: test-pipeline
+description: Example test pipeline for development
+version: 1
+
+triggers:
+  - event: pull_request.merged
+    branches: [main]
+
+variables:
+  environment: staging
+
+stages:
+  - name: validate
+    agent: tester
+    task: "Run validation tests"
+    timeout: 10m
+    on_failure: halt
+
+  - name: deploy
+    agent: deployer
+    task: "Deploy to ${environment}"
+    depends_on: [validate]
+    requires_approval: true
+    approvers: [team-lead]
+    on_failure: rollback
+    rollback_to: validate
