@@ -192,9 +192,9 @@ worktree_create() {
     mkdir -p "$WORKTREE_DIR"
 
     git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null || \
-        git branch "$branch" "$base"
+        git branch "$branch" "$base" >/dev/null 2>&1
 
-    git worktree add "$path" "$branch" 2>/dev/null || {
+    git worktree add "$path" "$branch" >/dev/null 2>&1 || {
         echo "Worktree exists: $path" >&2
     }
 

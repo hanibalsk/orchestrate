@@ -112,22 +112,49 @@ Spawn issue-fixer when changes are requested.
 Spawn issue-fixer when CI fails.
 
 **Acceptance Criteria:**
-- [ ] Detect `check_run.completed` or `check_suite.completed` event
-- [ ] Check if conclusion is `failure` or `timed_out`
-- [ ] Extract failed check details and logs URL
-- [ ] Spawn `issue-fixer` agent with CI failure context
-- [ ] Avoid spawning duplicate fixers for same failure
+- [x] Detect `check_run.completed` or `check_suite.completed` event
+- [x] Check if conclusion is `failure` or `timed_out`
+- [x] Extract failed check details and logs URL
+- [x] Spawn `issue-fixer` agent with CI failure context
+- [x] Avoid spawning duplicate fixers for same failure
+
+**Implementation Details:**
+- Implemented `handle_ci_status` function that routes to check_run or check_suite handlers
+- Handles both `check_run.completed` and `check_suite.completed` events
+- Filters for `failure` and `timed_out` conclusions only
+- Extracts check details: ID, name, SHA, URLs, branch, PR numbers
+- Links to existing pr-shepherd agent if available
+- Deduplicates based on check/suite ID, commit SHA, and PR number
+- Added 11 comprehensive unit tests covering all scenarios
+- Added 6 integration tests for end-to-end validation
+- Updated webhook processor to route check_run and check_suite events
 
 ### Story 6: Push to Main Event Handler
 
 Spawn regression-tester on main branch pushes.
 
 **Acceptance Criteria:**
-- [ ] Detect `push` event to main/master branch
-- [ ] Extract commit range and changed files
-- [ ] Spawn `regression-tester` agent (new agent type)
+- [x] Detect `push` event to main/master branch
+- [x] Extract commit range and changed files
+- [x] Spawn `regression-tester` agent (new agent type)
 - [ ] Run test suite and report results
 - [ ] Create issue if regression detected
+
+**Implementation Details:**
+- Created `RegressionTester` agent type in orchestrate-core
+- Configured with Bash, Read, Write, Edit, Glob, Grep tools, 50 max turns
+- Implemented `handle_push_to_main` function in event_handlers.rs
+- Filters for refs/heads/main and refs/heads/master branches only
+- Extracts commit range (before..after SHA) from push payload
+- Collects all changed files (added, modified, removed) from commits
+- Deduplicates files that appear in multiple commits
+- Stores commit range and changed files in agent context
+- Added 8 comprehensive unit tests covering all scenarios
+- Added 2 integration tests for webhook processor routing
+- Updated webhook processor to route "push" events to handler
+- Agent is created and stored in database ready for execution
+- TODO: Actual agent execution (spawn process) - will be handled by agent runtime
+- TODO: Test suite execution and issue creation - will be implemented in agent logic
 
 ### Story 7: Issue Created Event Handler
 
