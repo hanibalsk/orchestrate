@@ -8,6 +8,7 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod change_test_analyzer;
 pub mod coverage;
 pub mod database;
 #[cfg(test)]
@@ -77,4 +78,10 @@ pub use coverage::{
 pub use test_quality::{
     MutationDetail, MutationTestResult, MutationType, TestIssueType, TestQualityIssue,
     TestQualityReport, TestQualityService,
+};
+
+// Re-export change test analyzer types
+pub use change_test_analyzer::{
+    ChangeAnalysisResult, ChangeTestAnalyzer, ChangeType, ChangedFunction, Priority,
+    TestCoverage, TestSuggestion,
 };

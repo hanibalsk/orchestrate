@@ -599,6 +599,24 @@ enum TestAction {
         #[arg(short, long, default_value = "text")]
         output: String,
     },
+    /// Analyze PR changes and suggest tests
+    AnalyzePr {
+        /// PR number to analyze
+        #[arg(short, long)]
+        pr: Option<i32>,
+        /// Base reference (e.g., main)
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Head reference (e.g., feature-branch). If not provided, uses current branch
+        #[arg(long)]
+        head: Option<String>,
+        /// Post results as PR comment
+        #[arg(long)]
+        comment: bool,
+        /// Output format (text, json, markdown)
+        #[arg(short, long, default_value = "text")]
+        output: String,
+    },
 }
 
 #[tokio::main]
@@ -1896,6 +1914,15 @@ async fn main() -> Result<()> {
             } => {
                 handle_test_validate(&db, &file, mutation, source.as_deref(), store, &output)
                     .await?;
+            }
+            TestAction::AnalyzePr {
+                pr,
+                base,
+                head,
+                comment,
+                output,
+            } => {
+                handle_test_analyze_pr(&db, pr, &base, head.as_deref(), comment, &output).await?;
             }
         },
     }
@@ -3556,6 +3583,199 @@ async fn handle_test_validate(
     }
 
     Ok(())
+}
+
+/// Handle test analyze-pr command
+async fn handle_test_analyze_pr(
+    _db: &Database,
+    pr_number: Option<i32>,
+    base: &str,
+    head: Option<&str>,
+    post_comment: bool,
+    output_format: &str,
+) -> Result<()> {
+    use orchestrate_core::ChangeTestAnalyzer;
+    use std::process::Command;
+
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║           PR Test Coverage Analysis                          ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+
+    // Get current working directory as repo path
+    let repo_path = std::env::current_dir()?;
+
+    // Determine head reference
+    let head_ref = if let Some(h) = head {
+        h.to_string()
+    } else if let Some(_pr) = pr_number {
+        // If PR number is provided, fetch from GitHub
+        anyhow::bail!("Fetching head ref from PR number not yet implemented. Please specify --head")
+    } else {
+        // Get current branch
+        let output = Command::new("git")
+            .args(["branch", "--show-current"])
+            .output()?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to get current branch: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        String::from_utf8(output.stdout)?.trim().to_string()
+    };
+
+    println!("  Base:  {}", base);
+    println!("  Head:  {}", head_ref);
+    println!();
+
+    // Get git diff
+    println!("📊 Analyzing changes...");
+    let diff_output = Command::new("git")
+        .args(["diff", base, &head_ref])
+        .output()?;
+
+    if !diff_output.status.success() {
+        anyhow::bail!(
+            "Failed to get git diff: {}",
+            String::from_utf8_lossy(&diff_output.stderr)
+        );
+    }
+
+    let diff_content = String::from_utf8(diff_output.stdout)?;
+
+    if diff_content.trim().is_empty() {
+        println!("ℹ️  No changes detected between {} and {}", base, head_ref);
+        return Ok(());
+    }
+
+    // Analyze diff
+    let analyzer = ChangeTestAnalyzer::new(repo_path);
+    let result = analyzer.analyze_diff(&diff_content, base, &head_ref).await?;
+
+    println!("✅ Analysis complete");
+    println!();
+
+    // Output results
+    match output_format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        "markdown" => {
+            let comment = analyzer.format_pr_comment(&result);
+            println!("{}", comment);
+        }
+        "text" | _ => {
+            print_change_analysis(&result);
+        }
+    }
+
+    // Post as PR comment if requested
+    if post_comment {
+        if let Some(pr) = pr_number {
+            println!();
+            println!("💬 Posting comment to PR #{}...", pr);
+
+            let comment = analyzer.format_pr_comment(&result);
+
+            let output = Command::new("gh")
+                .args([
+                    "pr",
+                    "comment",
+                    &pr.to_string(),
+                    "--body",
+                    &comment,
+                ])
+                .output()?;
+
+            if !output.status.success() {
+                anyhow::bail!(
+                    "Failed to post PR comment: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            println!("✅ Comment posted successfully");
+        } else {
+            println!("⚠️  Cannot post comment: --pr number required");
+        }
+    }
+
+    Ok(())
+}
+
+fn print_change_analysis(result: &orchestrate_core::ChangeAnalysisResult) {
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("  Test Coverage Analysis Results");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+
+    println!("  Coverage: {:.1}% of changed functions have tests", result.coverage_percentage);
+    println!("  Changed functions: {}", result.changed_functions.len());
+    println!("  Functions with tests: {}", result.coverage.iter().filter(|c| c.has_tests).count());
+    println!("  Functions without tests: {}", result.suggestions.len());
+    println!();
+
+    if result.suggestions.is_empty() {
+        println!("✅ All changed functions have test coverage!");
+        return;
+    }
+
+    // Group suggestions by priority
+    let high: Vec<_> = result.suggestions.iter()
+        .filter(|s| matches!(s.priority, orchestrate_core::Priority::High))
+        .collect();
+    let medium: Vec<_> = result.suggestions.iter()
+        .filter(|s| matches!(s.priority, orchestrate_core::Priority::Medium))
+        .collect();
+    let low: Vec<_> = result.suggestions.iter()
+        .filter(|s| matches!(s.priority, orchestrate_core::Priority::Low))
+        .collect();
+
+    if !high.is_empty() {
+        println!("🔴 High Priority ({} functions)", high.len());
+        println!("───────────────────────────────────────────────────────────────");
+        for suggestion in high {
+            print_suggestion(suggestion);
+        }
+        println!();
+    }
+
+    if !medium.is_empty() {
+        println!("🟡 Medium Priority ({} functions)", medium.len());
+        println!("───────────────────────────────────────────────────────────────");
+        for suggestion in medium {
+            print_suggestion(suggestion);
+        }
+        println!();
+    }
+
+    if !low.is_empty() {
+        println!("🟢 Low Priority ({} functions)", low.len());
+        println!("───────────────────────────────────────────────────────────────");
+        for suggestion in low {
+            print_suggestion(suggestion);
+        }
+        println!();
+    }
+
+    println!("═══════════════════════════════════════════════════════════════");
+}
+
+fn print_suggestion(suggestion: &orchestrate_core::TestSuggestion) {
+    println!("  📝 {} ({}:{})",
+        suggestion.function.name,
+        suggestion.function.file_path.display(),
+        suggestion.function.line_number
+    );
+    println!("     {}", suggestion.reason);
+    println!("     Suggested tests:");
+    for test in &suggestion.suggested_tests {
+        println!("       • {}", test);
+    }
+    println!();
 }
 
 fn print_quality_report(report: &orchestrate_core::TestQualityReport) {
