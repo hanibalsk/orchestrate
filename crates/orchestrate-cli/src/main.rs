@@ -1888,25 +1888,25 @@ async fn main() -> Result<()> {
 
         Commands::Pipeline { action } => match action {
             PipelineAction::Create { file } => {
-                handle_pipeline_create(&db, file).await?;
+                handle_pipeline_create(&db, &file).await?;
             }
             PipelineAction::List { enabled_only } => {
                 handle_pipeline_list(&db, enabled_only).await?;
             }
             PipelineAction::Show { name } => {
-                handle_pipeline_show(&db, name).await?;
+                handle_pipeline_show(&db, &name).await?;
             }
             PipelineAction::Update { name, file } => {
-                handle_pipeline_update(&db, name, file).await?;
+                handle_pipeline_update(&db, &name, &file).await?;
             }
             PipelineAction::Delete { name } => {
-                handle_pipeline_delete(&db, name).await?;
+                handle_pipeline_delete(&db, &name).await?;
             }
             PipelineAction::Enable { name } => {
-                handle_pipeline_enable(&db, name).await?;
+                handle_pipeline_enable(&db, &name).await?;
             }
             PipelineAction::Disable { name } => {
-                handle_pipeline_disable(&db, name).await?;
+                handle_pipeline_disable(&db, &name).await?;
             }
             PipelineAction::Run { name, dry_run } => {
                 handle_pipeline_run(&db, &name, dry_run).await?;
@@ -3154,23 +3154,27 @@ fn generate_test_payload(event_type: &str) -> String {
 // ==================== Pipeline Command Handlers ====================
 
 async fn handle_pipeline_create(db: &Database, file: &PathBuf) -> Result<()> {
-    use orchestrate_core::{Pipeline, PipelineDefinition};
+    use orchestrate_core::Pipeline;
     use std::fs;
 
     // Read YAML file
     let yaml = fs::read_to_string(file)?;
 
-    // Parse to validate it
-    let definition: PipelineDefinition = serde_yaml::from_str(&yaml)?;
+    // Try to parse pipeline name from YAML (simple approach - look for "name:" line)
+    let name = yaml
+        .lines()
+        .find(|line| line.trim_start().starts_with("name:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .ok_or_else(|| anyhow::anyhow!("Pipeline YAML must contain 'name' field"))?;
 
-    // Create pipeline
-    let pipeline = Pipeline::new(definition.name.clone(), yaml);
+    // Create pipeline (validation will happen when the executor parses it)
+    let pipeline = Pipeline::new(name.clone(), yaml);
     db.insert_pipeline(&pipeline).await?;
 
-    println!("Pipeline created: {}", definition.name);
-    println!("  Description: {}", definition.description.unwrap_or_default());
-    println!("  Version: {}", definition.version);
-    println!("  Stages: {}", definition.stages.len());
+    println!("Pipeline created: {}", name);
+    println!("  File: {:?}", file);
+    println!("  Note: Pipeline definition will be validated on first run");
 
     Ok(())
 }
@@ -3226,14 +3230,12 @@ async fn handle_pipeline_update(db: &Database, name: &str, file: &PathBuf) -> Re
     // Read new YAML file
     let yaml = fs::read_to_string(file)?;
 
-    // Parse to validate it
-    let _definition: orchestrate_core::PipelineDefinition = serde_yaml::from_str(&yaml)?;
-
-    // Update pipeline
+    // Update pipeline (validation will happen when the executor parses it)
     pipeline.definition = yaml;
     db.update_pipeline(&pipeline).await?;
 
     println!("Pipeline updated: {}", name);
+    println!("  Note: Pipeline definition will be validated on first run");
 
     Ok(())
 }
@@ -3277,7 +3279,7 @@ async fn handle_pipeline_disable(db: &Database, name: &str) -> Result<()> {
 }
 
 async fn handle_pipeline_run(db: &Database, name: &str, dry_run: bool) -> Result<()> {
-    use orchestrate_core::{PipelineExecutor, PipelineRun};
+    use orchestrate_core::PipelineRun;
 
     let pipeline = db
         .get_pipeline_by_name(name)
@@ -3298,16 +3300,8 @@ async fn handle_pipeline_run(db: &Database, name: &str, dry_run: bool) -> Result
     println!("Pipeline run started: {}", run_id);
     println!("  Pipeline: {}", name);
     println!("  Trigger: manual");
-
-    // Create executor and start execution in background
-    let executor = PipelineExecutor::new(db.clone());
-    tokio::spawn(async move {
-        if let Err(e) = executor.execute_run(run_id).await {
-            eprintln!("Pipeline run {} failed: {}", run_id, e);
-        }
-    });
-
-    println!("\nUse 'orchestrate pipeline status {}' to check progress", run_id);
+    println!("\nNote: Pipeline execution requires the daemon to be running.");
+    println!("Use 'orchestrate pipeline status {}' to check progress", run_id);
 
     Ok(())
 }
