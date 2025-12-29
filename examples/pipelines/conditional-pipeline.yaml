@@ -1,0 +1,72 @@
+name: conditional-pipeline
+description: Pipeline with conditional stage execution based on changes
+version: 1
+
+triggers:
+  - event: pull_request.opened
+    branches: [main, develop]
+
+stages:
+  - name: lint-all
+    agent: linter
+    task: Lint all changed files
+    timeout: 5m
+    on_failure: halt
+
+  - name: test-backend
+    agent: backend-tester
+    task: Run backend tests
+    timeout: 20m
+    depends_on: [lint-all]
+    when:
+      paths: ["backend/**", "shared/**"]
+    on_failure: halt
+
+  - name: test-frontend
+    agent: frontend-tester
+    task: Run frontend tests
+    timeout: 15m
+    depends_on: [lint-all]
+    when:
+      paths: ["frontend/**", "shared/**"]
+    on_failure: halt
+
+  - name: build-docs
+    agent: doc-builder
+    task: Build documentation
+    timeout: 10m
+    depends_on: [lint-all]
+    when:
+      paths: ["docs/**", "README.md", "*.md"]
+    on_failure: continue
+
+  - name: e2e-tests
+    agent: e2e-tester
+    task: Run end-to-end tests
+    timeout: 45m
+    depends_on: [test-backend, test-frontend]
+    when:
+      labels: ["needs-e2e"]
+      or:
+        paths: ["backend/api/**", "frontend/src/**"]
+    on_failure: halt
+
+  - name: performance-tests
+    agent: perf-tester
+    task: Run performance benchmarks
+    timeout: 30m
+    depends_on: [test-backend]
+    when:
+      labels: ["needs-perf-test"]
+    on_failure: continue
+
+  - name: security-audit
+    agent: security-auditor
+    task: Run security audit
+    timeout: 20m
+    depends_on: [lint-all]
+    when:
+      labels: ["security-review"]
+      or:
+        paths: ["backend/auth/**", "backend/api/**"]
+    on_failure: halt

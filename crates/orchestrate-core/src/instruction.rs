@@ -436,6 +436,128 @@ impl Default for LearningConfig {
     }
 }
 
+/// Types of success patterns that can be learned
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuccessPatternType {
+    /// Effective sequences of tool calls
+    ToolSequence,
+    /// Prompt structures that lead to success
+    PromptStructure,
+    /// Optimal context sizes for different task types
+    ContextSize,
+    /// Model choices that work best for task types
+    ModelChoice,
+    /// Time-of-day patterns affecting success
+    Timing,
+}
+
+impl SuccessPatternType {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SuccessPatternType::ToolSequence => "tool_sequence",
+            SuccessPatternType::PromptStructure => "prompt_structure",
+            SuccessPatternType::ContextSize => "context_size",
+            SuccessPatternType::ModelChoice => "model_choice",
+            SuccessPatternType::Timing => "timing",
+        }
+    }
+
+    /// Parse from string representation
+    pub fn from_str(s: &str) -> crate::Result<Self> {
+        match s {
+            "tool_sequence" => Ok(SuccessPatternType::ToolSequence),
+            "prompt_structure" => Ok(SuccessPatternType::PromptStructure),
+            "context_size" => Ok(SuccessPatternType::ContextSize),
+            "model_choice" => Ok(SuccessPatternType::ModelChoice),
+            "timing" => Ok(SuccessPatternType::Timing),
+            _ => Err(crate::Error::Other(format!(
+                "Unknown success pattern type: {}",
+                s
+            ))),
+        }
+    }
+}
+
+/// A pattern learned from successful agent runs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuccessPattern {
+    /// Database ID
+    pub id: i64,
+    /// Type of success pattern
+    pub pattern_type: SuccessPatternType,
+    /// Agent type (None for patterns that apply to all types)
+    pub agent_type: Option<AgentType>,
+    /// Task type categorization
+    pub task_type: Option<String>,
+    /// Unique signature for deduplication
+    pub pattern_signature: String,
+    /// Pattern data (JSON)
+    pub pattern_data: serde_json::Value,
+    /// Number of times this pattern was observed
+    pub occurrence_count: i64,
+    /// Average completion time in milliseconds
+    pub avg_completion_time_ms: Option<i64>,
+    /// Average token usage
+    pub avg_token_usage: Option<i64>,
+    /// Success rate (always 1.0 for success patterns, but can track consistency)
+    pub success_rate: f64,
+    /// First observation timestamp
+    pub first_seen_at: DateTime<Utc>,
+    /// Last observation timestamp
+    pub last_seen_at: DateTime<Utc>,
+}
+
+impl SuccessPattern {
+    /// Create a new success pattern
+    pub fn new(
+        pattern_type: SuccessPatternType,
+        pattern_signature: impl Into<String>,
+        pattern_data: serde_json::Value,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: 0,
+            pattern_type,
+            agent_type: None,
+            task_type: None,
+            pattern_signature: pattern_signature.into(),
+            pattern_data,
+            occurrence_count: 1,
+            avg_completion_time_ms: None,
+            avg_token_usage: None,
+            success_rate: 1.0,
+            first_seen_at: now,
+            last_seen_at: now,
+        }
+    }
+
+    /// Set agent type
+    pub fn with_agent_type(mut self, agent_type: AgentType) -> Self {
+        self.agent_type = Some(agent_type);
+        self
+    }
+
+    /// Set task type
+    pub fn with_task_type(mut self, task_type: impl Into<String>) -> Self {
+        self.task_type = Some(task_type.into());
+        self
+    }
+
+    /// Set completion time
+    pub fn with_completion_time_ms(mut self, time_ms: i64) -> Self {
+        self.avg_completion_time_ms = Some(time_ms);
+        self
+    }
+
+    /// Set token usage
+    pub fn with_token_usage(mut self, tokens: i64) -> Self {
+        self.avg_token_usage = Some(tokens);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

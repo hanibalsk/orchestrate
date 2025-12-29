@@ -151,6 +151,16 @@ enum Commands {
         #[command(subcommand)]
         action: WebhookAction,
     },
+    /// Pipeline management
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
+    /// Approval management
+    Approval {
+        #[command(subcommand)]
+        action: ApprovalAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -596,6 +606,122 @@ enum SecretAction {
     Rotate,
     /// Show current webhook secret
     Show,
+}
+
+#[derive(Subcommand)]
+enum PipelineAction {
+    /// Create pipeline from YAML file
+    Create {
+        /// Path to YAML file
+        file: PathBuf,
+    },
+    /// List all pipelines
+    List {
+        /// Show only enabled pipelines
+        #[arg(long)]
+        enabled_only: bool,
+    },
+    /// Show pipeline definition
+    Show {
+        /// Pipeline name
+        name: String,
+    },
+    /// Update pipeline from YAML file
+    Update {
+        /// Pipeline name
+        name: String,
+        /// Path to YAML file
+        file: PathBuf,
+    },
+    /// Delete pipeline
+    Delete {
+        /// Pipeline name
+        name: String,
+    },
+    /// Enable pipeline
+    Enable {
+        /// Pipeline name
+        name: String,
+    },
+    /// Disable pipeline
+    Disable {
+        /// Pipeline name
+        name: String,
+    },
+    /// Trigger pipeline manually
+    Run {
+        /// Pipeline name
+        name: String,
+        /// Dry run - show what would be done without executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show pipeline run status
+    Status {
+        /// Run ID
+        run_id: i64,
+    },
+    /// Cancel running pipeline
+    Cancel {
+        /// Run ID
+        run_id: i64,
+    },
+    /// Show pipeline run history
+    History {
+        /// Pipeline name
+        name: String,
+        /// Number of runs to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Initialize pipeline from template
+    Init {
+        /// Template name (ci, cd, release, security)
+        template: Option<String>,
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// List available templates
+        #[arg(long)]
+        list: bool,
+        /// Force overwrite existing file
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalAction {
+    /// List approval requests
+    List {
+        /// Show only pending approvals
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Approve a request
+    Approve {
+        /// Approval request ID
+        id: i64,
+        /// Optional comment
+        #[arg(short, long)]
+        comment: Option<String>,
+    },
+    /// Reject a request
+    Reject {
+        /// Approval request ID
+        id: i64,
+        /// Reason for rejection
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+    /// Delegate approval to another user
+    Delegate {
+        /// Approval request ID
+        id: i64,
+        /// User to delegate to
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[tokio::main]
@@ -2100,6 +2226,60 @@ async fn main() -> Result<()> {
                 }
             },
         },
+
+        Commands::Pipeline { action } => match action {
+            PipelineAction::Create { file } => {
+                handle_pipeline_create(&db, &file).await?;
+            }
+            PipelineAction::List { enabled_only } => {
+                handle_pipeline_list(&db, enabled_only).await?;
+            }
+            PipelineAction::Show { name } => {
+                handle_pipeline_show(&db, &name).await?;
+            }
+            PipelineAction::Update { name, file } => {
+                handle_pipeline_update(&db, &name, &file).await?;
+            }
+            PipelineAction::Delete { name } => {
+                handle_pipeline_delete(&db, &name).await?;
+            }
+            PipelineAction::Enable { name } => {
+                handle_pipeline_enable(&db, &name).await?;
+            }
+            PipelineAction::Disable { name } => {
+                handle_pipeline_disable(&db, &name).await?;
+            }
+            PipelineAction::Run { name, dry_run } => {
+                handle_pipeline_run(&db, &name, dry_run).await?;
+            }
+            PipelineAction::Status { run_id } => {
+                handle_pipeline_status(&db, run_id).await?;
+            }
+            PipelineAction::Cancel { run_id } => {
+                handle_pipeline_cancel(&db, run_id).await?;
+            }
+            PipelineAction::History { name, limit } => {
+                handle_pipeline_history(&db, &name, limit).await?;
+            }
+            PipelineAction::Init { template, output, list, force } => {
+                handle_pipeline_init(template.as_deref(), output.as_ref(), list, force)?;
+            }
+        },
+
+        Commands::Approval { action } => match action {
+            ApprovalAction::List { pending } => {
+                handle_approval_list(&db, pending).await?;
+            }
+            ApprovalAction::Approve { id, comment } => {
+                handle_approval_approve(&db, id, comment.as_deref()).await?;
+            }
+            ApprovalAction::Reject { id, reason } => {
+                handle_approval_reject(&db, id, reason.as_deref()).await?;
+            }
+            ApprovalAction::Delegate { id, to } => {
+                handle_approval_delegate(&db, id, &to).await?;
+            }
+        },
     }
 
     Ok(())
@@ -3314,3 +3494,459 @@ fn generate_test_payload(event_type: &str) -> String {
         }
     }
 }
+
+// ==================== Pipeline Command Handlers ====================
+
+async fn handle_pipeline_create(db: &Database, file: &PathBuf) -> Result<()> {
+    use orchestrate_core::Pipeline;
+    use std::fs;
+
+    // Read YAML file
+    let yaml = fs::read_to_string(file)?;
+
+    // Try to parse pipeline name from YAML (simple approach - look for "name:" line)
+    let name = yaml
+        .lines()
+        .find(|line| line.trim_start().starts_with("name:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .ok_or_else(|| anyhow::anyhow!("Pipeline YAML must contain 'name' field"))?;
+
+    // Create pipeline (validation will happen when the executor parses it)
+    let pipeline = Pipeline::new(name.clone(), yaml);
+    db.insert_pipeline(&pipeline).await?;
+
+    println!("Pipeline created: {}", name);
+    println!("  File: {:?}", file);
+    println!("  Note: Pipeline definition will be validated on first run");
+
+    Ok(())
+}
+
+async fn handle_pipeline_list(db: &Database, enabled_only: bool) -> Result<()> {
+    let pipelines = if enabled_only {
+        db.list_enabled_pipelines().await?
+    } else {
+        db.list_pipelines().await?
+    };
+
+    if pipelines.is_empty() {
+        println!("No pipelines found");
+        return Ok(());
+    }
+
+    println!("{:<30} {:<10} {:<20}", "NAME", "ENABLED", "CREATED");
+    println!("{}", "-".repeat(70));
+
+    for pipeline in pipelines {
+        let enabled_str = if pipeline.enabled { "yes" } else { "no" };
+        let created = pipeline.created_at.format("%Y-%m-%d %H:%M:%S");
+        println!("{:<30} {:<10} {:<20}", pipeline.name, enabled_str, created);
+    }
+
+    Ok(())
+}
+
+async fn handle_pipeline_show(db: &Database, name: &str) -> Result<()> {
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    println!("Pipeline: {}", pipeline.name);
+    println!("Enabled: {}", if pipeline.enabled { "yes" } else { "no" });
+    println!("Created: {}", pipeline.created_at.format("%Y-%m-%d %H:%M:%S"));
+    println!("\nDefinition:");
+    println!("{}", pipeline.definition);
+
+    Ok(())
+}
+
+async fn handle_pipeline_update(db: &Database, name: &str, file: &PathBuf) -> Result<()> {
+    use std::fs;
+
+    // Get existing pipeline
+    let mut pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    // Read new YAML file
+    let yaml = fs::read_to_string(file)?;
+
+    // Update pipeline (validation will happen when the executor parses it)
+    pipeline.definition = yaml;
+    db.update_pipeline(&pipeline).await?;
+
+    println!("Pipeline updated: {}", name);
+    println!("  Note: Pipeline definition will be validated on first run");
+
+    Ok(())
+}
+
+async fn handle_pipeline_delete(db: &Database, name: &str) -> Result<()> {
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    db.delete_pipeline(pipeline.id.unwrap()).await?;
+    println!("Pipeline deleted: {}", name);
+
+    Ok(())
+}
+
+async fn handle_pipeline_enable(db: &Database, name: &str) -> Result<()> {
+    let mut pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    pipeline.enabled = true;
+    db.update_pipeline(&pipeline).await?;
+    println!("Pipeline enabled: {}", name);
+
+    Ok(())
+}
+
+async fn handle_pipeline_disable(db: &Database, name: &str) -> Result<()> {
+    let mut pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    pipeline.enabled = false;
+    db.update_pipeline(&pipeline).await?;
+    println!("Pipeline disabled: {}", name);
+
+    Ok(())
+}
+
+async fn handle_pipeline_run(db: &Database, name: &str, dry_run: bool) -> Result<()> {
+    use orchestrate_core::PipelineRun;
+
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    if dry_run {
+        println!("Dry run: Would trigger pipeline '{}'", name);
+        println!("Pipeline definition:");
+        println!("{}", pipeline.definition);
+        return Ok(());
+    }
+
+    // Create pipeline run
+    let run = PipelineRun::new(pipeline.id.unwrap(), Some("manual".to_string()));
+    let run_id = db.insert_pipeline_run(&run).await?;
+
+    println!("Pipeline run started: {}", run_id);
+    println!("  Pipeline: {}", name);
+    println!("  Trigger: manual");
+    println!("\nNote: Pipeline execution requires the daemon to be running.");
+    println!("Use 'orchestrate pipeline status {}' to check progress", run_id);
+
+    Ok(())
+}
+
+async fn handle_pipeline_status(db: &Database, run_id: i64) -> Result<()> {
+    use orchestrate_core::PipelineRunStatus;
+
+    let run = db
+        .get_pipeline_run(run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline run not found: {}", run_id))?;
+
+    let pipeline = db.get_pipeline(run.pipeline_id).await?.ok_or_else(|| {
+        anyhow::anyhow!("Pipeline not found for run {}", run_id)
+    })?;
+
+    println!("Pipeline Run: {}", run_id);
+    println!("  Pipeline: {}", pipeline.name);
+    println!("  Status: {:?}", run.status);
+    println!("  Trigger: {}", run.trigger_event.as_deref().unwrap_or("unknown"));
+
+    if let Some(started) = run.started_at {
+        println!("  Started: {}", started.format("%Y-%m-%d %H:%M:%S"));
+    }
+
+    if let Some(completed) = run.completed_at {
+        println!("  Completed: {}", completed.format("%Y-%m-%d %H:%M:%S"));
+        if let Some(started) = run.started_at {
+            let duration = completed - started;
+            println!("  Duration: {}s", duration.num_seconds());
+        }
+    }
+
+    // Show stages
+    let stages = db.list_pipeline_stages(run_id).await?;
+    if !stages.is_empty() {
+        println!("\nStages:");
+        for stage in stages {
+            let status_str = format!("{:?}", stage.status);
+            let agent_str = stage.agent_id.as_deref().unwrap_or("N/A");
+            println!("  - {}: {} (agent: {})", stage.stage_name, status_str, agent_str);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_pipeline_cancel(db: &Database, run_id: i64) -> Result<()> {
+    let mut run = db
+        .get_pipeline_run(run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline run not found: {}", run_id))?;
+
+    run.mark_cancelled();
+    db.update_pipeline_run(&run).await?;
+
+    println!("Pipeline run cancelled: {}", run_id);
+
+    Ok(())
+}
+
+async fn handle_pipeline_history(db: &Database, name: &str, limit: usize) -> Result<()> {
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    let mut runs = db.list_pipeline_runs(pipeline.id.unwrap()).await?;
+
+    // Sort by created_at descending (newest first)
+    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    // Limit results
+    let runs: Vec<_> = runs.into_iter().take(limit).collect();
+
+    if runs.is_empty() {
+        println!("No runs found for pipeline: {}", name);
+        return Ok(());
+    }
+
+    println!("Pipeline: {}", name);
+    println!("\n{:<10} {:<15} {:<20} {:<20} {:<10}", "RUN ID", "STATUS", "STARTED", "COMPLETED", "DURATION");
+    println!("{}", "-".repeat(90));
+
+    for run in runs {
+        let status = format!("{:?}", run.status);
+        let started = run
+            .started_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let completed = run
+            .completed_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        let duration = if let (Some(start), Some(end)) = (run.started_at, run.completed_at) {
+            format!("{}s", (end - start).num_seconds())
+        } else {
+            "-".to_string()
+        };
+
+        println!(
+            "{:<10} {:<15} {:<20} {:<20} {:<10}",
+            run.id.unwrap_or(0),
+            status,
+            started,
+            completed,
+            duration
+        );
+    }
+
+    Ok(())
+}
+
+fn handle_pipeline_init(
+    template: Option<&str>,
+    output: Option<&PathBuf>,
+    list: bool,
+    force: bool,
+) -> Result<()> {
+    use orchestrate_core::pipeline_template;
+    use std::fs;
+
+    // Handle --list flag
+    if list {
+        println!("Available pipeline templates:");
+        println!();
+
+        let templates = pipeline_template::get_templates();
+        let mut names: Vec<_> = templates.keys().collect();
+        names.sort();
+
+        for name in names {
+            let template = &templates[name];
+            println!("  {} - {}", name, template.description);
+        }
+
+        return Ok(());
+    }
+
+    // Template name is required if not listing
+    let template_name = template
+        .ok_or_else(|| anyhow::anyhow!("Template name required. Use --list to see available templates"))?;
+
+    // Get template
+    let template = pipeline_template::get_template(template_name)
+        .ok_or_else(|| anyhow::anyhow!("Template not found: {}. Use --list to see available templates", template_name))?;
+
+    // Determine output file
+    let output_file = if let Some(path) = output {
+        path.clone()
+    } else {
+        // Default: <template-name>-pipeline.yaml
+        PathBuf::from(format!("{}-pipeline.yaml", template_name))
+    };
+
+    // Check if file exists
+    if output_file.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "File already exists: {}. Use --force to overwrite",
+            output_file.display()
+        ));
+    }
+
+    // Write template to file
+    fs::write(&output_file, &template.yaml)?;
+
+    println!("Pipeline template '{}' initialized successfully!", template_name);
+    println!("  File: {}", output_file.display());
+    println!("  Description: {}", template.description);
+    println!();
+    println!("Next steps:");
+    println!("  1. Review and customize the pipeline definition");
+    println!("  2. Create the pipeline: orchestrate pipeline create {}", output_file.display());
+
+    Ok(())
+}
+
+// ==================== Approval Command Handlers ====================
+
+async fn handle_approval_list(db: &Database, pending_only: bool) -> Result<()> {
+    use orchestrate_core::ApprovalStatus;
+
+    let approvals = if pending_only {
+        db.list_pending_approvals().await?
+    } else {
+        // For now, just list pending. In the future, add a list_all_approvals method
+        db.list_pending_approvals().await?
+    };
+
+    if approvals.is_empty() {
+        println!("No approval requests found");
+        return Ok(());
+    }
+
+    println!("{:<10} {:<10} {:<15} {:<30} {:<20}", "ID", "RUN ID", "STATUS", "APPROVERS", "CREATED");
+    println!("{}", "-".repeat(95));
+
+    for approval in approvals {
+        let status = format!("{:?}", approval.status);
+        let approvers = &approval.required_approvers;
+        let created = approval.created_at.format("%Y-%m-%d %H:%M:%S");
+
+        println!(
+            "{:<10} {:<10} {:<15} {:<30} {:<20}",
+            approval.id.unwrap_or(0),
+            approval.run_id,
+            status,
+            approvers,
+            created
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_approval_approve(db: &Database, id: i64, comment: Option<&str>) -> Result<()> {
+    use orchestrate_core::ApprovalDecision;
+
+    // Get approval request
+    let mut approval = db
+        .get_approval_request(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Approval request not found: {}", id))?;
+
+    // Get current user (for now, use a placeholder)
+    let approver = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    // Create decision
+    let decision = ApprovalDecision::new(id, approver.clone(), true, comment.map(String::from));
+    db.create_approval_decision(decision).await?;
+
+    // Update approval count
+    approval.approval_count += 1;
+
+    // Check if quorum reached
+    if approval.has_approval_quorum() {
+        approval.mark_approved();
+        println!("Approval request {} APPROVED by {}", id, approver);
+        println!("  Quorum reached: {}/{}", approval.approval_count, approval.required_count);
+    } else {
+        println!("Approval recorded from {}", approver);
+        println!("  Progress: {}/{}", approval.approval_count, approval.required_count);
+    }
+
+    db.update_approval_request(&approval).await?;
+
+    Ok(())
+}
+
+async fn handle_approval_reject(db: &Database, id: i64, reason: Option<&str>) -> Result<()> {
+    use orchestrate_core::ApprovalDecision;
+
+    // Get approval request
+    let mut approval = db
+        .get_approval_request(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Approval request not found: {}", id))?;
+
+    // Get current user
+    let approver = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    // Create decision
+    let decision = ApprovalDecision::new(id, approver.clone(), false, reason.map(String::from));
+    db.create_approval_decision(decision).await?;
+
+    // Update rejection count
+    approval.rejection_count += 1;
+
+    // Check if rejection quorum reached
+    if approval.has_rejection_quorum() {
+        approval.mark_rejected();
+        println!("Approval request {} REJECTED by {}", id, approver);
+        if let Some(r) = reason {
+            println!("  Reason: {}", r);
+        }
+    } else {
+        println!("Rejection recorded from {}", approver);
+        println!("  Rejections: {}", approval.rejection_count);
+    }
+
+    db.update_approval_request(&approval).await?;
+
+    Ok(())
+}
+
+async fn handle_approval_delegate(db: &Database, id: i64, to: &str) -> Result<()> {
+    // Get approval request
+    let mut approval = db
+        .get_approval_request(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Approval request not found: {}", id))?;
+
+    // Update approvers list
+    approval.required_approvers = to.to_string();
+    approval.mark_delegated();
+
+    db.update_approval_request(&approval).await?;
+
+    println!("Approval request {} delegated to {}", id, to);
+
+    Ok(())
+}
+

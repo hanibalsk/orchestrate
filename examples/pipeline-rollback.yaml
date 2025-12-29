@@ -1,0 +1,69 @@
+name: deployment-with-rollback
+description: Deployment pipeline with automatic rollback on smoke test failure
+version: 1
+
+triggers:
+  - event: pull_request.merged
+    branches: [main]
+
+variables:
+  staging_environment: staging
+  production_environment: production
+
+stages:
+  # Build stage - runs tests and builds artifacts
+  - name: build
+    agent: builder
+    task: "Build application artifacts"
+    timeout: 15m
+    on_failure: halt
+
+  # Deploy to staging
+  - name: deploy-staging
+    agent: deployer
+    task: "Deploy to ${staging_environment}"
+    environment: staging
+    depends_on: [build]
+    on_failure: halt
+
+  # Run smoke tests on staging - rollback on failure
+  - name: smoke-test-staging
+    agent: smoke-tester
+    task: "Run smoke tests on ${staging_environment}"
+    depends_on: [deploy-staging]
+    on_failure: rollback
+    rollback_to: deploy-staging
+    timeout: 10m
+
+  # Integration tests
+  - name: integration-test
+    agent: integration-tester
+    task: "Run integration tests"
+    depends_on: [smoke-test-staging]
+    on_failure: halt
+
+  # Deploy to production with approval gate
+  - name: deploy-production
+    agent: deployer
+    task: "Deploy to ${production_environment}"
+    environment: production
+    depends_on: [integration-test]
+    requires_approval: true
+    approvers: [team-lead, devops-lead]
+    on_failure: halt
+
+  # Production smoke tests - rollback on failure
+  - name: smoke-test-production
+    agent: smoke-tester
+    task: "Run smoke tests on ${production_environment}"
+    depends_on: [deploy-production]
+    on_failure: rollback
+    rollback_to: deploy-production
+    timeout: 10m
+
+  # Final health check
+  - name: health-check
+    agent: monitor
+    task: "Verify production health metrics"
+    depends_on: [smoke-test-production]
+    on_failure: continue

@@ -1,0 +1,44 @@
+name: ci-pipeline
+description: Continuous integration pipeline for pull requests
+version: 1
+
+triggers:
+  - event: pull_request.opened
+    branches: [main, develop]
+  - event: pull_request.synchronize
+    branches: [main, develop]
+
+stages:
+  - name: lint
+    agent: linter
+    task: Run code linting and formatting checks
+    timeout: 5m
+    on_failure: halt
+
+  - name: test-unit
+    agent: unit-tester
+    task: Run unit tests
+    timeout: 15m
+    parallel_with: lint
+    on_failure: halt
+
+  - name: test-integration
+    agent: integration-tester
+    task: Run integration tests
+    timeout: 30m
+    depends_on: [lint, test-unit]
+    on_failure: halt
+
+  - name: security-scan
+    agent: security-scanner
+    task: Run security vulnerability scan
+    timeout: 10m
+    depends_on: [lint, test-unit]
+    on_failure: continue
+
+  - name: build
+    agent: builder
+    task: Build application artifacts
+    timeout: 20m
+    depends_on: [test-integration, security-scan]
+    on_failure: halt

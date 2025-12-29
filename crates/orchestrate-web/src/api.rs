@@ -6,13 +6,14 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post},
     Json, Router,
 };
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CustomInstruction, Database, InstructionEffectiveness,
-    InstructionScope, InstructionSource, LearningEngine, LearningPattern, PatternStatus,
-    Schedule, ScheduleRun,
+    Agent, AgentState, AgentType, ApprovalDecision, ApprovalRequest, ApprovalService,
+    ApprovalStatus, CustomInstruction, Database, InstructionEffectiveness, InstructionScope,
+    InstructionSource, LearningEngine, LearningPattern, PatternStatus, Pipeline, PipelineRun,
+    PipelineRunStatus, PipelineStage, Schedule, ScheduleRun,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -166,6 +167,26 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/patterns/:id/reject", post(reject_pattern))
         .route("/api/learning/process", post(process_patterns))
         .route("/api/learning/cleanup", post(cleanup_instructions))
+        // Pipeline routes
+        .route(
+            "/api/pipelines",
+            get(list_pipelines).post(create_pipeline),
+        )
+        .route(
+            "/api/pipelines/:name",
+            get(get_pipeline)
+                .put(update_pipeline)
+                .delete(delete_pipeline),
+        )
+        .route("/api/pipelines/:name/run", post(trigger_pipeline_run))
+        .route("/api/pipelines/:name/runs", get(list_pipeline_runs))
+        .route("/api/pipeline-runs/:id", get(get_pipeline_run))
+        .route("/api/pipeline-runs/:id/cancel", post(cancel_pipeline_run))
+        .route("/api/pipeline-runs/:id/stages", get(list_pipeline_stages))
+        // Approval routes
+        .route("/api/approvals", get(list_pending_approvals))
+        .route("/api/approvals/:id/approve", post(approve_approval))
+        .route("/api/approvals/:id/reject", post(reject_approval))
         // Schedule routes
         .route("/api/schedules", get(list_schedules).post(create_schedule))
         .route(
@@ -770,221 +791,286 @@ async fn cleanup_instructions(
     }))
 }
 
-// ==================== Schedule Handlers ====================
+// ==================== Pipeline Handlers ====================
 
-async fn list_schedules(
+async fn list_pipelines(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<ScheduleResponse>>, ApiError> {
-    let schedules = state
+) -> Result<Json<Vec<PipelineResponse>>, ApiError> {
+    let pipelines = state
         .db
-        .list_schedules(false)
+        .list_pipelines()
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    Ok(Json(schedules.into_iter().map(Into::into).collect()))
+    Ok(Json(pipelines.into_iter().map(Into::into).collect()))
 }
 
-async fn get_schedule(
+async fn get_pipeline(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let schedule = state
+    Path(name): Path<String>,
+) -> Result<Json<PipelineResponse>, ApiError> {
+    let pipeline = state
         .db
-        .get_schedule(id)
+        .get_pipeline_by_name(&name)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
 
-    Ok(Json(schedule.into()))
+    Ok(Json(pipeline.into()))
 }
 
-async fn create_schedule(
+async fn create_pipeline(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateScheduleRequest>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
+    Json(req): Json<CreatePipelineRequest>,
+) -> Result<Json<PipelineResponse>, ApiError> {
     req.validate()?;
 
-    let mut schedule = Schedule::new(
-        req.name,
-        req.cron_expression,
-        req.agent_type,
-        req.task,
-    );
-
-    // Validate cron expression
-    schedule
-        .validate_cron()
-        .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
-
-    // Calculate next run
-    schedule
-        .update_next_run()
-        .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
-
+    let mut pipeline = Pipeline::new(req.name, req.definition);
     if let Some(enabled) = req.enabled {
-        schedule.enabled = enabled;
+        pipeline.enabled = enabled;
     }
 
     let id = state
         .db
-        .insert_schedule(&schedule)
+        .insert_pipeline(&pipeline)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    schedule.id = id;
-    Ok(Json(schedule.into()))
+    pipeline.id = Some(id);
+    Ok(Json(pipeline.into()))
 }
 
-async fn update_schedule(
+async fn update_pipeline(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Json(req): Json<UpdateScheduleRequest>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let mut schedule = state
+    Path(name): Path<String>,
+    Json(req): Json<UpdatePipelineRequest>,
+) -> Result<Json<PipelineResponse>, ApiError> {
+    let mut pipeline = state
         .db
-        .get_schedule(id)
+        .get_pipeline_by_name(&name)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
 
-    if let Some(name) = req.name {
-        schedule.name = name;
-    }
-    if let Some(cron_expression) = req.cron_expression {
-        schedule.cron_expression = cron_expression;
-        // Validate and recalculate next run
-        schedule
-            .validate_cron()
-            .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
-        schedule
-            .update_next_run()
-            .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
-    }
-    if let Some(agent_type) = req.agent_type {
-        schedule.agent_type = agent_type;
-    }
-    if let Some(task) = req.task {
-        schedule.task = task;
+    if let Some(definition) = req.definition {
+        pipeline.definition = definition;
     }
     if let Some(enabled) = req.enabled {
-        schedule.enabled = enabled;
+        pipeline.enabled = enabled;
     }
 
     state
         .db
-        .update_schedule(&schedule)
+        .update_pipeline(&pipeline)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    Ok(Json(schedule.into()))
+    Ok(Json(pipeline.into()))
 }
 
-async fn delete_schedule(
+async fn delete_pipeline(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
+    Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let deleted = state
+    let pipeline = state
         .db
-        .delete_schedule(id)
+        .get_pipeline_by_name(&name)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
+
+    let id = pipeline
+        .id
+        .ok_or_else(|| ApiError::internal("Pipeline missing ID"))?;
+
+    state
+        .db
+        .delete_pipeline(id)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    if !deleted {
-        return Err(ApiError::not_found("Schedule"));
-    }
 
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
-async fn pause_schedule(
+async fn trigger_pipeline_run(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let mut schedule = state
+    Path(name): Path<String>,
+    Json(req): Json<TriggerRunRequest>,
+) -> Result<Json<PipelineRunResponse>, ApiError> {
+    let pipeline = state
         .db
-        .get_schedule(id)
+        .get_pipeline_by_name(&name)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
 
-    schedule.enabled = false;
+    let pipeline_id = pipeline
+        .id
+        .ok_or_else(|| ApiError::internal("Pipeline missing ID"))?;
 
-    state
+    let mut run = PipelineRun::new(pipeline_id, req.trigger_event);
+    let run_id = state
         .db
-        .update_schedule(&schedule)
+        .insert_pipeline_run(&run)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    Ok(Json(schedule.into()))
+    run.id = Some(run_id);
+    Ok(Json(run.into()))
 }
 
-async fn resume_schedule(
+async fn list_pipeline_runs(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let mut schedule = state
+    Path(name): Path<String>,
+) -> Result<Json<Vec<PipelineRunResponse>>, ApiError> {
+    let pipeline = state
         .db
-        .get_schedule(id)
+        .get_pipeline_by_name(&name)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
 
-    schedule.enabled = true;
-
-    state
-        .db
-        .update_schedule(&schedule)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(schedule.into()))
-}
-
-async fn run_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<AgentResponse>, ApiError> {
-    let schedule = state
-        .db
-        .get_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
-
-    // Parse agent type
-    let agent_type = AgentType::from_str(&schedule.agent_type)
-        .map_err(|_| ApiError::bad_request(format!("Invalid agent type: {}", schedule.agent_type)))?;
-
-    // Create and insert agent
-    let agent = Agent::new(agent_type, schedule.task.clone());
-    state
-        .db
-        .insert_agent(&agent)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(agent.into()))
-}
-
-async fn get_schedule_runs(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Vec<ScheduleRunResponse>>, ApiError> {
-    // Verify schedule exists
-    let _ = state
-        .db
-        .get_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+    let pipeline_id = pipeline
+        .id
+        .ok_or_else(|| ApiError::internal("Pipeline missing ID"))?;
 
     let runs = state
         .db
-        .get_schedule_runs(id, 100)
+        .list_pipeline_runs(pipeline_id)
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
     Ok(Json(runs.into_iter().map(Into::into).collect()))
+}
+
+async fn get_pipeline_run(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<PipelineRunResponse>, ApiError> {
+    let run = state
+        .db
+        .get_pipeline_run(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pipeline run"))?;
+
+    Ok(Json(run.into()))
+}
+
+async fn cancel_pipeline_run(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<PipelineRunResponse>, ApiError> {
+    let mut run = state
+        .db
+        .get_pipeline_run(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Pipeline run"))?;
+
+    // Only allow cancelling runs that are pending, running, or waiting for approval
+    match run.status {
+        PipelineRunStatus::Pending
+        | PipelineRunStatus::Running
+        | PipelineRunStatus::WaitingApproval => {
+            run.mark_cancelled();
+            state
+                .db
+                .update_pipeline_run(&run)
+                .await
+                .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+            Ok(Json(run.into()))
+        }
+        _ => Err(ApiError::conflict(format!(
+            "Cannot cancel pipeline run in status: {}",
+            run.status.as_str()
+        ))),
+    }
+}
+
+async fn list_pipeline_stages(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<PipelineStageResponse>>, ApiError> {
+    let stages = state
+        .db
+        .list_pipeline_stages(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(stages.into_iter().map(|s| s.into()).collect()))
+}
+
+// ==================== Approval Handlers ====================
+
+async fn list_pending_approvals(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ApprovalResponse>>, ApiError> {
+    let approvals = state
+        .db
+        .list_pending_approvals()
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(approvals.into_iter().map(Into::into).collect()))
+}
+
+async fn approve_approval(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<ApprovalDecisionRequest>,
+) -> Result<Json<ApprovalResponse>, ApiError> {
+    req.validate()?;
+
+    let approval_service = ApprovalService::new(state.db.clone());
+
+    let approval = approval_service
+        .approve(id, req.approver.clone(), req.comment.clone())
+        .await
+        .map_err(|e| match e {
+            orchestrate_core::Error::Other(msg) if msg.contains("not found") => {
+                ApiError::not_found("Approval")
+            }
+            orchestrate_core::Error::Other(msg)
+                if msg.contains("not authorized") || msg.contains("not an authorized") => {
+                ApiError::bad_request(msg)
+            }
+            orchestrate_core::Error::Other(msg) if msg.contains("already resolved") || msg.contains("already submitted") => {
+                ApiError::conflict(msg)
+            }
+            _ => ApiError::internal(format!("Approval error: {}", e)),
+        })?;
+
+    Ok(Json(approval.into()))
+}
+
+async fn reject_approval(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<ApprovalDecisionRequest>,
+) -> Result<Json<ApprovalResponse>, ApiError> {
+    req.validate()?;
+
+    let approval_service = ApprovalService::new(state.db.clone());
+
+    let approval = approval_service
+        .reject(id, req.approver.clone(), req.comment.clone())
+        .await
+        .map_err(|e| match e {
+            orchestrate_core::Error::Other(msg) if msg.contains("not found") => {
+                ApiError::not_found("Approval")
+            }
+            orchestrate_core::Error::Other(msg)
+                if msg.contains("not authorized") || msg.contains("not an authorized") => {
+                ApiError::bad_request(msg)
+            }
+            orchestrate_core::Error::Other(msg) if msg.contains("already resolved") || msg.contains("already submitted") => {
+                ApiError::conflict(msg)
+            }
+            _ => ApiError::internal(format!("Approval error: {}", e)),
+        })?;
+
+    Ok(Json(approval.into()))
 }
 
 // ==================== Request/Response Types ====================
@@ -1243,37 +1329,397 @@ pub struct CleanupResponse {
     pub deleted_names: Vec<String>,
 }
 
+// ==================== Pipeline Request/Response Types ====================
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePipelineRequest {
+    pub name: String,
+    pub definition: String,
+    pub enabled: Option<bool>,
+}
+
+impl CreatePipelineRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.name.trim().is_empty() {
+            return Err(ApiError::validation("Pipeline name cannot be empty"));
+        }
+        if self.name.len() > 255 {
+            return Err(ApiError::validation(
+                "Pipeline name exceeds maximum length of 255 characters",
+            ));
+        }
+        if self.definition.trim().is_empty() {
+            return Err(ApiError::validation("Pipeline definition cannot be empty"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePipelineRequest {
+    pub definition: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PipelineResponse {
+    pub id: i64,
+    pub name: String,
+    pub definition: String,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+impl From<Pipeline> for PipelineResponse {
+    fn from(pipeline: Pipeline) -> Self {
+        Self {
+            id: pipeline.id.unwrap_or(0),
+            name: pipeline.name,
+            definition: pipeline.definition,
+            enabled: pipeline.enabled,
+            created_at: pipeline.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TriggerRunRequest {
+    pub trigger_event: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PipelineRunResponse {
+    pub id: i64,
+    pub pipeline_id: i64,
+    pub status: String,
+    pub trigger_event: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+}
+
+impl From<PipelineRun> for PipelineRunResponse {
+    fn from(run: PipelineRun) -> Self {
+        Self {
+            id: run.id.unwrap_or(0),
+            pipeline_id: run.pipeline_id,
+            status: run.status.as_str().to_string(),
+            trigger_event: run.trigger_event,
+            started_at: run.started_at.map(|dt| dt.to_rfc3339()),
+            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
+            created_at: run.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PipelineStageResponse {
+    pub id: i64,
+    pub run_id: i64,
+    pub stage_name: String,
+    pub status: String,
+    pub agent_id: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+}
+
+impl From<PipelineStage> for PipelineStageResponse {
+    fn from(stage: PipelineStage) -> Self {
+        Self {
+            id: stage.id.unwrap_or(0),
+            run_id: stage.run_id,
+            stage_name: stage.stage_name,
+            status: stage.status.as_str().to_string(),
+            agent_id: stage.agent_id,
+            started_at: stage.started_at.map(|dt| dt.to_rfc3339()),
+            completed_at: stage.completed_at.map(|dt| dt.to_rfc3339()),
+            created_at: stage.created_at.to_rfc3339(),
+        }
+    }
+}
+
+// ==================== Approval Request/Response Types ====================
+
+#[derive(Debug, Deserialize)]
+pub struct ApprovalDecisionRequest {
+    pub approver: String,
+    pub comment: Option<String>,
+}
+
+impl ApprovalDecisionRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.approver.trim().is_empty() {
+            return Err(ApiError::validation("Approver cannot be empty"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApprovalResponse {
+    pub id: i64,
+    pub stage_id: i64,
+    pub run_id: i64,
+    pub status: String,
+    pub required_approvers: String,
+    pub required_count: i32,
+    pub approval_count: i32,
+    pub rejection_count: i32,
+    pub timeout_seconds: Option<i64>,
+    pub timeout_action: Option<String>,
+    pub timeout_at: Option<String>,
+    pub resolved_at: Option<String>,
+    pub created_at: String,
+}
+
+impl From<ApprovalRequest> for ApprovalResponse {
+    fn from(req: ApprovalRequest) -> Self {
+        Self {
+            id: req.id.unwrap_or(0),
+            stage_id: req.stage_id,
+            run_id: req.run_id,
+            status: req.status.as_str().to_string(),
+            required_approvers: req.required_approvers,
+            required_count: req.required_count,
+            approval_count: req.approval_count,
+            rejection_count: req.rejection_count,
+            timeout_seconds: req.timeout_seconds,
+            timeout_action: req.timeout_action,
+            timeout_at: req.timeout_at.map(|dt| dt.to_rfc3339()),
+            resolved_at: req.resolved_at.map(|dt| dt.to_rfc3339()),
+            created_at: req.created_at.to_rfc3339(),
+        }
+    }
+}
+
+// ==================== Schedule Handlers ====================
+
+async fn list_schedules(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ScheduleResponse>>, ApiError> {
+    let schedules = state
+        .db
+        .list_schedules(false)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedules.into_iter().map(Into::into).collect()))
+}
+
+async fn get_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn create_schedule(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateScheduleRequest>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    req.validate()?;
+
+    let mut schedule = Schedule::new(
+        req.name,
+        req.cron_expression,
+        req.agent_type,
+        req.task,
+    );
+
+    schedule
+        .validate_cron()
+        .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
+
+    schedule
+        .update_next_run()
+        .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
+
+    if let Some(enabled) = req.enabled {
+        schedule.enabled = enabled;
+    }
+
+    let id = state
+        .db
+        .insert_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    schedule.id = id;
+    Ok(Json(schedule.into()))
+}
+
+async fn update_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateScheduleRequest>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let mut schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    if let Some(name) = req.name {
+        schedule.name = name;
+    }
+    if let Some(cron_expression) = req.cron_expression {
+        schedule.cron_expression = cron_expression;
+        schedule
+            .validate_cron()
+            .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
+        schedule
+            .update_next_run()
+            .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
+    }
+    if let Some(agent_type) = req.agent_type {
+        schedule.agent_type = agent_type;
+    }
+    if let Some(task) = req.task {
+        schedule.task = task;
+    }
+    if let Some(enabled) = req.enabled {
+        schedule.enabled = enabled;
+    }
+
+    state
+        .db
+        .update_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn delete_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .db
+        .delete_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pause_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let mut schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    schedule.enabled = false;
+    state
+        .db
+        .update_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn resume_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScheduleResponse>, ApiError> {
+    let mut schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    schedule.enabled = true;
+    state
+        .db
+        .update_schedule(&schedule)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(schedule.into()))
+}
+
+async fn run_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScheduleRunResponse>, ApiError> {
+    let schedule = state
+        .db
+        .get_schedule(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Schedule"))?;
+
+    let run = ScheduleRun::new(schedule.id, "manual");
+    let run_id = state
+        .db
+        .insert_schedule_run(&run)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let run = state
+        .db
+        .get_schedule_run(run_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::internal("Failed to retrieve created run".to_string()))?;
+
+    Ok(Json(run.into()))
+}
+
+async fn get_schedule_runs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<ScheduleRunResponse>>, ApiError> {
+    let runs = state
+        .db
+        .get_schedule_runs(id, 50)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(runs.into_iter().map(Into::into).collect()))
+}
+
 // ==================== Schedule Request/Response Types ====================
 
 #[derive(Debug, Deserialize)]
-pub struct CreateScheduleRequest {
-    pub name: String,
-    pub cron_expression: String,
-    pub agent_type: String,
-    pub task: String,
-    pub enabled: Option<bool>,
+struct CreateScheduleRequest {
+    name: String,
+    cron_expression: String,
+    agent_type: String,
+    task: String,
+    enabled: Option<bool>,
 }
 
 impl CreateScheduleRequest {
     fn validate(&self) -> Result<(), ApiError> {
-        if self.name.trim().is_empty() {
-            return Err(ApiError::validation("Name cannot be empty"));
+        if self.name.is_empty() || self.name.len() > 255 {
+            return Err(ApiError::validation("Name must be 1-255 characters"));
         }
-        if self.cron_expression.trim().is_empty() {
-            return Err(ApiError::validation("Cron expression cannot be empty"));
+        if self.cron_expression.is_empty() {
+            return Err(ApiError::validation("Cron expression is required"));
         }
-        if self.agent_type.trim().is_empty() {
-            return Err(ApiError::validation("Agent type cannot be empty"));
+        if self.agent_type.is_empty() {
+            return Err(ApiError::validation("Agent type is required"));
         }
-        if self.task.trim().is_empty() {
-            return Err(ApiError::validation("Task cannot be empty"));
-        }
-        if self.name.len() > 255 {
-            return Err(ApiError::validation("Name exceeds maximum length of 255 characters"));
-        }
-        if self.task.len() > MAX_TASK_LENGTH {
+        if self.task.is_empty() || self.task.len() > MAX_TASK_LENGTH {
             return Err(ApiError::validation(format!(
-                "Task exceeds maximum length of {} characters",
+                "Task must be 1-{} characters",
                 MAX_TASK_LENGTH
             )));
         }
@@ -1282,25 +1728,26 @@ impl CreateScheduleRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct UpdateScheduleRequest {
-    pub name: Option<String>,
-    pub cron_expression: Option<String>,
-    pub agent_type: Option<String>,
-    pub task: Option<String>,
-    pub enabled: Option<bool>,
+struct UpdateScheduleRequest {
+    name: Option<String>,
+    cron_expression: Option<String>,
+    agent_type: Option<String>,
+    task: Option<String>,
+    enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ScheduleResponse {
-    pub id: i64,
-    pub name: String,
-    pub cron_expression: String,
-    pub agent_type: String,
-    pub task: String,
-    pub enabled: bool,
-    pub last_run: Option<String>,
-    pub next_run: Option<String>,
-    pub created_at: String,
+#[derive(Debug, Serialize)]
+struct ScheduleResponse {
+    id: i64,
+    name: String,
+    cron_expression: String,
+    agent_type: String,
+    task: String,
+    enabled: bool,
+    next_run_at: Option<String>,
+    last_run_at: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 impl From<Schedule> for ScheduleResponse {
@@ -1312,22 +1759,25 @@ impl From<Schedule> for ScheduleResponse {
             agent_type: schedule.agent_type,
             task: schedule.task,
             enabled: schedule.enabled,
-            last_run: schedule.last_run.map(|dt| dt.to_rfc3339()),
-            next_run: schedule.next_run.map(|dt| dt.to_rfc3339()),
+            next_run_at: schedule.next_run_at.map(|dt| dt.to_rfc3339()),
+            last_run_at: schedule.last_run_at.map(|dt| dt.to_rfc3339()),
             created_at: schedule.created_at.to_rfc3339(),
+            updated_at: schedule.updated_at.to_rfc3339(),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ScheduleRunResponse {
-    pub id: i64,
-    pub schedule_id: i64,
-    pub agent_id: Option<String>,
-    pub started_at: String,
-    pub completed_at: Option<String>,
-    pub status: String,
-    pub error_message: Option<String>,
+#[derive(Debug, Serialize)]
+struct ScheduleRunResponse {
+    id: i64,
+    schedule_id: i64,
+    status: String,
+    trigger_type: String,
+    agent_id: Option<String>,
+    error_message: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: String,
 }
 
 impl From<ScheduleRun> for ScheduleRunResponse {
@@ -1335,11 +1785,13 @@ impl From<ScheduleRun> for ScheduleRunResponse {
         Self {
             id: run.id,
             schedule_id: run.schedule_id,
-            agent_id: run.agent_id,
-            started_at: run.started_at.to_rfc3339(),
-            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
             status: run.status.as_str().to_string(),
+            trigger_type: run.trigger_type,
+            agent_id: run.agent_id.map(|id| id.to_string()),
             error_message: run.error_message,
+            started_at: run.started_at.map(|dt| dt.to_rfc3339()),
+            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
+            created_at: run.created_at.to_rfc3339(),
         }
     }
 }
@@ -2108,10 +2560,10 @@ mod tests {
         assert_eq!(response.content, "Hello");
     }
 
-    // ==================== Schedule Tests ====================
+    // ==================== Pipeline CRUD Tests ====================
 
     #[tokio::test]
-    async fn test_list_schedules_empty() {
+    async fn test_list_pipelines_empty() {
         let test_app = setup_app().await;
 
         let response = test_app
@@ -2119,7 +2571,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
-                    .uri("/api/schedules")
+                    .uri("/api/pipelines")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2129,12 +2581,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = body_to_string(response.into_body()).await;
-        let schedules: Vec<ScheduleResponse> = serde_json::from_str(&body).unwrap();
-        assert!(schedules.is_empty());
+        let pipelines: Vec<PipelineResponse> = serde_json::from_str(&body).unwrap();
+        assert!(pipelines.is_empty());
     }
 
     #[tokio::test]
-    async fn test_create_schedule_success() {
+    async fn test_create_pipeline_success() {
         let test_app = setup_app().await;
 
         let response = test_app
@@ -2142,10 +2594,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/schedules")
+                    .uri("/api/pipelines")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"name":"daily-backup","cron_expression":"0 2 * * *","agent_type":"story_developer","task":"Run backup"}"#,
+                        r#"{"name":"test-pipeline","definition":"name: test\nstages: []"}"#,
                     ))
                     .unwrap(),
             )
@@ -2155,17 +2607,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = body_to_string(response.into_body()).await;
-        let schedule: ScheduleResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(schedule.name, "daily-backup");
-        assert_eq!(schedule.cron_expression, "0 2 * * *");
-        assert_eq!(schedule.agent_type, "story_developer");
-        assert_eq!(schedule.task, "Run backup");
-        assert!(schedule.enabled);
-        assert!(schedule.next_run.is_some());
+        let pipeline: PipelineResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(pipeline.name, "test-pipeline");
+        assert!(pipeline.enabled);
+        assert!(pipeline.id > 0);
     }
 
     #[tokio::test]
-    async fn test_create_schedule_invalid_cron() {
+    async fn test_create_pipeline_empty_name_fails() {
         let test_app = setup_app().await;
 
         let response = test_app
@@ -2173,37 +2622,9 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/schedules")
+                    .uri("/api/pipelines")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"name":"bad-schedule","cron_expression":"invalid","agent_type":"story_developer","task":"Test"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let body = body_to_string(response.into_body()).await;
-        let error: ApiError = serde_json::from_str(&body).unwrap();
-        assert_eq!(error.code, "validation_error");
-    }
-
-    #[tokio::test]
-    async fn test_create_schedule_empty_name() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/schedules")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"name":"","cron_expression":"0 2 * * *","agent_type":"story_developer","task":"Test"}"#,
-                    ))
+                    .body(Body::from(r#"{"name":"","definition":"test"}"#))
                     .unwrap(),
             )
             .await
@@ -2213,25 +2634,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_schedule_success() {
+    async fn test_create_pipeline_empty_definition_fails() {
         let test_app = setup_app().await;
 
-        // Create schedule directly in DB
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pipelines")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"test","definition":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_pipeline_long_name_fails() {
+        let test_app = setup_app().await;
+
+        let long_name = "x".repeat(256);
+        let body = format!(r#"{{"name":"{}","definition":"test"}}"#, long_name);
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pipelines")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_pipeline_success() {
+        let test_app = setup_app().await;
+
+        // Create pipeline directly in DB
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "name: test".to_string());
+        let id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+        assert!(id > 0);
 
         let response = test_app
             .router
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
-                    .uri(format!("/api/schedules/{}", id))
+                    .uri("/api/pipelines/test-pipeline")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2241,13 +2700,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = body_to_string(response.into_body()).await;
-        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.id, id);
-        assert_eq!(resp.name, "test-schedule");
+        let resp: PipelineResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.name, "test-pipeline");
+        assert_eq!(resp.definition, "name: test");
     }
 
     #[tokio::test]
-    async fn test_get_schedule_not_found() {
+    async fn test_get_pipeline_not_found() {
         let test_app = setup_app().await;
 
         let response = test_app
@@ -2255,7 +2714,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
-                    .uri("/api/schedules/999")
+                    .uri("/api/pipelines/nonexistent")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2266,27 +2725,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_schedule_success() {
+    async fn test_update_pipeline_success() {
         let test_app = setup_app().await;
 
-        // Create schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Original task".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+        // Create pipeline
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "old definition".to_string());
+        test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
 
         let response = test_app
             .router
             .oneshot(
                 Request::builder()
                     .method(Method::PUT)
-                    .uri(format!("/api/schedules/{}", id))
+                    .uri("/api/pipelines/test-pipeline")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"task":"Updated task"}"#))
+                    .body(Body::from(
+                        r#"{"definition":"new definition","enabled":false}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2295,181 +2750,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = body_to_string(response.into_body()).await;
-        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.task, "Updated task");
-        assert_eq!(resp.name, "test-schedule"); // Unchanged
-    }
-
-    #[tokio::test]
-    async fn test_update_schedule_cron_expression() {
-        let test_app = setup_app().await;
-
-        // Create schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::PUT)
-                    .uri(format!("/api/schedules/{}", id))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"cron_expression":"@hourly"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.cron_expression, "@hourly");
-    }
-
-    #[tokio::test]
-    async fn test_update_schedule_invalid_cron() {
-        let test_app = setup_app().await;
-
-        // Create schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::PUT)
-                    .uri(format!("/api/schedules/{}", id))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"cron_expression":"invalid"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_delete_schedule_success() {
-        let test_app = setup_app().await;
-
-        // Create schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::DELETE)
-                    .uri(format!("/api/schedules/{}", id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // Verify it's deleted
-        let schedule = test_app.state.db.get_schedule(id).await.unwrap();
-        assert!(schedule.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_delete_schedule_not_found() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::DELETE)
-                    .uri("/api/schedules/999")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_pause_schedule() {
-        let test_app = setup_app().await;
-
-        // Create enabled schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/schedules/{}/pause", id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
+        let resp: PipelineResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.definition, "new definition");
         assert!(!resp.enabled);
     }
 
     #[tokio::test]
-    async fn test_resume_schedule() {
+    async fn test_delete_pipeline_success() {
         let test_app = setup_app().await;
 
-        // Create disabled schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
-        );
-        schedule.enabled = false;
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
+        // Create pipeline
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
 
         let response = test_app
             .router
             .oneshot(
                 Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/schedules/{}/resume", id))
+                    .method(Method::DELETE)
+                    .uri("/api/pipelines/test-pipeline")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2478,88 +2777,26 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = body_to_string(response.into_body()).await;
-        let resp: ScheduleResponse = serde_json::from_str(&body).unwrap();
-        assert!(resp.enabled);
-    }
-
-    #[tokio::test]
-    async fn test_run_schedule_immediately() {
-        let test_app = setup_app().await;
-
-        // Create schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task for immediate run".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/schedules/{}/run", id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+        // Verify deleted
+        let deleted = test_app
+            .state
+            .db
+            .get_pipeline_by_name("test-pipeline")
             .await
             .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let agent: AgentResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(agent.task, "Test task for immediate run");
-        assert_eq!(agent.agent_type, AgentType::StoryDeveloper);
+        assert!(deleted.is_none());
     }
 
     #[tokio::test]
-    async fn test_get_schedule_runs_empty() {
-        let test_app = setup_app().await;
-
-        // Create schedule
-        let mut schedule = Schedule::new(
-            "test-schedule".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
-        );
-        schedule.update_next_run().unwrap();
-        let id = test_app.state.db.insert_schedule(&schedule).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/api/schedules/{}/runs", id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let runs: Vec<ScheduleRunResponse> = serde_json::from_str(&body).unwrap();
-        assert!(runs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_get_schedule_runs_not_found() {
+    async fn test_delete_pipeline_not_found() {
         let test_app = setup_app().await;
 
         let response = test_app
             .router
             .oneshot(
                 Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/schedules/999/runs")
+                    .method(Method::DELETE)
+                    .uri("/api/pipelines/nonexistent")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2569,21 +2806,687 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[test]
-    fn test_schedule_response_from_schedule() {
-        let mut schedule = Schedule::new(
-            "test".to_string(),
-            "@daily".to_string(),
-            "story_developer".to_string(),
-            "Test task".to_string(),
+    // ==================== Pipeline Run Tests ====================
+
+    #[tokio::test]
+    async fn test_trigger_pipeline_run_success() {
+        let test_app = setup_app().await;
+
+        // Create pipeline
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pipelines/test-pipeline/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"trigger_event":"manual"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let run: PipelineRunResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(run.status, "pending");
+        assert_eq!(run.trigger_event, Some("manual".to_string()));
+        assert!(run.id > 0);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_pipeline_run_nonexistent_pipeline() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/pipelines/nonexistent/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_pipeline_runs_success() {
+        let test_app = setup_app().await;
+
+        // Create pipeline and runs
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let run1 = PipelineRun::new(pipeline_id, Some("event1".to_string()));
+        test_app.state.db.insert_pipeline_run(&run1).await.unwrap();
+
+        let run2 = PipelineRun::new(pipeline_id, Some("event2".to_string()));
+        test_app.state.db.insert_pipeline_run(&run2).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/pipelines/test-pipeline/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let runs: Vec<PipelineRunResponse> = serde_json::from_str(&body).unwrap();
+        assert_eq!(runs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_pipeline_run_success() {
+        let test_app = setup_app().await;
+
+        // Create pipeline and run
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let run = PipelineRun::new(pipeline_id, Some("test-event".to_string()));
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/pipeline-runs/{}", run_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: PipelineRunResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.id, run_id);
+        assert_eq!(resp.trigger_event, Some("test-event".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_pipeline_run_not_found() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/pipeline-runs/99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pipeline_run_pending() {
+        let test_app = setup_app().await;
+
+        // Create pipeline and pending run
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/pipeline-runs/{}/cancel", run_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: PipelineRunResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pipeline_run_running() {
+        let test_app = setup_app().await;
+
+        // Create pipeline and running run
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let mut run = PipelineRun::new(pipeline_id, None);
+        run.mark_running();
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/pipeline-runs/{}/cancel", run_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: PipelineRunResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pipeline_run_already_completed() {
+        let test_app = setup_app().await;
+
+        // Create pipeline and completed run
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let mut run = PipelineRun::new(pipeline_id, None);
+        run.mark_succeeded();
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/pipeline-runs/{}/cancel", run_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_list_pipeline_stages() {
+        let test_app = setup_app().await;
+
+        // Create pipeline and run
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+
+        // Create stages
+        let stage1 = PipelineStage::new(run_id, "build".to_string());
+        let stage2 = PipelineStage::new(run_id, "test".to_string());
+        test_app.state.db.insert_pipeline_stage(&stage1).await.unwrap();
+        test_app.state.db.insert_pipeline_stage(&stage2).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/pipeline-runs/{}/stages", run_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let stages: Vec<PipelineStageResponse> = serde_json::from_str(&body).unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].stage_name, "build");
+        assert_eq!(stages[1].stage_name, "test");
+    }
+
+    // ==================== Approval Tests ====================
+
+    #[tokio::test]
+    async fn test_list_pending_approvals_empty() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/approvals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let approvals: Vec<ApprovalResponse> = serde_json::from_str(&body).unwrap();
+        assert!(approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_pending_approvals_with_data() {
+        let test_app = setup_app().await;
+
+        // Create pipeline, run, and stage first
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+        let stage = PipelineStage::new(run_id, "deploy".to_string());
+        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
+
+        // Create approval request
+        let approval = ApprovalRequest::new(
+            stage_id,
+            run_id,
+            "user1@example.com".to_string(),
+            1,
+            None,
+            None,
         );
-        schedule.id = 42;
-        let response: ScheduleResponse = schedule.clone().into();
+        test_app
+            .state
+            .db
+            .create_approval_request(approval)
+            .await
+            .unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/approvals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let approvals: Vec<ApprovalResponse> = serde_json::from_str(&body).unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].status, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_approve_approval_success() {
+        let test_app = setup_app().await;
+
+        // Create pipeline, run, and stage first
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+        let stage = PipelineStage::new(run_id, "deploy".to_string());
+        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
+
+        // Create approval request
+        let approval = ApprovalRequest::new(
+            stage_id,
+            run_id,
+            "user1@example.com".to_string(),
+            1,
+            None,
+            None,
+        );
+        let created = test_app
+            .state
+            .db
+            .create_approval_request(approval)
+            .await
+            .unwrap();
+        let approval_id = created.id.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/approvals/{}/approve", approval_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"approver":"user1@example.com","comment":"LGTM"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: ApprovalResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.status, "approved");
+        assert_eq!(resp.approval_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_approve_approval_empty_approver_fails() {
+        let test_app = setup_app().await;
+
+        // Create pipeline, run, and stage first
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+        let stage = PipelineStage::new(run_id, "deploy".to_string());
+        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
+
+        // Create approval request
+        let approval = ApprovalRequest::new(
+            stage_id,
+            run_id,
+            "user1@example.com".to_string(),
+            1,
+            None,
+            None,
+        );
+        let created = test_app
+            .state
+            .db
+            .create_approval_request(approval)
+            .await
+            .unwrap();
+        let approval_id = created.id.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/approvals/{}/approve", approval_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approver":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_approve_approval_unauthorized_approver() {
+        let test_app = setup_app().await;
+
+        // Create pipeline, run, and stage first
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+        let stage = PipelineStage::new(run_id, "deploy".to_string());
+        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
+
+        // Create approval request requiring user1
+        let approval = ApprovalRequest::new(
+            stage_id,
+            run_id,
+            "user1@example.com".to_string(),
+            1,
+            None,
+            None,
+        );
+        let created = test_app
+            .state
+            .db
+            .create_approval_request(approval)
+            .await
+            .unwrap();
+        let approval_id = created.id.unwrap();
+
+        // Try to approve as user2
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/approvals/{}/approve", approval_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approver":"user2@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_reject_approval_success() {
+        let test_app = setup_app().await;
+
+        // Create pipeline, run, and stage first
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+        let stage = PipelineStage::new(run_id, "deploy".to_string());
+        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
+
+        // Create approval request
+        let approval = ApprovalRequest::new(
+            stage_id,
+            run_id,
+            "user1@example.com".to_string(),
+            1,
+            None,
+            None,
+        );
+        let created = test_app
+            .state
+            .db
+            .create_approval_request(approval)
+            .await
+            .unwrap();
+        let approval_id = created.id.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/approvals/{}/reject", approval_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"approver":"user1@example.com","comment":"Not ready"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let resp: ApprovalResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.status, "rejected");
+        assert_eq!(resp.rejection_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_approve_approval_not_found() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/approvals/99999/approve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approver":"user@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_reject_approval_not_found() {
+        let test_app = setup_app().await;
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/approvals/99999/reject")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"approver":"user@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ==================== Request Validation Tests ====================
+
+    #[test]
+    fn test_create_pipeline_request_validation() {
+        // Valid request
+        let valid = CreatePipelineRequest {
+            name: "test".to_string(),
+            definition: "definition".to_string(),
+            enabled: Some(true),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Empty name
+        let empty_name = CreatePipelineRequest {
+            name: "".to_string(),
+            definition: "definition".to_string(),
+            enabled: None,
+        };
+        assert!(empty_name.validate().is_err());
+
+        // Empty definition
+        let empty_def = CreatePipelineRequest {
+            name: "test".to_string(),
+            definition: "".to_string(),
+            enabled: None,
+        };
+        assert!(empty_def.validate().is_err());
+
+        // Name too long
+        let long_name = CreatePipelineRequest {
+            name: "x".repeat(256),
+            definition: "definition".to_string(),
+            enabled: None,
+        };
+        assert!(long_name.validate().is_err());
+    }
+
+    #[test]
+    fn test_approval_decision_request_validation() {
+        // Valid request
+        let valid = ApprovalDecisionRequest {
+            approver: "user@example.com".to_string(),
+            comment: Some("LGTM".to_string()),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Empty approver
+        let empty = ApprovalDecisionRequest {
+            approver: "".to_string(),
+            comment: None,
+        };
+        assert!(empty.validate().is_err());
+
+        // Whitespace approver
+        let whitespace = ApprovalDecisionRequest {
+            approver: "   ".to_string(),
+            comment: None,
+        };
+        assert!(whitespace.validate().is_err());
+    }
+
+    // ==================== Response Conversion Tests ====================
+
+    #[test]
+    fn test_pipeline_response_from_pipeline() {
+        let mut pipeline = Pipeline::new("test".to_string(), "definition".to_string());
+        pipeline.id = Some(42);
+        pipeline.enabled = false;
+
+        let response: PipelineResponse = pipeline.clone().into();
 
         assert_eq!(response.id, 42);
         assert_eq!(response.name, "test");
-        assert_eq!(response.cron_expression, "@daily");
-        assert_eq!(response.agent_type, "story_developer");
-        assert_eq!(response.task, "Test task");
+        assert_eq!(response.definition, "definition");
+        assert!(!response.enabled);
+    }
+
+    #[test]
+    fn test_pipeline_run_response_from_run() {
+        let mut run = PipelineRun::new(1, Some("event".to_string()));
+        run.id = Some(42);
+        run.mark_running();
+
+        let response: PipelineRunResponse = run.clone().into();
+
+        assert_eq!(response.id, 42);
+        assert_eq!(response.pipeline_id, 1);
+        assert_eq!(response.status, "running");
+        assert_eq!(response.trigger_event, Some("event".to_string()));
+        assert!(response.started_at.is_some());
+    }
+
+    #[test]
+    fn test_approval_response_from_approval() {
+        let mut approval = ApprovalRequest::new(
+            1,
+            2,
+            "user@example.com".to_string(),
+            1,
+            Some(3600),
+            Some("approve".to_string()),
+        );
+        approval.id = Some(42);
+
+        let response: ApprovalResponse = approval.clone().into();
+
+        assert_eq!(response.id, 42);
+        assert_eq!(response.stage_id, 1);
+        assert_eq!(response.run_id, 2);
+        assert_eq!(response.status, "pending");
+        assert_eq!(response.required_approvers, "user@example.com");
+        assert_eq!(response.required_count, 1);
+        assert_eq!(response.timeout_seconds, Some(3600));
     }
 }
