@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::{Agent, AgentState, AgentType, Epic, EpicStatus, Message, MessageRole, PrStatus, PullRequest, MergeStrategy, Result};
+use crate::{Agent, AgentState, AgentType, Epic, EpicStatus, Message, MessageRole, PrStatus, PullRequest, MergeStrategy, Result, Story, StoryStatus};
 use crate::network::{AgentId, StepOutput, StepOutputType};
 use crate::instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
@@ -618,6 +618,144 @@ impl Database {
         .await?;
 
         rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // ==================== Story Operations ====================
+
+    /// Upsert a story
+    pub async fn upsert_story(&self, story: &Story) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stories (id, epic_id, title, description, acceptance_criteria, status, agent_id, created_at, updated_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                acceptance_criteria = excluded.acceptance_criteria,
+                status = excluded.status,
+                agent_id = excluded.agent_id,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at
+            "#,
+        )
+        .bind(&story.id)
+        .bind(&story.epic_id)
+        .bind(&story.title)
+        .bind(&story.description)
+        .bind(story.acceptance_criteria.as_ref().map(|c| serde_json::to_string(c).ok()).flatten())
+        .bind(story.status.as_str())
+        .bind(story.agent_id.map(|id| id.to_string()))
+        .bind(story.created_at.to_rfc3339())
+        .bind(story.updated_at.to_rfc3339())
+        .bind(story.completed_at.map(|dt| dt.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get a story by ID
+    pub async fn get_story(&self, id: &str) -> Result<Option<Story>> {
+        let row = sqlx::query_as::<_, StoryRow>(
+            "SELECT * FROM stories WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get all stories for an epic
+    pub async fn get_stories_for_epic(&self, epic_id: &str) -> Result<Vec<Story>> {
+        let rows = sqlx::query_as::<_, StoryRow>(
+            "SELECT * FROM stories WHERE epic_id = ? ORDER BY created_at ASC",
+        )
+        .bind(epic_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get pending stories (optionally for a specific epic)
+    pub async fn get_pending_stories(&self, epic_id: Option<&str>) -> Result<Vec<Story>> {
+        let rows = if let Some(eid) = epic_id {
+            sqlx::query_as::<_, StoryRow>(
+                "SELECT * FROM stories WHERE epic_id = ? AND status = 'pending' ORDER BY created_at ASC",
+            )
+            .bind(eid)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, StoryRow>(
+                "SELECT * FROM stories WHERE status = 'pending' ORDER BY created_at ASC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update story status
+    pub async fn update_story_status(&self, id: &str, status: StoryStatus, agent_id: Option<Uuid>) -> Result<bool> {
+        let now = chrono::Utc::now();
+        let completed_at = if status == StoryStatus::Completed {
+            Some(now.to_rfc3339())
+        } else {
+            None
+        };
+
+        let result = sqlx::query(
+            r#"
+            UPDATE stories SET
+                status = ?,
+                agent_id = ?,
+                updated_at = ?,
+                completed_at = COALESCE(?, completed_at)
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(agent_id.map(|id| id.to_string()))
+        .bind(now.to_rfc3339())
+        .bind(completed_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List all stories with optional status filter
+    pub async fn list_stories(&self, status: Option<StoryStatus>) -> Result<Vec<Story>> {
+        let rows = if let Some(s) = status {
+            sqlx::query_as::<_, StoryRow>(
+                "SELECT * FROM stories WHERE status = ? ORDER BY created_at DESC",
+            )
+            .bind(s.as_str())
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, StoryRow>(
+                "SELECT * FROM stories ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Delete a story
+    pub async fn delete_story(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM stories WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     // ==================== Step Output Operations ====================
@@ -1870,6 +2008,53 @@ impl TryFrom<EpicRow> for Epic {
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
             updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at).map_err(|e| crate::Error::Other(e.to_string()))?.into(),
             completed_at: row.completed_at.map(|s| chrono::DateTime::parse_from_rfc3339(&s)).transpose().map_err(|e| crate::Error::Other(e.to_string()))?.map(Into::into),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StoryRow {
+    id: String,
+    epic_id: String,
+    title: String,
+    description: Option<String>,
+    acceptance_criteria: Option<String>,
+    status: String,
+    agent_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    completed_at: Option<String>,
+}
+
+impl TryFrom<StoryRow> for Story {
+    type Error = crate::Error;
+
+    fn try_from(row: StoryRow) -> Result<Self> {
+        Ok(Story {
+            id: row.id,
+            epic_id: row.epic_id,
+            title: row.title,
+            description: row.description,
+            acceptance_criteria: row.acceptance_criteria
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
+            status: StoryStatus::from_str(&row.status)?,
+            agent_id: row.agent_id
+                .map(|s| Uuid::parse_str(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            completed_at: row.completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
         })
     }
 }

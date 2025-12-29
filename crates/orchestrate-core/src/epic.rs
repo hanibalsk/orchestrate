@@ -63,6 +63,31 @@ pub enum StoryStatus {
     Skipped,
 }
 
+impl StoryStatus {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    /// Parse from string
+    pub fn from_str(s: &str) -> Result<Self, crate::Error> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "in_progress" => Ok(Self::InProgress),
+            "completed" => Ok(Self::Completed),
+            "blocked" => Ok(Self::Blocked),
+            "skipped" => Ok(Self::Skipped),
+            _ => Err(crate::Error::Other(format!("Invalid story status: {}", s))),
+        }
+    }
+}
+
 /// BMAD workflow phase
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
