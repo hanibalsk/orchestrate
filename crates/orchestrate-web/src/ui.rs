@@ -402,13 +402,13 @@ pub fn create_ui_router() -> Router<Arc<AppState>> {
         // Pages
         .route("/", get(dashboard))
         .route("/agents", get(agent_list))
-        .route("/agents/{id}", get(agent_detail))
+        .route("/agents/:id", get(agent_detail))
         // Actions
         .route("/agents/create", post(create_agent))
-        .route("/agents/{id}/send", post(send_message))
-        .route("/agents/{id}/pause", post(pause_agent))
-        .route("/agents/{id}/resume", post(resume_agent))
-        .route("/agents/{id}/terminate", post(terminate_agent))
+        .route("/agents/:id/send", post(send_message))
+        .route("/agents/:id/pause", post(pause_agent))
+        .route("/agents/:id/resume", post(resume_agent))
+        .route("/agents/:id/terminate", post(terminate_agent))
         // Static files
         .nest_service("/static", ServeDir::new(static_path))
 }
