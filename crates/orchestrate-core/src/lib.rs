@@ -27,6 +27,7 @@ pub mod network;
 pub mod pipeline;
 pub mod pipeline_executor;
 pub mod pipeline_parser;
+pub mod pipeline_template;
 pub mod pr;
 pub mod session;
 pub mod shell_state;
@@ -83,3 +84,6 @@ pub use condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationRe
 // Re-export approval types
 pub use approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
 pub use approval_service::ApprovalService;
+
+// Re-export pipeline template types
+pub use pipeline_template::PipelineTemplate;

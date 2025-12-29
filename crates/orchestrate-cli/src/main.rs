@@ -605,6 +605,20 @@ enum PipelineAction {
         #[arg(short, long, default_value = "10")]
         limit: usize,
     },
+    /// Initialize pipeline from template
+    Init {
+        /// Template name (ci, cd, release, security)
+        template: Option<String>,
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// List available templates
+        #[arg(long)]
+        list: bool,
+        /// Force overwrite existing file
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1919,6 +1933,9 @@ async fn main() -> Result<()> {
             }
             PipelineAction::History { name, limit } => {
                 handle_pipeline_history(&db, &name, limit).await?;
+            }
+            PipelineAction::Init { template, output, list, force } => {
+                handle_pipeline_init(template.as_deref(), output.as_ref(), list, force)?;
             }
         },
 
@@ -3412,6 +3429,70 @@ async fn handle_pipeline_history(db: &Database, name: &str, limit: usize) -> Res
             duration
         );
     }
+
+    Ok(())
+}
+
+fn handle_pipeline_init(
+    template: Option<&str>,
+    output: Option<&PathBuf>,
+    list: bool,
+    force: bool,
+) -> Result<()> {
+    use orchestrate_core::pipeline_template;
+    use std::fs;
+
+    // Handle --list flag
+    if list {
+        println!("Available pipeline templates:");
+        println!();
+
+        let templates = pipeline_template::get_templates();
+        let mut names: Vec<_> = templates.keys().collect();
+        names.sort();
+
+        for name in names {
+            let template = &templates[name];
+            println!("  {} - {}", name, template.description);
+        }
+
+        return Ok(());
+    }
+
+    // Template name is required if not listing
+    let template_name = template
+        .ok_or_else(|| anyhow::anyhow!("Template name required. Use --list to see available templates"))?;
+
+    // Get template
+    let template = pipeline_template::get_template(template_name)
+        .ok_or_else(|| anyhow::anyhow!("Template not found: {}. Use --list to see available templates", template_name))?;
+
+    // Determine output file
+    let output_file = if let Some(path) = output {
+        path.clone()
+    } else {
+        // Default: <template-name>-pipeline.yaml
+        PathBuf::from(format!("{}-pipeline.yaml", template_name))
+    };
+
+    // Check if file exists
+    if output_file.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "File already exists: {}. Use --force to overwrite",
+            output_file.display()
+        ));
+    }
+
+    // Write template to file
+    fs::write(&output_file, &template.yaml)?;
+
+    println!("Pipeline template '{}' initialized successfully!", template_name);
+    println!("  File: {}", output_file.display());
+    println!("  Description: {}", template.description);
+    println!();
+    println!("Next steps:");
+    println!("  1. Review and customize the pipeline definition");
+    println!("  2. Create the pipeline: orchestrate pipeline create {}", output_file.display());
 
     Ok(())
 }
