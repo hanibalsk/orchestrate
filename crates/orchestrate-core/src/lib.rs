@@ -25,9 +25,12 @@ pub mod experiment;
 pub mod feedback;
 pub mod instruction;
 pub mod learning;
+pub mod learning_automation;
 pub mod message;
 pub mod model_selection;
 pub mod network;
+pub mod pattern_export;
+pub mod prompt_optimization;
 pub mod pipeline;
 pub mod pipeline_executor;
 pub mod pipeline_parser;
@@ -121,4 +124,25 @@ pub use model_selection::{
     classify_task_complexity, model_to_tier, AlternativeModel, ModelPerformance,
     ModelRecommendation, ModelSelectionConfig, ModelSelectionRule, ModelTier, OptimizationGoal,
     TaskComplexity,
+};
+
+// Re-export prompt optimization types
+pub use prompt_optimization::{
+    analyze_prompt_sections, prompt_similarity, PromptEffectiveness, PromptOptimizationConfig,
+    PromptSection, PromptSuggestion, PromptVersion, SectionAnalysis, SuggestionStatus,
+};
+
+// Re-export pattern export types
+pub use pattern_export::{
+    filter_patterns, ExportMetadata, ExportablePattern, ImportDetail, ImportOptions, ImportResult,
+    ImportStatus, InstructionPattern, PatternContext, PatternEffectiveness, PatternExport,
+    PromptTemplatePattern, SuccessPatternExport, ToolSequencePattern,
+};
+
+// Re-export learning automation types
+pub use learning_automation::{
+    predict_task_outcome, ActionType, AreaForImprovement, AutomationAction, AutomationResults,
+    AutomationRun, AutomationRunStatus, AutomationTrigger, DurationEstimate, Improvement,
+    ImprovementCategory, LearningAutomationConfig, LearningReport, ReportSummary, RiskFactor,
+    RiskSeverity, TaskPrediction, TokenEstimate,
 };

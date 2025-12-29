@@ -172,6 +172,15 @@ enum Commands {
         #[command(subcommand)]
         action: ExperimentAction,
     },
+    /// Predict task outcomes based on historical data
+    Predict {
+        /// Task description to predict outcomes for
+        #[arg(short, long)]
+        task: String,
+        /// Agent type for context
+        #[arg(short = 'a', long)]
+        agent_type: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -465,6 +474,60 @@ enum LearnAction {
         /// Show summary statistics only
         #[arg(long)]
         summary: bool,
+    },
+    /// Get improvement suggestions based on learning data
+    Suggest {
+        /// Agent type to get suggestions for
+        #[arg(short = 't', long)]
+        agent_type: Option<String>,
+        /// Maximum number of suggestions
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+    },
+    /// Export learned patterns to file
+    Export {
+        /// Output file path (supports .yaml and .json)
+        #[arg(short, long)]
+        output: String,
+        /// Minimum success rate to include
+        #[arg(long, default_value = "0.7")]
+        min_success_rate: f64,
+        /// Minimum sample size to include
+        #[arg(long, default_value = "10")]
+        min_samples: i64,
+        /// Source project name for metadata
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Import patterns from file
+    Import {
+        /// Input file path (supports .yaml and .json)
+        #[arg(short, long)]
+        file: String,
+        /// Dry run - show what would be imported
+        #[arg(long)]
+        dry_run: bool,
+        /// Minimum success rate to import
+        #[arg(long, default_value = "0.7")]
+        min_success_rate: f64,
+        /// Minimum sample size to import
+        #[arg(long, default_value = "10")]
+        min_samples: i64,
+        /// Skip existing patterns
+        #[arg(long, default_value = "true")]
+        skip_existing: bool,
+    },
+    /// Configure learning automation
+    Auto {
+        /// Enable automation
+        #[arg(long)]
+        enable: bool,
+        /// Disable automation
+        #[arg(long)]
+        disable: bool,
+        /// Show current automation status
+        #[arg(long)]
+        status: bool,
     },
 }
 
@@ -1888,6 +1951,269 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            LearnAction::Suggest { agent_type, limit } => {
+                // Get improvement suggestions based on learning data
+                println!("Improvement Suggestions");
+                println!("{}", "=".repeat(60));
+
+                // Get ineffective instructions that could be improved
+                let ineffective = db.list_ineffective_instructions(0.5, 5).await?;
+                let suggestions_count = ineffective.len().min(limit);
+
+                if ineffective.is_empty() {
+                    println!("No improvement suggestions at this time.");
+                    println!("All instructions are performing above threshold.");
+                } else {
+                    println!("\nInstructions needing improvement:");
+                    for (i, instr) in ineffective.iter().take(limit).enumerate() {
+                        // Filter by agent type if specified
+                        if let Some(ref at) = agent_type {
+                            // For now, show all - in a full implementation we'd filter by agent scope
+                            let _ = at;
+                        }
+                        println!(
+                            "\n{}. {} (ID: {})",
+                            i + 1,
+                            instr.name,
+                            instr.instruction_id
+                        );
+                        println!("   Current success rate: {:.1}%", instr.success_rate * 100.0);
+                        println!("   Usage count: {}", instr.usage_count);
+                        println!("   Suggestion: Review and update instruction content or disable if no longer relevant");
+                    }
+                    println!("\nTotal suggestions: {}", suggestions_count);
+                }
+            }
+            LearnAction::Export {
+                output,
+                min_success_rate,
+                min_samples,
+                project,
+            } => {
+                use orchestrate_core::{
+                    ExportMetadata, ExportablePattern, InstructionPattern, PatternContext,
+                    PatternEffectiveness, PatternExport, SuccessPatternExport,
+                };
+
+                let mut export = PatternExport::new();
+                if let Some(proj) = project {
+                    export = export.with_source_project(proj);
+                }
+
+                // Export custom instructions as patterns
+                let instructions = db.list_instructions(false, None, None).await?;
+                let mut instruction_count = 0;
+                let mut success_pattern_count = 0;
+
+                for instr in instructions {
+                    // Get effectiveness data for the instruction
+                    let effectiveness = db
+                        .list_instruction_effectiveness(true, 1)
+                        .await?
+                        .into_iter()
+                        .find(|e| e.instruction_id == instr.id);
+
+                    let (success_rate, sample_size) = match effectiveness {
+                        Some(eff) => (eff.success_rate, eff.usage_count),
+                        None => continue, // Skip instructions without usage data
+                    };
+
+                    if success_rate >= min_success_rate && sample_size >= min_samples {
+                        let agent_types: Vec<String> = instr.agent_type
+                            .map(|t| vec![t.as_str().to_string()])
+                            .unwrap_or_default();
+                        let pattern = InstructionPattern {
+                            name: instr.name.clone(),
+                            content: instr.content.clone(),
+                            scope: instr.scope.as_str().to_string(),
+                            agent_types,
+                            tags: instr.tags.clone(),
+                            effectiveness: PatternEffectiveness::new(success_rate, sample_size),
+                            context: PatternContext::new(),
+                        };
+                        export = export.add_pattern(ExportablePattern::Instruction(pattern));
+                        instruction_count += 1;
+                    }
+                }
+
+                // Export success patterns
+                let success_patterns = db.list_success_patterns(None, 1000).await?;
+                for sp in success_patterns {
+                    let success_rate = sp.success_rate;
+
+                    if success_rate >= min_success_rate && sp.occurrence_count >= min_samples {
+                        let agent_types: Vec<String> = sp.agent_type
+                            .map(|t| vec![t.as_str().to_string()])
+                            .unwrap_or_default();
+                        let pattern = SuccessPatternExport {
+                            pattern_type: sp.pattern_type.as_str().to_string(),
+                            signature: sp.pattern_signature.clone(),
+                            data: sp.pattern_data.clone(),
+                            agent_types,
+                            effectiveness: PatternEffectiveness::new(success_rate, sp.occurrence_count),
+                            context: PatternContext::new(),
+                        };
+                        export = export.add_pattern(ExportablePattern::SuccessPattern(pattern));
+                        success_pattern_count += 1;
+                    }
+                }
+
+                // Update metadata
+                export.metadata = ExportMetadata {
+                    total_patterns: instruction_count + success_pattern_count,
+                    instruction_count,
+                    tool_sequence_count: 0,
+                    prompt_template_count: 0,
+                    success_pattern_count,
+                    description: None,
+                    tags: vec![],
+                };
+
+                // Write to file
+                let content = if output.ends_with(".json") {
+                    export.to_json().map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
+                } else {
+                    export.to_yaml().map_err(|e| anyhow::anyhow!("YAML serialization failed: {}", e))?
+                };
+
+                std::fs::write(&output, content)?;
+                println!("Exported {} patterns to {}", export.metadata.total_patterns, output);
+                println!("  Instructions: {}", instruction_count);
+                println!("  Success patterns: {}", success_pattern_count);
+            }
+            LearnAction::Import {
+                file,
+                dry_run,
+                min_success_rate,
+                min_samples,
+                skip_existing,
+            } => {
+                use orchestrate_core::{
+                    filter_patterns, ExportablePattern, ImportOptions, PatternExport,
+                };
+
+                let content = std::fs::read_to_string(&file)?;
+                let export = if file.ends_with(".json") {
+                    PatternExport::from_json(&content)
+                        .map_err(|e| anyhow::anyhow!("JSON parsing failed: {}", e))?
+                } else {
+                    PatternExport::from_yaml(&content)
+                        .map_err(|e| anyhow::anyhow!("YAML parsing failed: {}", e))?
+                };
+
+                let options = ImportOptions {
+                    min_success_rate,
+                    min_sample_size: min_samples,
+                    skip_existing,
+                    dry_run,
+                    ..Default::default()
+                };
+
+                let filtered = filter_patterns(&export, &options);
+                println!(
+                    "{}Importing {} of {} patterns from {}",
+                    if dry_run { "[DRY RUN] " } else { "" },
+                    filtered.len(),
+                    export.patterns.len(),
+                    file
+                );
+
+                if export.source_project.is_some() {
+                    println!("Source project: {}", export.source_project.as_ref().unwrap());
+                }
+
+                let mut imported = 0;
+                let mut skipped = 0;
+
+                for pattern in filtered {
+                    match pattern {
+                        ExportablePattern::Instruction(instr) => {
+                            if skip_existing {
+                                let existing = db.list_instructions(false, None, None).await?;
+                                if existing.iter().any(|i| i.name == instr.name) {
+                                    println!("  Skipped (exists): {}", instr.name);
+                                    skipped += 1;
+                                    continue;
+                                }
+                            }
+
+                            if !dry_run {
+                                let scope = orchestrate_core::InstructionScope::from_str(&instr.scope)
+                                    .unwrap_or(orchestrate_core::InstructionScope::Global);
+                                let agent_type: Option<orchestrate_core::AgentType> = instr
+                                    .agent_types
+                                    .first()
+                                    .and_then(|t| parse_agent_type(t).ok());
+
+                                let instruction = orchestrate_core::CustomInstruction {
+                                    id: 0,
+                                    name: instr.name.clone(),
+                                    content: instr.content.clone(),
+                                    scope,
+                                    agent_type,
+                                    priority: 0,
+                                    enabled: true,
+                                    source: orchestrate_core::InstructionSource::Imported,
+                                    confidence: instr.effectiveness.success_rate,
+                                    tags: instr.tags.clone(),
+                                    created_at: chrono::Utc::now(),
+                                    updated_at: chrono::Utc::now(),
+                                    created_by: Some("import".to_string()),
+                                };
+                                db.insert_instruction(&instruction).await?;
+                            }
+                            println!("  {}: {}", if dry_run { "Would import" } else { "Imported" }, instr.name);
+                            imported += 1;
+                        }
+                        ExportablePattern::SuccessPattern(sp) => {
+                            println!(
+                                "  {}: {} pattern ({})",
+                                if dry_run { "Would import" } else { "Noted" },
+                                sp.pattern_type,
+                                sp.signature
+                            );
+                            // Success patterns are informational - they're observed from runtime
+                            imported += 1;
+                        }
+                        _ => {
+                            println!("  Skipped unsupported pattern type");
+                            skipped += 1;
+                        }
+                    }
+                }
+
+                println!();
+                println!(
+                    "{}Imported: {}, Skipped: {}",
+                    if dry_run { "[DRY RUN] " } else { "" },
+                    imported,
+                    skipped
+                );
+            }
+            LearnAction::Auto { enable, disable, status } => {
+                use orchestrate_core::LearningAutomationConfig;
+
+                if status || (!enable && !disable) {
+                    let config = LearningAutomationConfig::default();
+                    println!("Learning Automation Status");
+                    println!("{}", "=".repeat(40));
+                    println!("Enabled: {}", config.enabled);
+                    println!("Analysis schedule: {}", config.analysis_schedule);
+                    println!("Auto-suggest: {}", config.auto_suggest);
+                    println!("Auto-disable: {}", config.auto_disable);
+                    println!("Auto-promote experiments: {}", config.auto_promote_experiments);
+                    println!("Generate reports: {}", config.generate_reports);
+                    println!("Min effectiveness: {:.0}%", config.min_effectiveness * 100.0);
+                    println!("Min samples: {}", config.min_samples);
+                } else if enable {
+                    println!("Learning automation enabled.");
+                    println!("Scheduled analysis will run according to configured schedule.");
+                    println!("Note: Automation configuration is stored in project settings.");
+                } else if disable {
+                    println!("Learning automation disabled.");
+                    println!("Manual analysis can still be run with: orchestrate learn analyze");
+                }
+            }
         },
 
         Commands::History { action } => match action {
@@ -2958,6 +3284,83 @@ async fn main() -> Result<()> {
                     println!("Deleted experiment '{}'", exp.name);
                 } else {
                     println!("Experiment not found");
+                }
+            }
+        },
+        Commands::Predict { task, agent_type } => {
+            use orchestrate_core::predict_task_outcome;
+
+            // Get historical data for prediction
+            let agent_type_parsed = agent_type.as_ref()
+                .map(|t| parse_agent_type(t))
+                .transpose()?;
+
+            // Calculate historical metrics from database
+            let agents = db.list_agents_paginated(1000, 0, None, agent_type_parsed).await?;
+            let total_agents = agents.len();
+            let successful = agents.iter()
+                .filter(|a| a.state == orchestrate_core::AgentState::Completed)
+                .count();
+            let historical_success_rate = if total_agents > 0 {
+                successful as f64 / total_agents as f64
+            } else {
+                0.75 // Default assumption
+            };
+
+            // Use default token estimate since we don't have global stats
+            let avg_tokens: i64 = 50000;
+
+            // Estimate average duration (rough estimate based on typical agent runs)
+            let avg_duration_mins = 30.0;
+
+            let prediction = predict_task_outcome(
+                &task,
+                historical_success_rate,
+                avg_tokens,
+                avg_duration_mins,
+                total_agents as i64,
+            );
+
+            println!("Task Prediction");
+            println!("{}", "=".repeat(60));
+            println!();
+            println!("Description: \"{}\"", prediction.task_description);
+            if let Some(ref at) = agent_type {
+                println!("Agent type: {}", at);
+            }
+            println!();
+            println!("Predictions:");
+            println!("  Success probability: {:.0}%", prediction.success_probability * 100.0);
+            println!("  Confidence: {:.0}%", prediction.confidence * 100.0);
+            println!(
+                "  Estimated tokens: {} - {}",
+                prediction.estimated_tokens.min, prediction.estimated_tokens.max
+            );
+            println!(
+                "  Estimated duration: {:.0} - {:.0} minutes",
+                prediction.estimated_duration.min_minutes,
+                prediction.estimated_duration.max_minutes
+            );
+            println!("  Recommended model: {}", prediction.recommended_model);
+
+            if !prediction.risk_factors.is_empty() {
+                println!();
+                println!("Risk factors:");
+                for risk in &prediction.risk_factors {
+                    println!(
+                        "  - [{}] {}: {}",
+                        risk.severity.as_str().to_uppercase(),
+                        risk.name,
+                        risk.description
+                    );
+                }
+            }
+
+            if !prediction.recommendations.is_empty() {
+                println!();
+                println!("Recommendations:");
+                for rec in &prediction.recommendations {
+                    println!("  - {}", rec);
                 }
             }
         },

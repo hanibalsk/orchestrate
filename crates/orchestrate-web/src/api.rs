@@ -202,6 +202,17 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/feedback", get(list_feedback).post(create_feedback))
         .route("/api/feedback/:id", get(get_feedback).delete(delete_feedback))
         .route("/api/feedback/stats", get(get_feedback_stats))
+        // Learning analytics routes
+        .route("/api/learning/effectiveness", get(get_learning_effectiveness))
+        .route("/api/learning/suggestions", get(get_learning_suggestions))
+        .route("/api/learning/analyze", post(trigger_learning_analysis))
+        // Experiment routes
+        .route("/api/experiments", get(list_experiments).post(create_experiment))
+        .route("/api/experiments/:id", get(get_experiment))
+        .route("/api/experiments/:id/results", get(get_experiment_results))
+        .route("/api/experiments/:id/promote", post(promote_experiment))
+        // Prediction routes
+        .route("/api/predictions", post(get_prediction))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -2001,6 +2012,508 @@ async fn get_feedback_stats(
 struct FeedbackStatsQuery {
     #[serde(default)]
     agent_id: Option<String>,
+}
+
+// ==================== Learning Analytics Handlers ====================
+
+#[derive(Debug, Serialize)]
+struct LearningEffectivenessResponse {
+    instructions: Vec<InstructionEffectivenessItem>,
+    summary: EffectivenessSummaryItem,
+}
+
+#[derive(Debug, Serialize)]
+struct InstructionEffectivenessItem {
+    instruction_id: i64,
+    name: String,
+    source: String,
+    enabled: bool,
+    usage_count: i64,
+    success_rate: f64,
+    penalty_score: f64,
+    level: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EffectivenessSummaryItem {
+    total_instructions: i64,
+    enabled_count: i64,
+    used_count: i64,
+    total_usage: i64,
+    avg_success_rate: f64,
+    avg_penalty_score: f64,
+    ineffective_count: i64,
+}
+
+async fn get_learning_effectiveness(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<EffectivenessQuery>,
+) -> Result<Json<LearningEffectivenessResponse>, ApiError> {
+    let instructions = state
+        .db
+        .list_instruction_effectiveness(query.include_disabled.unwrap_or(false), query.min_usage.unwrap_or(1))
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let summary = state
+        .db
+        .get_effectiveness_summary()
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let items: Vec<InstructionEffectivenessItem> = instructions
+        .into_iter()
+        .map(|i| InstructionEffectivenessItem {
+            instruction_id: i.instruction_id,
+            name: i.name.clone(),
+            source: i.instruction_source.clone(),
+            enabled: i.enabled,
+            usage_count: i.usage_count,
+            success_rate: i.success_rate,
+            penalty_score: i.penalty_score,
+            level: i.effectiveness_level().to_string(),
+        })
+        .collect();
+
+    Ok(Json(LearningEffectivenessResponse {
+        instructions: items,
+        summary: EffectivenessSummaryItem {
+            total_instructions: summary.total_instructions,
+            enabled_count: summary.enabled_count,
+            used_count: summary.used_count,
+            total_usage: summary.total_usage,
+            avg_success_rate: summary.avg_success_rate,
+            avg_penalty_score: summary.avg_penalty_score,
+            ineffective_count: summary.ineffective_count,
+        },
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct EffectivenessQuery {
+    #[serde(default)]
+    min_usage: Option<i64>,
+    #[serde(default)]
+    include_disabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct SuggestionResponse {
+    suggestions: Vec<SuggestionItem>,
+    total: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SuggestionItem {
+    instruction_id: i64,
+    name: String,
+    success_rate: f64,
+    usage_count: i64,
+    suggestion: String,
+}
+
+async fn get_learning_suggestions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SuggestionsQuery>,
+) -> Result<Json<SuggestionResponse>, ApiError> {
+    let ineffective = state
+        .db
+        .list_ineffective_instructions(0.5, 5)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let limit = query.limit.unwrap_or(10);
+    let suggestions: Vec<SuggestionItem> = ineffective
+        .into_iter()
+        .take(limit)
+        .map(|i| SuggestionItem {
+            instruction_id: i.instruction_id,
+            name: i.name.clone(),
+            success_rate: i.success_rate,
+            usage_count: i.usage_count,
+            suggestion: "Review and update instruction content or disable if no longer relevant".to_string(),
+        })
+        .collect();
+
+    let total = suggestions.len();
+    Ok(Json(SuggestionResponse { suggestions, total }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestionsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisResponse {
+    patterns_processed: usize,
+    instructions_created: Vec<String>,
+}
+
+async fn trigger_learning_analysis(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<AnalysisResponse>, ApiError> {
+    let engine = LearningEngine::new();
+    let created = engine
+        .process_patterns(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Analysis error: {}", e)))?;
+
+    Ok(Json(AnalysisResponse {
+        patterns_processed: created.len(),
+        instructions_created: created.iter().map(|i| i.name.clone()).collect(),
+    }))
+}
+
+// ==================== Experiment Handlers ====================
+
+use orchestrate_core::{Experiment, ExperimentStatus, ExperimentType, ExperimentMetric};
+
+#[derive(Debug, Serialize)]
+struct ExperimentResponse {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    experiment_type: String,
+    metric: String,
+    status: String,
+    min_samples: i64,
+    confidence_level: f64,
+    created_at: String,
+}
+
+impl From<Experiment> for ExperimentResponse {
+    fn from(exp: Experiment) -> Self {
+        Self {
+            id: exp.id,
+            name: exp.name,
+            description: exp.description,
+            experiment_type: exp.experiment_type.as_str().to_string(),
+            metric: exp.metric.as_str().to_string(),
+            status: exp.status.as_str().to_string(),
+            min_samples: exp.min_samples,
+            confidence_level: exp.confidence_level,
+            created_at: exp.created_at.to_rfc3339(),
+        }
+    }
+}
+
+async fn list_experiments(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExperimentListQuery>,
+) -> Result<Json<Vec<ExperimentResponse>>, ApiError> {
+    let status_filter = query.status.as_ref().and_then(|s| {
+        use std::str::FromStr;
+        ExperimentStatus::from_str(s).ok()
+    });
+
+    let experiments = state
+        .db
+        .list_experiments(status_filter, query.limit.unwrap_or(100))
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(experiments.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct ExperimentListQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateExperimentRequest {
+    name: String,
+    description: Option<String>,
+    experiment_type: String,
+    metric: String,
+    min_samples: Option<i64>,
+    confidence_level: Option<f64>,
+}
+
+async fn create_experiment(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateExperimentRequest>,
+) -> Result<Json<ExperimentResponse>, ApiError> {
+    use std::str::FromStr;
+
+    let experiment_type = ExperimentType::from_str(&req.experiment_type)
+        .map_err(|_| ApiError::validation(format!("Invalid experiment type: {}", req.experiment_type)))?;
+
+    let metric = ExperimentMetric::from_str(&req.metric)
+        .map_err(|_| ApiError::validation(format!("Invalid metric: {}", req.metric)))?;
+
+    let experiment = Experiment {
+        id: 0,
+        name: req.name,
+        description: req.description,
+        hypothesis: None,
+        experiment_type,
+        metric,
+        agent_type: None,
+        status: ExperimentStatus::Draft,
+        min_samples: req.min_samples.unwrap_or(100),
+        confidence_level: req.confidence_level.unwrap_or(0.95),
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        completed_at: None,
+        winner_variant_id: None,
+    };
+
+    let id = state
+        .db
+        .create_experiment(&experiment)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let created = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::internal("Failed to retrieve created experiment"))?;
+
+    Ok(Json(created.into()))
+}
+
+async fn get_experiment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ExperimentResponse>, ApiError> {
+    let experiment = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Experiment"))?;
+
+    Ok(Json(experiment.into()))
+}
+
+#[derive(Debug, Serialize)]
+struct ExperimentResultsResponse {
+    experiment_id: i64,
+    variants: Vec<VariantResultItem>,
+    is_significant: bool,
+    p_value: Option<f64>,
+    improvement: Option<f64>,
+    winning_variant: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VariantResultItem {
+    variant_id: i64,
+    name: String,
+    is_control: bool,
+    sample_count: i64,
+    mean: f64,
+    std_dev: f64,
+    success_rate: f64,
+}
+
+async fn get_experiment_results(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ExperimentResultsResponse>, ApiError> {
+    let experiment = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Experiment"))?;
+
+    let results = state
+        .db
+        .get_experiment_results(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let variants: Vec<VariantResultItem> = results
+        .iter()
+        .map(|v| VariantResultItem {
+            variant_id: v.variant_id,
+            name: v.variant_name.clone(),
+            is_control: v.is_control,
+            sample_count: v.sample_count,
+            mean: v.mean,
+            std_dev: v.std_dev,
+            success_rate: v.success_rate.unwrap_or(0.0),
+        })
+        .collect();
+
+    // Calculate significance if we have control and treatment
+    let (is_significant, p_value, improvement, winning_variant) = if let (Some(control), Some(treatment)) =
+        (results.iter().find(|v| v.is_control), results.iter().find(|v| !v.is_control))
+    {
+        use orchestrate_core::ExperimentResults;
+        let (sig, pval) = ExperimentResults::calculate_significance(control, treatment, experiment.confidence_level);
+        let imp = ExperimentResults::calculate_improvement(control.mean, treatment.mean);
+        let winner = if sig {
+            if treatment.mean > control.mean {
+                Some(treatment.variant_name.clone())
+            } else {
+                Some(control.variant_name.clone())
+            }
+        } else {
+            None
+        };
+        (sig, Some(pval), Some(imp), winner)
+    } else {
+        (false, None, None, None)
+    };
+
+    Ok(Json(ExperimentResultsResponse {
+        experiment_id: id,
+        variants,
+        is_significant,
+        p_value,
+        improvement,
+        winning_variant,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteExperimentRequest {
+    winner_variant_id: i64,
+}
+
+async fn promote_experiment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<PromoteExperimentRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let experiment = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Experiment"))?;
+
+    // Complete the experiment with the winner
+    state
+        .db
+        .update_experiment_status(id, ExperimentStatus::Completed)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "message": format!("Experiment '{}' completed with variant {} as winner", experiment.name, req.winner_variant_id),
+        "experiment_id": id,
+        "winner_variant_id": req.winner_variant_id
+    })))
+}
+
+// ==================== Prediction Handlers ====================
+
+#[derive(Debug, Deserialize)]
+struct PredictionRequest {
+    task: String,
+    agent_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PredictionResponse {
+    task_description: String,
+    success_probability: f64,
+    confidence: f64,
+    estimated_tokens: TokenEstimateItem,
+    estimated_duration: DurationEstimateItem,
+    recommended_model: String,
+    risk_factors: Vec<RiskFactorItem>,
+    recommendations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenEstimateItem {
+    min: i64,
+    max: i64,
+    expected: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DurationEstimateItem {
+    min_minutes: f64,
+    max_minutes: f64,
+    expected_minutes: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct RiskFactorItem {
+    name: String,
+    description: String,
+    severity: String,
+    impact_on_success: f64,
+}
+
+async fn get_prediction(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PredictionRequest>,
+) -> Result<Json<PredictionResponse>, ApiError> {
+    use orchestrate_core::predict_task_outcome;
+
+    // Parse agent type if provided
+    let agent_type_parsed = req.agent_type.as_ref().and_then(|t| {
+        use std::str::FromStr;
+        AgentType::from_str(t).ok()
+    });
+
+    // Get historical data for prediction
+    let agents = state
+        .db
+        .list_agents_paginated(1000, 0, None, agent_type_parsed)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let total_agents = agents.len();
+    let successful = agents
+        .iter()
+        .filter(|a| a.state == AgentState::Completed)
+        .count();
+    let historical_success_rate = if total_agents > 0 {
+        successful as f64 / total_agents as f64
+    } else {
+        0.75 // Default assumption
+    };
+
+    let prediction = predict_task_outcome(
+        &req.task,
+        historical_success_rate,
+        50000, // Default token estimate
+        30.0,  // Default duration estimate
+        total_agents as i64,
+    );
+
+    Ok(Json(PredictionResponse {
+        task_description: prediction.task_description,
+        success_probability: prediction.success_probability,
+        confidence: prediction.confidence,
+        estimated_tokens: TokenEstimateItem {
+            min: prediction.estimated_tokens.min,
+            max: prediction.estimated_tokens.max,
+            expected: prediction.estimated_tokens.expected,
+        },
+        estimated_duration: DurationEstimateItem {
+            min_minutes: prediction.estimated_duration.min_minutes,
+            max_minutes: prediction.estimated_duration.max_minutes,
+            expected_minutes: prediction.estimated_duration.expected_minutes,
+        },
+        recommended_model: prediction.recommended_model,
+        risk_factors: prediction
+            .risk_factors
+            .into_iter()
+            .map(|r| RiskFactorItem {
+                name: r.name,
+                description: r.description,
+                severity: r.severity.as_str().to_string(),
+                impact_on_success: r.impact_on_success,
+            })
+            .collect(),
+        recommendations: prediction.recommendations,
+    }))
 }
 
 #[cfg(test)]
