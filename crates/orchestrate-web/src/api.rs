@@ -182,6 +182,7 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/pipelines/:name/runs", get(list_pipeline_runs))
         .route("/api/pipeline-runs/:id", get(get_pipeline_run))
         .route("/api/pipeline-runs/:id/cancel", post(cancel_pipeline_run))
+        .route("/api/pipeline-runs/:id/stages", get(list_pipeline_stages))
         // Approval routes
         .route("/api/approvals", get(list_pending_approvals))
         .route("/api/approvals/:id/approve", post(approve_approval))
@@ -977,6 +978,19 @@ async fn cancel_pipeline_run(
     }
 }
 
+async fn list_pipeline_stages(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<PipelineStageResponse>>, ApiError> {
+    let stages = state
+        .db
+        .list_pipeline_stages(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(stages.into_iter().map(|s| s.into()).collect()))
+}
+
 // ==================== Approval Handlers ====================
 
 async fn list_pending_approvals(
@@ -1384,6 +1398,33 @@ impl From<PipelineRun> for PipelineRunResponse {
             started_at: run.started_at.map(|dt| dt.to_rfc3339()),
             completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
             created_at: run.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PipelineStageResponse {
+    pub id: i64,
+    pub run_id: i64,
+    pub stage_name: String,
+    pub status: String,
+    pub agent_id: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+}
+
+impl From<PipelineStage> for PipelineStageResponse {
+    fn from(stage: PipelineStage) -> Self {
+        Self {
+            id: stage.id.unwrap_or(0),
+            run_id: stage.run_id,
+            stage_name: stage.stage_name,
+            status: stage.status.as_str().to_string(),
+            agent_id: stage.agent_id,
+            started_at: stage.started_at.map(|dt| dt.to_rfc3339()),
+            completed_at: stage.completed_at.map(|dt| dt.to_rfc3339()),
+            created_at: stage.created_at.to_rfc3339(),
         }
     }
 }
@@ -2673,6 +2714,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_list_pipeline_stages() {
+        let test_app = setup_app().await;
+
+        // Create pipeline and run
+        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
+        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
+
+        let run = PipelineRun::new(pipeline_id, None);
+        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
+
+        // Create stages
+        let stage1 = PipelineStage::new(run_id, "build".to_string());
+        let stage2 = PipelineStage::new(run_id, "test".to_string());
+        test_app.state.db.insert_pipeline_stage(&stage1).await.unwrap();
+        test_app.state.db.insert_pipeline_stage(&stage2).await.unwrap();
+
+        let response = test_app
+            .router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/pipeline-runs/{}/stages", run_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response.into_body()).await;
+        let stages: Vec<PipelineStageResponse> = serde_json::from_str(&body).unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].stage_name, "build");
+        assert_eq!(stages[1].stage_name, "test");
     }
 
     // ==================== Approval Tests ====================

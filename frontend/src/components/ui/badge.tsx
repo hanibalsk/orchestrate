@@ -1,7 +1,12 @@
 import * as React from 'react';
 import { cva, type VariantProps } from 'class-variance-authority';
 import { cn } from '@/lib/utils';
-import type { AgentState, AgentType } from '@/api/types';
+import type {
+  AgentState,
+  AgentType,
+  PipelineRunStatus,
+  PipelineStageStatus,
+} from '@/api/types';
 
 const badgeVariants = cva(
   'inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
@@ -14,16 +19,20 @@ const badgeVariants = cva(
           'border-transparent bg-secondary text-secondary-foreground',
         destructive:
           'border-transparent bg-destructive text-destructive-foreground shadow',
+        success:
+          'border-transparent bg-green-600 text-white shadow',
+        warning:
+          'border-transparent bg-yellow-600 text-white shadow',
         outline: 'text-foreground',
         // Agent states
         created: 'border-transparent bg-gray-500 text-white',
         initializing: 'border-transparent bg-cyan-600 text-white',
-        running: 'border-transparent bg-success text-white',
-        waiting_for_input: 'border-transparent bg-warning text-black',
+        running: 'border-transparent bg-green-600 text-white',
+        waiting_for_input: 'border-transparent bg-yellow-600 text-white',
         waiting_for_external: 'border-transparent bg-orange-500 text-white',
-        paused: 'border-transparent bg-warning text-black',
-        completed: 'border-transparent bg-info text-white',
-        failed: 'border-transparent bg-danger text-white',
+        paused: 'border-transparent bg-yellow-600 text-white',
+        completed: 'border-transparent bg-blue-600 text-white',
+        failed: 'border-transparent bg-red-600 text-white',
         terminated: 'border-transparent bg-gray-600 text-white',
       },
     },
@@ -81,6 +90,35 @@ export function AgentTypeBadge({ type }: { type: AgentType }) {
   };
 
   return <Badge variant="secondary">{labels[type]}</Badge>;
+}
+
+// Helper component for pipeline run status badges
+export function PipelineRunStatusBadge({ status }: { status: PipelineRunStatus }) {
+  const variantMap: Record<PipelineRunStatus, 'default' | 'success' | 'warning' | 'destructive' | 'secondary'> = {
+    Pending: 'secondary',
+    Running: 'default',
+    WaitingApproval: 'warning',
+    Succeeded: 'success',
+    Failed: 'destructive',
+    Cancelled: 'secondary',
+  };
+
+  return <Badge variant={variantMap[status]}>{status}</Badge>;
+}
+
+// Helper component for pipeline stage status badges
+export function PipelineStageStatusBadge({ status }: { status: PipelineStageStatus }) {
+  const variantMap: Record<PipelineStageStatus, 'default' | 'success' | 'warning' | 'destructive' | 'secondary'> = {
+    Pending: 'secondary',
+    Running: 'default',
+    WaitingApproval: 'warning',
+    Succeeded: 'success',
+    Failed: 'destructive',
+    Skipped: 'secondary',
+    Cancelled: 'secondary',
+  };
+
+  return <Badge variant={variantMap[status]}>{status}</Badge>;
 }
 
 export { Badge, badgeVariants };

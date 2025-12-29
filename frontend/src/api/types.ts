@@ -110,3 +110,117 @@ export type WsMessage =
   | WsAgentStateMessage
   | WsAgentMessage
   | WsSystemStatusMessage;
+
+// Pipeline types
+export type PipelineRunStatus =
+  | 'Pending'
+  | 'Running'
+  | 'WaitingApproval'
+  | 'Succeeded'
+  | 'Failed'
+  | 'Cancelled';
+
+export type PipelineStageStatus =
+  | 'Pending'
+  | 'Running'
+  | 'WaitingApproval'
+  | 'Succeeded'
+  | 'Failed'
+  | 'Skipped'
+  | 'Cancelled';
+
+export type ApprovalStatus = 'Pending' | 'Approved' | 'Rejected' | 'TimedOut';
+
+export interface Pipeline {
+  id: number;
+  name: string;
+  definition: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface PipelineRun {
+  id: number;
+  pipeline_id: number;
+  status: PipelineRunStatus;
+  trigger_event: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface PipelineStage {
+  id: number;
+  run_id: number;
+  stage_name: string;
+  status: PipelineStageStatus;
+  agent_id: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface ApprovalRequest {
+  id: number;
+  stage_id: number;
+  run_id: number;
+  status: ApprovalStatus;
+  required_approvers: string;
+  required_count: number;
+  approval_count: number;
+  rejection_count: number;
+  timeout_seconds: number | null;
+  timeout_action: string | null;
+  timeout_at: string | null;
+  resolved_at: string | null;
+  created_at: string;
+}
+
+export interface CreatePipelineRequest {
+  name: string;
+  definition: string;
+  enabled?: boolean;
+}
+
+export interface UpdatePipelineRequest {
+  definition?: string;
+  enabled?: boolean;
+}
+
+export interface TriggerRunRequest {
+  trigger_event?: string;
+}
+
+export interface ApprovalDecisionRequest {
+  approver: string;
+  comment?: string;
+}
+
+// Pipeline WebSocket message types
+export interface WsPipelineRunMessage {
+  type: 'pipeline_run_status';
+  run_id: number;
+  status: PipelineRunStatus;
+}
+
+export interface WsPipelineStageMessage {
+  type: 'pipeline_stage_status';
+  stage_id: number;
+  run_id: number;
+  stage_name: string;
+  status: PipelineStageStatus;
+}
+
+export interface WsApprovalMessage {
+  type: 'approval_request';
+  approval_id: number;
+  run_id: number;
+  stage_name: string;
+}
+
+// Extend WsMessage type
+export type WsMessageExtended =
+  | WsMessage
+  | WsPipelineRunMessage
+  | WsPipelineStageMessage
+  | WsApprovalMessage;
