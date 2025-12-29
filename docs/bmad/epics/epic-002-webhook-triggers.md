@@ -89,11 +89,23 @@ Spawn pr-shepherd when PR is opened.
 Spawn issue-fixer when changes are requested.
 
 **Acceptance Criteria:**
-- [ ] Detect `pull_request_review.submitted` event
-- [ ] Check if review state is `changes_requested`
-- [ ] Parse review comments for actionable feedback
-- [ ] Spawn `issue-fixer` agent with review context
-- [ ] Link agent to existing PR shepherd if running
+- [x] Detect `pull_request_review.submitted` event
+- [x] Check if review state is `changes_requested`
+- [x] Parse review comments for actionable feedback
+- [x] Spawn `issue-fixer` agent with review context
+- [x] Link agent to existing PR shepherd if running
+
+**Implementation Details:**
+- Created `handle_pr_review_submitted` function in event_handlers.rs
+- Implemented payload parsing and validation for review events
+- Filters for "submitted" action and "changes_requested" state
+- Extracts PR number, branch name, review body from payload
+- Searches for existing pr-shepherd agent for the PR
+- Links issue-fixer to shepherd by storing shepherd_agent_id in context
+- Stores review body in agent context for fixer to use
+- Added 7 comprehensive unit tests covering all scenarios
+- Added 4 integration tests for end-to-end validation
+- Updated webhook processor to route pull_request_review events
 
 ### Story 5: CI Status Event Handler
 
