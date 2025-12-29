@@ -6,19 +6,17 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use orchestrate_core::{
-    Agent, AgentState, AgentType, ApprovalDecision, ApprovalRequest, ApprovalService,
-    ApprovalStatus, CustomInstruction, Database, Feedback, FeedbackRating, FeedbackSource,
-    FeedbackStats, InstructionEffectiveness, InstructionScope, InstructionSource, LearningEngine,
-    LearningPattern, PatternStatus, Pipeline, PipelineRun, PipelineRunStatus, PipelineStage,
-    Schedule, ScheduleRun,
+    Agent, AgentState, AgentType, CustomInstruction, Database, InstructionEffectiveness,
+    InstructionScope, InstructionSource, LearningEngine, LearningPattern, PatternStatus,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// Maximum task length
@@ -94,6 +92,8 @@ impl ApiError {
 pub struct AppState {
     pub db: Database,
     pub api_key: Option<SecretString>,
+    // TODO: Move to database when implementing persistence
+    test_runs: Arc<Mutex<HashMap<String, TestRunResponse>>>,
 }
 
 impl AppState {
@@ -102,6 +102,7 @@ impl AppState {
         Self {
             db,
             api_key: api_key.map(SecretString::new),
+            test_runs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -168,67 +169,13 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/patterns/:id/reject", post(reject_pattern))
         .route("/api/learning/process", post(process_patterns))
         .route("/api/learning/cleanup", post(cleanup_instructions))
-        // Pipeline routes
-        .route(
-            "/api/pipelines",
-            get(list_pipelines).post(create_pipeline),
-        )
-        .route(
-            "/api/pipelines/:name",
-            get(get_pipeline)
-                .put(update_pipeline)
-                .delete(delete_pipeline),
-        )
-        .route("/api/pipelines/:name/run", post(trigger_pipeline_run))
-        .route("/api/pipelines/:name/runs", get(list_pipeline_runs))
-        .route("/api/pipeline-runs/:id", get(get_pipeline_run))
-        .route("/api/pipeline-runs/:id/cancel", post(cancel_pipeline_run))
-        .route("/api/pipeline-runs/:id/stages", get(list_pipeline_stages))
-        // Approval routes
-        .route("/api/approvals", get(list_pending_approvals))
-        .route("/api/approvals/:id/approve", post(approve_approval))
-        .route("/api/approvals/:id/reject", post(reject_approval))
-        // Schedule routes
-        .route("/api/schedules", get(list_schedules).post(create_schedule))
-        .route(
-            "/api/schedules/:id",
-            get(get_schedule).put(update_schedule).delete(delete_schedule),
-        )
-        .route("/api/schedules/:id/pause", post(pause_schedule))
-        .route("/api/schedules/:id/resume", post(resume_schedule))
-        .route("/api/schedules/:id/run", post(run_schedule))
-        .route("/api/schedules/:id/runs", get(get_schedule_runs))
-        // Feedback routes
-        .route("/api/feedback", get(list_feedback).post(create_feedback))
-        .route("/api/feedback/:id", get(get_feedback).delete(delete_feedback))
-        .route("/api/feedback/stats", get(get_feedback_stats))
-        // Learning analytics routes
-        .route("/api/learning/effectiveness", get(get_learning_effectiveness))
-        .route("/api/learning/suggestions", get(get_learning_suggestions))
-        .route("/api/learning/analyze", post(trigger_learning_analysis))
-        // Experiment routes
-        .route("/api/experiments", get(list_experiments).post(create_experiment))
-        .route("/api/experiments/:id", get(get_experiment))
-        .route("/api/experiments/:id/results", get(get_experiment_results))
-        .route("/api/experiments/:id/promote", post(promote_experiment))
-        // Prediction routes
-        .route("/api/predictions", post(get_prediction))
-        // Documentation routes
-        .route("/api/docs/generate", post(generate_documentation))
-        .route("/api/docs/validate", post(validate_documentation))
-        .route("/api/docs/adrs", get(list_adrs).post(create_adr))
-        .route("/api/docs/adrs/:number", get(get_adr).put(update_adr))
-        .route("/api/docs/changelog", post(generate_changelog))
-        // Slack routes (Story 10)
-        .route("/api/slack/connect", post(slack_connect))
-        .route("/api/slack/disconnect", post(slack_disconnect))
-        .route("/api/slack/status", get(slack_status))
-        .route("/api/slack/channels", get(slack_channels))
-        .route("/api/slack/channel", post(slack_set_channel))
-        .route("/api/slack/test", post(slack_test_notification))
-        .route("/api/slack/users", get(slack_list_users).post(slack_map_user))
-        .route("/api/slack/users/:github_username", delete(slack_delete_user))
-        .route("/api/slack/notify", post(slack_send_notification))
+        // Test routes
+        .route("/api/tests/generate", post(generate_tests))
+        .route("/api/tests/coverage", get(get_coverage_report))
+        .route("/api/tests/coverage/history", get(get_coverage_history))
+        .route("/api/tests/run", post(trigger_test_run))
+        .route("/api/tests/runs/:id", get(get_test_run_results))
+        .route("/api/tests/suggestions", get(get_test_suggestions))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -823,286 +770,126 @@ async fn cleanup_instructions(
     }))
 }
 
-// ==================== Pipeline Handlers ====================
+// ==================== Test Handlers ====================
 
-async fn list_pipelines(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<PipelineResponse>>, ApiError> {
-    let pipelines = state
-        .db
-        .list_pipelines()
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(pipelines.into_iter().map(Into::into).collect()))
-}
-
-async fn get_pipeline(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Result<Json<PipelineResponse>, ApiError> {
-    let pipeline = state
-        .db
-        .get_pipeline_by_name(&name)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
-
-    Ok(Json(pipeline.into()))
-}
-
-async fn create_pipeline(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreatePipelineRequest>,
-) -> Result<Json<PipelineResponse>, ApiError> {
+async fn generate_tests(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<GenerateTestsRequest>,
+) -> Result<Json<GenerateTestsResponse>, ApiError> {
     req.validate()?;
 
-    let mut pipeline = Pipeline::new(req.name, req.definition);
-    if let Some(enabled) = req.enabled {
-        pipeline.enabled = enabled;
-    }
+    // TODO: Implement actual test generation using TestGenerationService
+    // For now, return a mock response
+    use orchestrate_core::{TestCase, TestCategory};
 
-    let id = state
-        .db
-        .insert_pipeline(&pipeline)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+    let test_cases = vec![
+        TestCase {
+            name: format!("test_{}_happy_path", req.target.replace('/', "_")),
+            category: TestCategory::HappyPath,
+            code: "// Generated test code".to_string(),
+        },
+    ];
 
-    pipeline.id = Some(id);
-    Ok(Json(pipeline.into()))
-}
-
-async fn update_pipeline(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-    Json(req): Json<UpdatePipelineRequest>,
-) -> Result<Json<PipelineResponse>, ApiError> {
-    let mut pipeline = state
-        .db
-        .get_pipeline_by_name(&name)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
-
-    if let Some(definition) = req.definition {
-        pipeline.definition = definition;
-    }
-    if let Some(enabled) = req.enabled {
-        pipeline.enabled = enabled;
-    }
-
-    state
-        .db
-        .update_pipeline(&pipeline)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(pipeline.into()))
-}
-
-async fn delete_pipeline(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let pipeline = state
-        .db
-        .get_pipeline_by_name(&name)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
-
-    let id = pipeline
-        .id
-        .ok_or_else(|| ApiError::internal("Pipeline missing ID"))?;
-
-    state
-        .db
-        .delete_pipeline(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(serde_json::json!({"deleted": true})))
-}
-
-async fn trigger_pipeline_run(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-    Json(req): Json<TriggerRunRequest>,
-) -> Result<Json<PipelineRunResponse>, ApiError> {
-    let pipeline = state
-        .db
-        .get_pipeline_by_name(&name)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
-
-    let pipeline_id = pipeline
-        .id
-        .ok_or_else(|| ApiError::internal("Pipeline missing ID"))?;
-
-    let mut run = PipelineRun::new(pipeline_id, req.trigger_event);
-    let run_id = state
-        .db
-        .insert_pipeline_run(&run)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    run.id = Some(run_id);
-    Ok(Json(run.into()))
-}
-
-async fn list_pipeline_runs(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Result<Json<Vec<PipelineRunResponse>>, ApiError> {
-    let pipeline = state
-        .db
-        .get_pipeline_by_name(&name)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Pipeline"))?;
-
-    let pipeline_id = pipeline
-        .id
-        .ok_or_else(|| ApiError::internal("Pipeline missing ID"))?;
-
-    let runs = state
-        .db
-        .list_pipeline_runs(pipeline_id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(runs.into_iter().map(Into::into).collect()))
-}
-
-async fn get_pipeline_run(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<PipelineRunResponse>, ApiError> {
-    let run = state
-        .db
-        .get_pipeline_run(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Pipeline run"))?;
-
-    Ok(Json(run.into()))
-}
-
-async fn cancel_pipeline_run(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<PipelineRunResponse>, ApiError> {
-    let mut run = state
-        .db
-        .get_pipeline_run(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Pipeline run"))?;
-
-    // Only allow cancelling runs that are pending, running, or waiting for approval
-    match run.status {
-        PipelineRunStatus::Pending
-        | PipelineRunStatus::Running
-        | PipelineRunStatus::WaitingApproval => {
-            run.mark_cancelled();
-            state
-                .db
-                .update_pipeline_run(&run)
-                .await
-                .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-            Ok(Json(run.into()))
+    Ok(Json(GenerateTestsResponse {
+        test_cases: test_cases.into_iter().map(Into::into).collect(),
+        generated_count: 1,
+        target: req.target,
+        test_type: match req.test_type {
+            orchestrate_core::TestType::Unit => "unit",
+            orchestrate_core::TestType::Integration => "integration",
+            orchestrate_core::TestType::E2e => "e2e",
+            orchestrate_core::TestType::Property => "property",
         }
-        _ => Err(ApiError::conflict(format!(
-            "Cannot cancel pipeline run in status: {}",
-            run.status.as_str()
-        ))),
+        .to_string(),
+    }))
+}
+
+async fn get_coverage_report(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<CoverageReportParams>,
+) -> Result<Json<CoverageReportResponse>, ApiError> {
+    // TODO: Implement actual coverage report fetching from database
+    // For now, return a mock response
+    use orchestrate_core::{CoverageReport, ModuleCoverage};
+
+    let mut report = CoverageReport::new();
+
+    if let Some(module_name) = params.module {
+        let module = ModuleCoverage::new(module_name, 80.0);
+        report.add_module(module);
+    } else {
+        // Return all modules
+        let core_module = ModuleCoverage::new("orchestrate-core".to_string(), 80.0);
+        let web_module = ModuleCoverage::new("orchestrate-web".to_string(), 70.0);
+        report.add_module(core_module);
+        report.add_module(web_module);
     }
+
+    Ok(Json(report.into()))
 }
 
-async fn list_pipeline_stages(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Vec<PipelineStageResponse>>, ApiError> {
-    let stages = state
-        .db
-        .list_pipeline_stages(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(stages.into_iter().map(|s| s.into()).collect()))
+async fn get_coverage_history(
+    State(_state): State<Arc<AppState>>,
+    Query(_params): Query<CoverageHistoryParams>,
+) -> Result<Json<Vec<CoverageReportResponse>>, ApiError> {
+    // TODO: Implement actual coverage history fetching from database
+    // For now, return an empty list
+    Ok(Json(Vec::new()))
 }
 
-// ==================== Approval Handlers ====================
-
-async fn list_pending_approvals(
+async fn trigger_test_run(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<ApprovalResponse>>, ApiError> {
-    let approvals = state
-        .db
-        .list_pending_approvals()
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(approvals.into_iter().map(Into::into).collect()))
-}
-
-async fn approve_approval(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Json(req): Json<ApprovalDecisionRequest>,
-) -> Result<Json<ApprovalResponse>, ApiError> {
+    Json(req): Json<TriggerTestRunRequest>,
+) -> Result<Json<TestRunResponse>, ApiError> {
     req.validate()?;
 
-    let approval_service = ApprovalService::new(state.db.clone());
+    // TODO: Implement actual test run triggering
+    // For now, return a mock response with a generated run ID
+    let run_id = uuid::Uuid::new_v4().to_string();
 
-    let approval = approval_service
-        .approve(id, req.approver.clone(), req.comment.clone())
-        .await
-        .map_err(|e| match e {
-            orchestrate_core::Error::Other(msg) if msg.contains("not found") => {
-                ApiError::not_found("Approval")
-            }
-            orchestrate_core::Error::Other(msg)
-                if msg.contains("not authorized") || msg.contains("not an authorized") => {
-                ApiError::bad_request(msg)
-            }
-            orchestrate_core::Error::Other(msg) if msg.contains("already resolved") || msg.contains("already submitted") => {
-                ApiError::conflict(msg)
-            }
-            _ => ApiError::internal(format!("Approval error: {}", e)),
-        })?;
+    let test_run = TestRunResponse {
+        run_id: run_id.clone(),
+        status: "pending".to_string(),
+        scope: req.scope,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        completed_at: None,
+        test_results: None,
+    };
 
-    Ok(Json(approval.into()))
+    // Store the test run
+    state
+        .test_runs
+        .lock()
+        .unwrap()
+        .insert(run_id.clone(), test_run.clone());
+
+    Ok(Json(test_run))
 }
 
-async fn reject_approval(
+async fn get_test_run_results(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Json(req): Json<ApprovalDecisionRequest>,
-) -> Result<Json<ApprovalResponse>, ApiError> {
-    req.validate()?;
+    Path(id): Path<String>,
+    Query(_params): Query<TestRunResultsParams>,
+) -> Result<Json<TestRunResponse>, ApiError> {
+    // Validate UUID format - treat invalid UUIDs as not found
+    uuid::Uuid::parse_str(&id).map_err(|_| ApiError::not_found("Test run"))?;
 
-    let approval_service = ApprovalService::new(state.db.clone());
+    // Retrieve from store
+    let test_runs = state.test_runs.lock().unwrap();
+    let test_run = test_runs.get(&id).ok_or_else(|| ApiError::not_found("Test run"))?;
 
-    let approval = approval_service
-        .reject(id, req.approver.clone(), req.comment.clone())
-        .await
-        .map_err(|e| match e {
-            orchestrate_core::Error::Other(msg) if msg.contains("not found") => {
-                ApiError::not_found("Approval")
-            }
-            orchestrate_core::Error::Other(msg)
-                if msg.contains("not authorized") || msg.contains("not an authorized") => {
-                ApiError::bad_request(msg)
-            }
-            orchestrate_core::Error::Other(msg) if msg.contains("already resolved") || msg.contains("already submitted") => {
-                ApiError::conflict(msg)
-            }
-            _ => ApiError::internal(format!("Approval error: {}", e)),
-        })?;
+    Ok(Json(test_run.clone()))
+}
 
-    Ok(Json(approval.into()))
+async fn get_test_suggestions(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<TestSuggestionsParams>,
+) -> Result<Json<Vec<TestSuggestionResponse>>, ApiError> {
+    params.validate()?;
+
+    // TODO: Implement actual test suggestions using ChangeTestAnalyzer
+    // For now, return an empty list
+    Ok(Json(Vec::new()))
 }
 
 // ==================== Request/Response Types ====================
@@ -1361,2021 +1148,252 @@ pub struct CleanupResponse {
     pub deleted_names: Vec<String>,
 }
 
-// ==================== Pipeline Request/Response Types ====================
+// ==================== Test Request/Response Types ====================
 
 #[derive(Debug, Deserialize)]
-pub struct CreatePipelineRequest {
-    pub name: String,
-    pub definition: String,
-    pub enabled: Option<bool>,
+pub struct GenerateTestsRequest {
+    pub test_type: orchestrate_core::TestType,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub language: Option<orchestrate_core::Language>,
+    #[serde(default)]
+    pub story_id: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
-impl CreatePipelineRequest {
+impl GenerateTestsRequest {
     fn validate(&self) -> Result<(), ApiError> {
-        if self.name.trim().is_empty() {
-            return Err(ApiError::validation("Pipeline name cannot be empty"));
-        }
-        if self.name.len() > 255 {
-            return Err(ApiError::validation(
-                "Pipeline name exceeds maximum length of 255 characters",
+        // For E2E tests, story_id is required
+        if matches!(self.test_type, orchestrate_core::TestType::E2e) && self.story_id.is_none() {
+            return Err(ApiError::bad_request(
+                "story_id is required for E2E test generation",
             ));
         }
-        if self.definition.trim().is_empty() {
-            return Err(ApiError::validation("Pipeline definition cannot be empty"));
+
+        // For other test types, target is required
+        if !matches!(self.test_type, orchestrate_core::TestType::E2e) && self.target.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "target is required for test generation",
+            ));
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct UpdatePipelineRequest {
-    pub definition: Option<String>,
-    pub enabled: Option<bool>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PipelineResponse {
-    pub id: i64,
+pub struct TestCaseResponse {
     pub name: String,
-    pub definition: String,
-    pub enabled: bool,
-    pub created_at: String,
+    pub category: String,
+    pub code: String,
 }
 
-impl From<Pipeline> for PipelineResponse {
-    fn from(pipeline: Pipeline) -> Self {
+impl From<orchestrate_core::TestCase> for TestCaseResponse {
+    fn from(tc: orchestrate_core::TestCase) -> Self {
         Self {
-            id: pipeline.id.unwrap_or(0),
-            name: pipeline.name,
-            definition: pipeline.definition,
-            enabled: pipeline.enabled,
-            created_at: pipeline.created_at.to_rfc3339(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TriggerRunRequest {
-    pub trigger_event: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PipelineRunResponse {
-    pub id: i64,
-    pub pipeline_id: i64,
-    pub status: String,
-    pub trigger_event: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-    pub created_at: String,
-}
-
-impl From<PipelineRun> for PipelineRunResponse {
-    fn from(run: PipelineRun) -> Self {
-        Self {
-            id: run.id.unwrap_or(0),
-            pipeline_id: run.pipeline_id,
-            status: run.status.as_str().to_string(),
-            trigger_event: run.trigger_event,
-            started_at: run.started_at.map(|dt| dt.to_rfc3339()),
-            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
-            created_at: run.created_at.to_rfc3339(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PipelineStageResponse {
-    pub id: i64,
-    pub run_id: i64,
-    pub stage_name: String,
-    pub status: String,
-    pub agent_id: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-    pub created_at: String,
-}
-
-impl From<PipelineStage> for PipelineStageResponse {
-    fn from(stage: PipelineStage) -> Self {
-        Self {
-            id: stage.id.unwrap_or(0),
-            run_id: stage.run_id,
-            stage_name: stage.stage_name,
-            status: stage.status.as_str().to_string(),
-            agent_id: stage.agent_id,
-            started_at: stage.started_at.map(|dt| dt.to_rfc3339()),
-            completed_at: stage.completed_at.map(|dt| dt.to_rfc3339()),
-            created_at: stage.created_at.to_rfc3339(),
-        }
-    }
-}
-
-// ==================== Approval Request/Response Types ====================
-
-#[derive(Debug, Deserialize)]
-pub struct ApprovalDecisionRequest {
-    pub approver: String,
-    pub comment: Option<String>,
-}
-
-impl ApprovalDecisionRequest {
-    fn validate(&self) -> Result<(), ApiError> {
-        if self.approver.trim().is_empty() {
-            return Err(ApiError::validation("Approver cannot be empty"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ApprovalResponse {
-    pub id: i64,
-    pub stage_id: i64,
-    pub run_id: i64,
-    pub status: String,
-    pub required_approvers: String,
-    pub required_count: i32,
-    pub approval_count: i32,
-    pub rejection_count: i32,
-    pub timeout_seconds: Option<i64>,
-    pub timeout_action: Option<String>,
-    pub timeout_at: Option<String>,
-    pub resolved_at: Option<String>,
-    pub created_at: String,
-}
-
-impl From<ApprovalRequest> for ApprovalResponse {
-    fn from(req: ApprovalRequest) -> Self {
-        Self {
-            id: req.id.unwrap_or(0),
-            stage_id: req.stage_id,
-            run_id: req.run_id,
-            status: req.status.as_str().to_string(),
-            required_approvers: req.required_approvers,
-            required_count: req.required_count,
-            approval_count: req.approval_count,
-            rejection_count: req.rejection_count,
-            timeout_seconds: req.timeout_seconds,
-            timeout_action: req.timeout_action,
-            timeout_at: req.timeout_at.map(|dt| dt.to_rfc3339()),
-            resolved_at: req.resolved_at.map(|dt| dt.to_rfc3339()),
-            created_at: req.created_at.to_rfc3339(),
-        }
-    }
-}
-
-// ==================== Schedule Handlers ====================
-
-async fn list_schedules(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<ScheduleResponse>>, ApiError> {
-    let schedules = state
-        .db
-        .list_schedules(false)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(schedules.into_iter().map(Into::into).collect()))
-}
-
-async fn get_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let schedule = state
-        .db
-        .get_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
-
-    Ok(Json(schedule.into()))
-}
-
-async fn create_schedule(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateScheduleRequest>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    req.validate()?;
-
-    let mut schedule = Schedule::new(
-        req.name,
-        req.cron_expression,
-        req.agent_type,
-        req.task,
-    );
-
-    schedule
-        .validate_cron()
-        .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
-
-    schedule
-        .update_next_run()
-        .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
-
-    if let Some(enabled) = req.enabled {
-        schedule.enabled = enabled;
-    }
-
-    let id = state
-        .db
-        .insert_schedule(&schedule)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    schedule.id = id;
-    Ok(Json(schedule.into()))
-}
-
-async fn update_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Json(req): Json<UpdateScheduleRequest>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let mut schedule = state
-        .db
-        .get_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
-
-    if let Some(name) = req.name {
-        schedule.name = name;
-    }
-    if let Some(cron_expression) = req.cron_expression {
-        schedule.cron_expression = cron_expression;
-        schedule
-            .validate_cron()
-            .map_err(|e| ApiError::validation(format!("Invalid cron expression: {}", e)))?;
-        schedule
-            .update_next_run()
-            .map_err(|e| ApiError::internal(format!("Failed to calculate next run: {}", e)))?;
-    }
-    if let Some(agent_type) = req.agent_type {
-        schedule.agent_type = agent_type;
-    }
-    if let Some(task) = req.task {
-        schedule.task = task;
-    }
-    if let Some(enabled) = req.enabled {
-        schedule.enabled = enabled;
-    }
-
-    state
-        .db
-        .update_schedule(&schedule)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(schedule.into()))
-}
-
-async fn delete_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    state
-        .db
-        .delete_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn pause_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let mut schedule = state
-        .db
-        .get_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
-
-    schedule.enabled = false;
-    state
-        .db
-        .update_schedule(&schedule)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(schedule.into()))
-}
-
-async fn resume_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ScheduleResponse>, ApiError> {
-    let mut schedule = state
-        .db
-        .get_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
-
-    schedule.enabled = true;
-    state
-        .db
-        .update_schedule(&schedule)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(schedule.into()))
-}
-
-async fn run_schedule(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ScheduleRunResponse>, ApiError> {
-    let schedule = state
-        .db
-        .get_schedule(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Schedule"))?;
-
-    let run = ScheduleRun::new(schedule.id);
-    let run_id = state
-        .db
-        .insert_schedule_run(&run)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    // Retrieve the created run from the list of runs
-    let runs = state
-        .db
-        .get_schedule_runs(schedule.id, 1)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let run = runs
-        .into_iter()
-        .find(|r| r.id == run_id)
-        .ok_or_else(|| ApiError::internal("Failed to retrieve created run".to_string()))?;
-
-    Ok(Json(run.into()))
-}
-
-async fn get_schedule_runs(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Vec<ScheduleRunResponse>>, ApiError> {
-    let runs = state
-        .db
-        .get_schedule_runs(id, 50)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(runs.into_iter().map(Into::into).collect()))
-}
-
-// ==================== Schedule Request/Response Types ====================
-
-#[derive(Debug, Deserialize)]
-struct CreateScheduleRequest {
-    name: String,
-    cron_expression: String,
-    agent_type: String,
-    task: String,
-    enabled: Option<bool>,
-}
-
-impl CreateScheduleRequest {
-    fn validate(&self) -> Result<(), ApiError> {
-        if self.name.is_empty() || self.name.len() > 255 {
-            return Err(ApiError::validation("Name must be 1-255 characters"));
-        }
-        if self.cron_expression.is_empty() {
-            return Err(ApiError::validation("Cron expression is required"));
-        }
-        if self.agent_type.is_empty() {
-            return Err(ApiError::validation("Agent type is required"));
-        }
-        if self.task.is_empty() || self.task.len() > MAX_TASK_LENGTH {
-            return Err(ApiError::validation(format!(
-                "Task must be 1-{} characters",
-                MAX_TASK_LENGTH
-            )));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateScheduleRequest {
-    name: Option<String>,
-    cron_expression: Option<String>,
-    agent_type: Option<String>,
-    task: Option<String>,
-    enabled: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct ScheduleResponse {
-    id: i64,
-    name: String,
-    cron_expression: String,
-    agent_type: String,
-    task: String,
-    enabled: bool,
-    next_run_at: Option<String>,
-    last_run_at: Option<String>,
-    created_at: String,
-}
-
-impl From<Schedule> for ScheduleResponse {
-    fn from(schedule: Schedule) -> Self {
-        Self {
-            id: schedule.id,
-            name: schedule.name,
-            cron_expression: schedule.cron_expression,
-            agent_type: schedule.agent_type,
-            task: schedule.task,
-            enabled: schedule.enabled,
-            next_run_at: schedule.next_run.map(|dt| dt.to_rfc3339()),
-            last_run_at: schedule.last_run.map(|dt| dt.to_rfc3339()),
-            created_at: schedule.created_at.to_rfc3339(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ScheduleRunResponse {
-    id: i64,
-    schedule_id: i64,
-    status: String,
-    agent_id: Option<String>,
-    error_message: Option<String>,
-    started_at: String,
-    completed_at: Option<String>,
-}
-
-impl From<ScheduleRun> for ScheduleRunResponse {
-    fn from(run: ScheduleRun) -> Self {
-        Self {
-            id: run.id,
-            schedule_id: run.schedule_id,
-            status: run.status.as_str().to_string(),
-            agent_id: run.agent_id,
-            error_message: run.error_message,
-            started_at: run.started_at.to_rfc3339(),
-            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
-        }
-    }
-}
-
-// ==================== Feedback Handlers ====================
-
-#[derive(Debug, Deserialize)]
-struct CreateFeedbackRequest {
-    agent_id: String,
-    rating: String,
-    #[serde(default)]
-    comment: Option<String>,
-    #[serde(default)]
-    message_id: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-struct FeedbackResponse {
-    id: i64,
-    agent_id: String,
-    message_id: Option<i64>,
-    rating: String,
-    comment: Option<String>,
-    source: String,
-    created_by: String,
-    created_at: String,
-}
-
-impl From<Feedback> for FeedbackResponse {
-    fn from(fb: Feedback) -> Self {
-        Self {
-            id: fb.id,
-            agent_id: fb.agent_id.to_string(),
-            message_id: fb.message_id,
-            rating: fb.rating.as_str().to_string(),
-            comment: fb.comment,
-            source: fb.source.as_str().to_string(),
-            created_by: fb.created_by,
-            created_at: fb.created_at.to_rfc3339(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct FeedbackStatsResponse {
-    total: i64,
-    positive: i64,
-    negative: i64,
-    neutral: i64,
-    score: f64,
-    positive_percentage: f64,
-}
-
-impl From<FeedbackStats> for FeedbackStatsResponse {
-    fn from(stats: FeedbackStats) -> Self {
-        Self {
-            total: stats.total,
-            positive: stats.positive,
-            negative: stats.negative,
-            neutral: stats.neutral,
-            score: stats.score,
-            positive_percentage: stats.positive_percentage,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct FeedbackListQuery {
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default)]
-    rating: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default = "default_feedback_limit")]
-    limit: i64,
-}
-
-fn default_feedback_limit() -> i64 {
-    50
-}
-
-async fn create_feedback(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateFeedbackRequest>,
-) -> Result<Json<FeedbackResponse>, ApiError> {
-    use std::str::FromStr;
-
-    // Parse agent ID
-    let agent_uuid = Uuid::parse_str(&req.agent_id)
-        .map_err(|e| ApiError::validation(format!("Invalid agent ID: {}", e)))?;
-
-    // Verify agent exists
-    if state.db.get_agent(agent_uuid).await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .is_none()
-    {
-        return Err(ApiError::not_found("Agent"));
-    }
-
-    // Parse rating
-    let rating = FeedbackRating::from_str(&req.rating)
-        .map_err(|_| ApiError::validation("Invalid rating. Use: positive, negative, neutral"))?;
-
-    // Build feedback
-    let mut feedback = Feedback::new(agent_uuid, rating, "api")
-        .with_source(FeedbackSource::Api);
-
-    if let Some(msg_id) = req.message_id {
-        feedback = feedback.with_message_id(msg_id);
-    }
-
-    if let Some(comment) = req.comment {
-        feedback = feedback.with_comment(comment);
-    }
-
-    // Insert feedback
-    let id = state.db.insert_feedback(&feedback).await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    // Retrieve the created feedback
-    let created = state.db.get_feedback(id).await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::internal("Failed to retrieve created feedback".to_string()))?;
-
-    Ok(Json(created.into()))
-}
-
-async fn list_feedback(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<FeedbackListQuery>,
-) -> Result<Json<Vec<FeedbackResponse>>, ApiError> {
-    use std::str::FromStr;
-
-    let feedbacks = if let Some(agent_id) = query.agent_id {
-        let agent_uuid = Uuid::parse_str(&agent_id)
-            .map_err(|e| ApiError::validation(format!("Invalid agent ID: {}", e)))?;
-        state.db.list_feedback_for_agent(agent_uuid, query.limit).await
-    } else {
-        let rating_filter = query.rating
-            .as_ref()
-            .map(|r| FeedbackRating::from_str(r))
-            .transpose()
-            .map_err(|_| ApiError::validation("Invalid rating filter"))?;
-        let source_filter = query.source
-            .as_ref()
-            .map(|s| FeedbackSource::from_str(s))
-            .transpose()
-            .map_err(|_| ApiError::validation("Invalid source filter"))?;
-        state.db.list_feedback(rating_filter, source_filter, query.limit).await
-    };
-
-    let feedbacks = feedbacks
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(feedbacks.into_iter().map(Into::into).collect()))
-}
-
-async fn get_feedback(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<FeedbackResponse>, ApiError> {
-    let feedback = state.db.get_feedback(id).await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Feedback"))?;
-
-    Ok(Json(feedback.into()))
-}
-
-async fn delete_feedback(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    let deleted = state.db.delete_feedback(id).await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    if deleted {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::not_found("Feedback"))
-    }
-}
-
-async fn get_feedback_stats(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<FeedbackStatsQuery>,
-) -> Result<Json<FeedbackStatsResponse>, ApiError> {
-    let stats = if let Some(agent_id) = query.agent_id {
-        let agent_uuid = Uuid::parse_str(&agent_id)
-            .map_err(|e| ApiError::validation(format!("Invalid agent ID: {}", e)))?;
-        state.db.get_feedback_stats_for_agent(agent_uuid).await
-    } else {
-        state.db.get_feedback_stats().await
-    };
-
-    let stats = stats
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(stats.into()))
-}
-
-#[derive(Debug, Deserialize)]
-struct FeedbackStatsQuery {
-    #[serde(default)]
-    agent_id: Option<String>,
-}
-
-// ==================== Learning Analytics Handlers ====================
-
-#[derive(Debug, Serialize)]
-struct LearningEffectivenessResponse {
-    instructions: Vec<InstructionEffectivenessItem>,
-    summary: EffectivenessSummaryItem,
-}
-
-#[derive(Debug, Serialize)]
-struct InstructionEffectivenessItem {
-    instruction_id: i64,
-    name: String,
-    source: String,
-    enabled: bool,
-    usage_count: i64,
-    success_rate: f64,
-    penalty_score: f64,
-    level: String,
-}
-
-#[derive(Debug, Serialize)]
-struct EffectivenessSummaryItem {
-    total_instructions: i64,
-    enabled_count: i64,
-    used_count: i64,
-    total_usage: i64,
-    avg_success_rate: f64,
-    avg_penalty_score: f64,
-    ineffective_count: i64,
-}
-
-async fn get_learning_effectiveness(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<EffectivenessQuery>,
-) -> Result<Json<LearningEffectivenessResponse>, ApiError> {
-    let instructions = state
-        .db
-        .list_instruction_effectiveness(query.include_disabled.unwrap_or(false), query.min_usage.unwrap_or(1))
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let summary = state
-        .db
-        .get_effectiveness_summary()
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let items: Vec<InstructionEffectivenessItem> = instructions
-        .into_iter()
-        .map(|i| InstructionEffectivenessItem {
-            instruction_id: i.instruction_id,
-            name: i.name.clone(),
-            source: i.instruction_source.clone(),
-            enabled: i.enabled,
-            usage_count: i.usage_count,
-            success_rate: i.success_rate,
-            penalty_score: i.penalty_score,
-            level: i.effectiveness_level().to_string(),
-        })
-        .collect();
-
-    Ok(Json(LearningEffectivenessResponse {
-        instructions: items,
-        summary: EffectivenessSummaryItem {
-            total_instructions: summary.total_instructions,
-            enabled_count: summary.enabled_count,
-            used_count: summary.used_count,
-            total_usage: summary.total_usage,
-            avg_success_rate: summary.avg_success_rate,
-            avg_penalty_score: summary.avg_penalty_score,
-            ineffective_count: summary.ineffective_count,
-        },
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-struct EffectivenessQuery {
-    #[serde(default)]
-    min_usage: Option<i64>,
-    #[serde(default)]
-    include_disabled: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SuggestionResponse {
-    suggestions: Vec<SuggestionItem>,
-    total: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct SuggestionItem {
-    instruction_id: i64,
-    name: String,
-    success_rate: f64,
-    usage_count: i64,
-    suggestion: String,
-}
-
-async fn get_learning_suggestions(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<SuggestionsQuery>,
-) -> Result<Json<SuggestionResponse>, ApiError> {
-    let ineffective = state
-        .db
-        .list_ineffective_instructions(0.5, 5)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let limit = query.limit.unwrap_or(10);
-    let suggestions: Vec<SuggestionItem> = ineffective
-        .into_iter()
-        .take(limit)
-        .map(|i| SuggestionItem {
-            instruction_id: i.instruction_id,
-            name: i.name.clone(),
-            success_rate: i.success_rate,
-            usage_count: i.usage_count,
-            suggestion: "Review and update instruction content or disable if no longer relevant".to_string(),
-        })
-        .collect();
-
-    let total = suggestions.len();
-    Ok(Json(SuggestionResponse { suggestions, total }))
-}
-
-#[derive(Debug, Deserialize)]
-struct SuggestionsQuery {
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct AnalysisResponse {
-    patterns_processed: usize,
-    instructions_created: Vec<String>,
-}
-
-async fn trigger_learning_analysis(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<AnalysisResponse>, ApiError> {
-    let engine = LearningEngine::new();
-    let created = engine
-        .process_patterns(&state.db)
-        .await
-        .map_err(|e| ApiError::internal(format!("Analysis error: {}", e)))?;
-
-    Ok(Json(AnalysisResponse {
-        patterns_processed: created.len(),
-        instructions_created: created.iter().map(|i| i.name.clone()).collect(),
-    }))
-}
-
-// ==================== Experiment Handlers ====================
-
-use orchestrate_core::{Experiment, ExperimentStatus, ExperimentType, ExperimentMetric};
-
-#[derive(Debug, Serialize)]
-struct ExperimentResponse {
-    id: i64,
-    name: String,
-    description: Option<String>,
-    experiment_type: String,
-    metric: String,
-    status: String,
-    min_samples: i64,
-    confidence_level: f64,
-    created_at: String,
-}
-
-impl From<Experiment> for ExperimentResponse {
-    fn from(exp: Experiment) -> Self {
-        Self {
-            id: exp.id,
-            name: exp.name,
-            description: exp.description,
-            experiment_type: exp.experiment_type.as_str().to_string(),
-            metric: exp.metric.as_str().to_string(),
-            status: exp.status.as_str().to_string(),
-            min_samples: exp.min_samples,
-            confidence_level: exp.confidence_level,
-            created_at: exp.created_at.to_rfc3339(),
-        }
-    }
-}
-
-async fn list_experiments(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<ExperimentListQuery>,
-) -> Result<Json<Vec<ExperimentResponse>>, ApiError> {
-    let status_filter = query.status.as_ref().and_then(|s| {
-        use std::str::FromStr;
-        ExperimentStatus::from_str(s).ok()
-    });
-
-    let experiments = state
-        .db
-        .list_experiments(status_filter, query.limit.unwrap_or(100))
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(experiments.into_iter().map(Into::into).collect()))
-}
-
-#[derive(Debug, Deserialize)]
-struct ExperimentListQuery {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateExperimentRequest {
-    name: String,
-    description: Option<String>,
-    experiment_type: String,
-    metric: String,
-    min_samples: Option<i64>,
-    confidence_level: Option<f64>,
-}
-
-async fn create_experiment(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateExperimentRequest>,
-) -> Result<Json<ExperimentResponse>, ApiError> {
-    use std::str::FromStr;
-
-    let experiment_type = ExperimentType::from_str(&req.experiment_type)
-        .map_err(|_| ApiError::validation(format!("Invalid experiment type: {}", req.experiment_type)))?;
-
-    let metric = ExperimentMetric::from_str(&req.metric)
-        .map_err(|_| ApiError::validation(format!("Invalid metric: {}", req.metric)))?;
-
-    let experiment = Experiment {
-        id: 0,
-        name: req.name,
-        description: req.description,
-        hypothesis: None,
-        experiment_type,
-        metric,
-        agent_type: None,
-        status: ExperimentStatus::Draft,
-        min_samples: req.min_samples.unwrap_or(100),
-        confidence_level: req.confidence_level.unwrap_or(0.95),
-        created_at: chrono::Utc::now(),
-        started_at: None,
-        completed_at: None,
-        winner_variant_id: None,
-    };
-
-    let id = state
-        .db
-        .create_experiment(&experiment)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let created = state
-        .db
-        .get_experiment(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::internal("Failed to retrieve created experiment"))?;
-
-    Ok(Json(created.into()))
-}
-
-async fn get_experiment(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ExperimentResponse>, ApiError> {
-    let experiment = state
-        .db
-        .get_experiment(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Experiment"))?;
-
-    Ok(Json(experiment.into()))
-}
-
-#[derive(Debug, Serialize)]
-struct ExperimentResultsResponse {
-    experiment_id: i64,
-    variants: Vec<VariantResultItem>,
-    is_significant: bool,
-    p_value: Option<f64>,
-    improvement: Option<f64>,
-    winning_variant: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct VariantResultItem {
-    variant_id: i64,
-    name: String,
-    is_control: bool,
-    sample_count: i64,
-    mean: f64,
-    std_dev: f64,
-    success_rate: f64,
-}
-
-async fn get_experiment_results(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<ExperimentResultsResponse>, ApiError> {
-    let experiment = state
-        .db
-        .get_experiment(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Experiment"))?;
-
-    let results = state
-        .db
-        .get_experiment_results(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let variants: Vec<VariantResultItem> = results
-        .iter()
-        .map(|v| VariantResultItem {
-            variant_id: v.variant_id,
-            name: v.variant_name.clone(),
-            is_control: v.is_control,
-            sample_count: v.sample_count,
-            mean: v.mean,
-            std_dev: v.std_dev,
-            success_rate: v.success_rate.unwrap_or(0.0),
-        })
-        .collect();
-
-    // Calculate significance if we have control and treatment
-    let (is_significant, p_value, improvement, winning_variant) = if let (Some(control), Some(treatment)) =
-        (results.iter().find(|v| v.is_control), results.iter().find(|v| !v.is_control))
-    {
-        use orchestrate_core::ExperimentResults;
-        let (sig, pval) = ExperimentResults::calculate_significance(control, treatment, experiment.confidence_level);
-        let imp = ExperimentResults::calculate_improvement(control.mean, treatment.mean);
-        let winner = if sig {
-            if treatment.mean > control.mean {
-                Some(treatment.variant_name.clone())
-            } else {
-                Some(control.variant_name.clone())
-            }
-        } else {
-            None
-        };
-        (sig, Some(pval), Some(imp), winner)
-    } else {
-        (false, None, None, None)
-    };
-
-    Ok(Json(ExperimentResultsResponse {
-        experiment_id: id,
-        variants,
-        is_significant,
-        p_value,
-        improvement,
-        winning_variant,
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-struct PromoteExperimentRequest {
-    winner_variant_id: i64,
-}
-
-async fn promote_experiment(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Json(req): Json<PromoteExperimentRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let experiment = state
-        .db
-        .get_experiment(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Experiment"))?;
-
-    // Complete the experiment with the winner
-    state
-        .db
-        .update_experiment_status(id, ExperimentStatus::Completed)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(serde_json::json!({
-        "message": format!("Experiment '{}' completed with variant {} as winner", experiment.name, req.winner_variant_id),
-        "experiment_id": id,
-        "winner_variant_id": req.winner_variant_id
-    })))
-}
-
-// ==================== Prediction Handlers ====================
-
-#[derive(Debug, Deserialize)]
-struct PredictionRequest {
-    task: String,
-    agent_type: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct PredictionResponse {
-    task_description: String,
-    success_probability: f64,
-    confidence: f64,
-    estimated_tokens: TokenEstimateItem,
-    estimated_duration: DurationEstimateItem,
-    recommended_model: String,
-    risk_factors: Vec<RiskFactorItem>,
-    recommendations: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct TokenEstimateItem {
-    min: i64,
-    max: i64,
-    expected: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct DurationEstimateItem {
-    min_minutes: f64,
-    max_minutes: f64,
-    expected_minutes: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct RiskFactorItem {
-    name: String,
-    description: String,
-    severity: String,
-    impact_on_success: f64,
-}
-
-async fn get_prediction(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PredictionRequest>,
-) -> Result<Json<PredictionResponse>, ApiError> {
-    use orchestrate_core::predict_task_outcome;
-
-    // Parse agent type if provided
-    let agent_type_parsed = req.agent_type.as_ref().and_then(|t| {
-        use std::str::FromStr;
-        AgentType::from_str(t).ok()
-    });
-
-    // Get historical data for prediction
-    let agents = state
-        .db
-        .list_agents_paginated(1000, 0, None, agent_type_parsed)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let total_agents = agents.len();
-    let successful = agents
-        .iter()
-        .filter(|a| a.state == AgentState::Completed)
-        .count();
-    let historical_success_rate = if total_agents > 0 {
-        successful as f64 / total_agents as f64
-    } else {
-        0.75 // Default assumption
-    };
-
-    let prediction = predict_task_outcome(
-        &req.task,
-        historical_success_rate,
-        50000, // Default token estimate
-        30.0,  // Default duration estimate
-        total_agents as i64,
-    );
-
-    Ok(Json(PredictionResponse {
-        task_description: prediction.task_description,
-        success_probability: prediction.success_probability,
-        confidence: prediction.confidence,
-        estimated_tokens: TokenEstimateItem {
-            min: prediction.estimated_tokens.min,
-            max: prediction.estimated_tokens.max,
-            expected: prediction.estimated_tokens.expected,
-        },
-        estimated_duration: DurationEstimateItem {
-            min_minutes: prediction.estimated_duration.min_minutes,
-            max_minutes: prediction.estimated_duration.max_minutes,
-            expected_minutes: prediction.estimated_duration.expected_minutes,
-        },
-        recommended_model: prediction.recommended_model,
-        risk_factors: prediction
-            .risk_factors
-            .into_iter()
-            .map(|r| RiskFactorItem {
-                name: r.name,
-                description: r.description,
-                severity: r.severity.as_str().to_string(),
-                impact_on_success: r.impact_on_success,
-            })
-            .collect(),
-        recommendations: prediction.recommendations,
-    }))
-}
-
-// ==================== Documentation Handlers ====================
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DocGenerateRequest {
-    doc_type: String,
-    format: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DocGenerateResponse {
-    doc_type: String,
-    format: String,
-    content: String,
-    generated_at: String,
-}
-
-async fn generate_documentation(
-    State(_state): State<Arc<AppState>>,
-    Json(req): Json<DocGenerateRequest>,
-) -> Result<Json<DocGenerateResponse>, ApiError> {
-    use orchestrate_core::{ApiDocumentation, ApiEndpoint, ReadmeContent, ReadmeSectionContent, ReadmeSection};
-
-    let format = req.format.unwrap_or_else(|| "yaml".to_string());
-
-    let content = match req.doc_type.to_lowercase().as_str() {
-        "api" => {
-            let mut api_doc = ApiDocumentation::new(
-                "Orchestrate API",
-                "1.0.0",
-                Some("Agent orchestration and automation API"),
-            );
-            api_doc.add_server("http://localhost:8080", Some("Development server"));
-
-            // Add basic endpoints
-            api_doc.add_endpoint(
-                ApiEndpoint::new("GET", "/api/agents")
-                    .with_summary("List all agents")
-                    .with_tag("agents"),
-            );
-            api_doc.add_endpoint(
-                ApiEndpoint::new("GET", "/api/agents/{id}")
-                    .with_summary("Get agent by ID")
-                    .with_tag("agents")
-                    .with_path_param("id", Some("Agent UUID")),
-            );
-            api_doc.add_endpoint(
-                ApiEndpoint::new("POST", "/api/agents")
-                    .with_summary("Create a new agent")
-                    .with_tag("agents"),
-            );
-            api_doc.add_endpoint(
-                ApiEndpoint::new("GET", "/api/sessions")
-                    .with_summary("List sessions")
-                    .with_tag("sessions"),
-            );
-            api_doc.add_endpoint(
-                ApiEndpoint::new("GET", "/api/prs")
-                    .with_summary("List pull requests")
-                    .with_tag("pull-requests"),
-            );
-
-            match format.to_lowercase().as_str() {
-                "yaml" | "yml" => api_doc.to_openapi_yaml(),
-                "json" => serde_json::to_string_pretty(&api_doc.to_openapi_json())
-                    .map_err(|e| ApiError::internal(format!("JSON error: {}", e)))?,
-                _ => return Err(ApiError::bad_request(format!("Unknown format: {}", format))),
-            }
-        }
-        "readme" => {
-            let readme = ReadmeContent {
-                sections: vec![
-                    ReadmeSectionContent {
-                        section_type: ReadmeSection::Title,
-                        heading: Some("# Orchestrate".to_string()),
-                        content: "An agent orchestration and automation system".to_string(),
-                    },
-                    ReadmeSectionContent {
-                        section_type: ReadmeSection::Installation,
-                        heading: Some("## Installation".to_string()),
-                        content: "```bash\ncargo install orchestrate\n```".to_string(),
-                    },
-                    ReadmeSectionContent {
-                        section_type: ReadmeSection::Usage,
-                        heading: Some("## Usage".to_string()),
-                        content: "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
-                    },
-                ],
-            };
-
-            readme.to_markdown()
-        }
-        _ => {
-            return Err(ApiError::bad_request(format!(
-                "Unknown doc type: {}. Valid: api, readme",
-                req.doc_type
-            )))
-        }
-    };
-
-    Ok(Json(DocGenerateResponse {
-        doc_type: req.doc_type,
-        format,
-        content,
-        generated_at: chrono::Utc::now().to_rfc3339(),
-    }))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DocValidateRequest {
-    path: Option<String>,
-    coverage_threshold: Option<u32>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct DocValidateResponse {
-    total_items: usize,
-    documented_items: usize,
-    coverage_percentage: f64,
-    issues_count: usize,
-    is_valid: bool,
-    summary: String,
-}
-
-async fn validate_documentation(
-    State(_state): State<Arc<AppState>>,
-    Json(req): Json<DocValidateRequest>,
-) -> Result<Json<DocValidateResponse>, ApiError> {
-    use orchestrate_core::DocValidationResult;
-
-    let _check_path = req.path.unwrap_or_else(|| ".".to_string());
-    let _threshold = req.coverage_threshold.unwrap_or(80);
-
-    // Create a mock validation result for now
-    let mut result = DocValidationResult::new();
-    result.total_items = 100;
-    result.documented_items = 85;
-    result.calculate_coverage();
-
-    Ok(Json(DocValidateResponse {
-        total_items: result.total_items,
-        documented_items: result.documented_items,
-        coverage_percentage: result.coverage_percentage,
-        issues_count: result.issues.len(),
-        is_valid: result.is_valid(),
-        summary: result.to_summary(),
-    }))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AdrListItem {
-    number: u32,
-    title: String,
-    status: String,
-    file_path: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AdrListResponse {
-    adrs: Vec<AdrListItem>,
-    total: usize,
-}
-
-async fn list_adrs(
-    State(_state): State<Arc<AppState>>,
-) -> Result<Json<AdrListResponse>, ApiError> {
-    let adr_dir = std::path::Path::new("docs/adrs");
-    let mut adrs = vec![];
-
-    if adr_dir.exists() {
-        let entries: Vec<_> = std::fs::read_dir(adr_dir)
-            .map_err(|e| ApiError::internal(format!("Failed to read ADR directory: {}", e)))?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
-            .collect();
-
-        for entry in entries {
-            let content = std::fs::read_to_string(entry.path())
-                .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            // Parse number from filename
-            let number = name_str
-                .strip_prefix("adr-")
-                .and_then(|s| s.strip_suffix(".md"))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-
-            // Parse title from first line
-            let title = content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim_start_matches("# ")
-                .to_string();
-
-            // Parse status
-            let status = content
-                .lines()
-                .skip_while(|l| !l.starts_with("## Status"))
-                .nth(2)
-                .unwrap_or("Unknown")
-                .to_string();
-
-            adrs.push(AdrListItem {
-                number,
-                title,
-                status,
-                file_path: entry.path().to_string_lossy().to_string(),
-            });
-        }
-    }
-
-    adrs.sort_by_key(|a| a.number);
-    let total = adrs.len();
-
-    Ok(Json(AdrListResponse { adrs, total }))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AdrCreateRequest {
-    title: String,
-    status: Option<String>,
-    context: Option<String>,
-    decision: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AdrCreateResponse {
-    number: u32,
-    title: String,
-    status: String,
-    file_path: String,
-}
-
-async fn create_adr(
-    State(_state): State<Arc<AppState>>,
-    Json(req): Json<AdrCreateRequest>,
-) -> Result<Json<AdrCreateResponse>, ApiError> {
-    use orchestrate_core::{Adr, AdrStatus};
-    use std::str::FromStr;
-
-    let status_str = req.status.unwrap_or_else(|| "proposed".to_string());
-    let adr_status = AdrStatus::from_str(&status_str)
-        .map_err(|_| ApiError::bad_request(format!("Invalid status: {}", status_str)))?;
-
-    // Find the next ADR number
-    let adr_dir = std::path::Path::new("docs/adrs");
-    std::fs::create_dir_all(adr_dir)
-        .map_err(|e| ApiError::internal(format!("Failed to create ADR directory: {}", e)))?;
-
-    let mut max_number = 0u32;
-    if adr_dir.exists() {
-        for entry in std::fs::read_dir(adr_dir)
-            .map_err(|e| ApiError::internal(format!("Failed to read directory: {}", e)))?
-        {
-            if let Ok(entry) = entry {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if let Some(num_str) = name
-                    .strip_prefix("adr-")
-                    .and_then(|s| s.strip_suffix(".md"))
-                {
-                    if let Ok(num) = num_str.parse::<u32>() {
-                        max_number = max_number.max(num);
-                    }
-                }
-            }
-        }
-    }
-    let adr_number = max_number + 1;
-
-    let adr = Adr {
-        number: adr_number as i32,
-        title: req.title.clone(),
-        status: adr_status,
-        date: chrono::Utc::now(),
-        context: req.context.unwrap_or_default(),
-        decision: req.decision.unwrap_or_default(),
-        consequences: vec![],
-        related_adrs: vec![],
-        superseded_by: None,
-        tags: vec![],
-    };
-
-    let file_path = adr_dir.join(format!("adr-{:04}.md", adr_number));
-    std::fs::write(&file_path, adr.to_markdown())
-        .map_err(|e| ApiError::internal(format!("Failed to write ADR: {}", e)))?;
-
-    Ok(Json(AdrCreateResponse {
-        number: adr_number,
-        title: req.title,
-        status: status_str,
-        file_path: file_path.to_string_lossy().to_string(),
-    }))
-}
-
-async fn get_adr(
-    State(_state): State<Arc<AppState>>,
-    Path(number): Path<u32>,
-) -> Result<String, ApiError> {
-    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
-    if !adr_path.exists() {
-        return Err(ApiError::not_found(&format!("ADR adr-{:04}", number)));
-    }
-    std::fs::read_to_string(&adr_path)
-        .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AdrUpdateRequest {
-    status: Option<String>,
-    superseded_by: Option<u32>,
-}
-
-async fn update_adr(
-    State(_state): State<Arc<AppState>>,
-    Path(number): Path<u32>,
-    Json(req): Json<AdrUpdateRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
-    if !adr_path.exists() {
-        return Err(ApiError::not_found(&format!("ADR adr-{:04}", number)));
-    }
-
-    let content = std::fs::read_to_string(&adr_path)
-        .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))?;
-
-    let mut new_content = String::new();
-    let mut in_status_section = false;
-    let mut status_updated = false;
-
-    for line in content.lines() {
-        if line.starts_with("## Status") {
-            in_status_section = true;
-            new_content.push_str(line);
-            new_content.push('\n');
-        } else if in_status_section && !status_updated && !line.is_empty() {
-            if let Some(ref new_status) = req.status {
-                let mut status_line = new_status.clone();
-                if let Some(by) = req.superseded_by {
-                    status_line.push_str(&format!(" by [ADR-{:04}](./adr-{:04}.md)", by, by));
-                }
-                new_content.push_str(&status_line);
-                new_content.push('\n');
-            } else {
-                new_content.push_str(line);
-                new_content.push('\n');
-            }
-            status_updated = true;
-            in_status_section = false;
-        } else {
-            new_content.push_str(line);
-            new_content.push('\n');
-        }
-    }
-
-    std::fs::write(&adr_path, new_content)
-        .map_err(|e| ApiError::internal(format!("Failed to write ADR: {}", e)))?;
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "number": number,
-        "status": req.status.unwrap_or_else(|| "unchanged".to_string())
-    })))
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChangelogRequest {
-    from: Option<String>,
-    to: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChangelogResponse {
-    version: String,
-    date: String,
-    entries: Vec<ChangelogEntryItem>,
-    markdown: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChangelogEntryItem {
-    change_type: String,
-    description: String,
-    commit_hash: Option<String>,
-    author: Option<String>,
-    breaking: bool,
-}
-
-async fn generate_changelog(
-    State(_state): State<Arc<AppState>>,
-    Json(req): Json<ChangelogRequest>,
-) -> Result<Json<ChangelogResponse>, ApiError> {
-    use orchestrate_core::{ChangelogEntry, ChangelogRelease, ChangeType};
-
-    let from_ref = req.from.unwrap_or_else(|| "HEAD~20".to_string());
-    let to_ref = req.to.unwrap_or_else(|| "HEAD".to_string());
-
-    // Get git log
-    let git_output = std::process::Command::new("git")
-        .args([
-            "log",
-            "--oneline",
-            "--pretty=format:%s|%H|%an",
-            &format!("{}..{}", from_ref, to_ref),
-        ])
-        .output()
-        .map_err(|e| ApiError::internal(format!("Failed to run git: {}", e)))?;
-
-    let log_output = String::from_utf8_lossy(&git_output.stdout);
-    let mut entries = vec![];
-    let mut entry_items = vec![];
-
-    for line in log_output.lines() {
-        let parts: Vec<&str> = line.splitn(3, '|').collect();
-        if parts.len() >= 3 {
-            let message = parts[0];
-            let hash = parts[1];
-            let author = parts[2];
-
-            // Parse conventional commit
-            let change_type = if message.starts_with("feat") {
-                Some(ChangeType::Added)
-            } else if message.starts_with("fix") {
-                Some(ChangeType::Fixed)
-            } else if message.starts_with("docs") {
-                Some(ChangeType::Changed)
-            } else if message.starts_with("refactor") || message.starts_with("chore") {
-                Some(ChangeType::Changed)
-            } else {
-                None
-            };
-
-            if let Some(ct) = change_type {
-                let desc = message
-                    .split(':')
-                    .nth(1)
-                    .map(|s| s.trim())
-                    .unwrap_or(message)
-                    .to_string();
-                let breaking = message.contains("BREAKING");
-
-                entries.push(ChangelogEntry {
-                    change_type: ct,
-                    description: desc.clone(),
-                    commit_hash: Some(hash[..7].to_string()),
-                    pr_number: None,
-                    issue_number: None,
-                    author: Some(author.to_string()),
-                    scope: None,
-                    breaking,
-                });
-
-                entry_items.push(ChangelogEntryItem {
-                    change_type: ct.as_str().to_string(),
-                    description: desc,
-                    commit_hash: Some(hash[..7].to_string()),
-                    author: Some(author.to_string()),
-                    breaking,
-                });
-            }
-        }
-    }
-
-    let release = ChangelogRelease {
-        version: "Unreleased".to_string(),
-        date: chrono::Utc::now(),
-        entries,
-        yanked: false,
-    };
-
-    Ok(Json(ChangelogResponse {
-        version: release.version.clone(),
-        date: release.date.to_rfc3339(),
-        entries: entry_items,
-        markdown: release.to_markdown(),
-    }))
-}
-
-// ==================== Slack API Handlers (Story 10) ====================
-
-#[derive(Debug, Deserialize)]
-struct SlackConnectRequest {
-    token: String,
-    team_id: Option<String>,
-    team_name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SlackConnectionResponse {
-    id: String,
-    team_id: String,
-    team_name: String,
-    connected_at: String,
-    is_active: bool,
-    scopes: Vec<String>,
-}
-
-async fn slack_connect(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SlackConnectRequest>,
-) -> Result<Json<SlackConnectionResponse>, ApiError> {
-    use orchestrate_core::{SlackConnection, SlackService};
-
-    // Validate token format
-    if !req.token.starts_with("xoxb-") {
-        return Err(ApiError::validation("Invalid token format. Bot tokens should start with 'xoxb-'"));
-    }
-
-    let slack_service = SlackService::new(state.db.clone());
-
-    // In production, would call Slack API to validate token and get team info
-    let team_id = req.team_id.unwrap_or_else(|| "T_WORKSPACE".to_string());
-    let team_name = req.team_name.unwrap_or_else(|| "Workspace".to_string());
-
-    let conn = SlackConnection::new(&team_id, &team_name, &req.token)
-        .with_scopes(vec![
-            "chat:write".to_string(),
-            "chat:write.public".to_string(),
-            "commands".to_string(),
-            "users:read".to_string(),
-            "channels:read".to_string(),
-        ]);
-
-    slack_service.save_connection(&conn).await
-        .map_err(|e| ApiError::internal(format!("Failed to save connection: {}", e)))?;
-
-    Ok(Json(SlackConnectionResponse {
-        id: conn.id,
-        team_id: conn.team_id,
-        team_name: conn.team_name,
-        connected_at: conn.connected_at.to_rfc3339(),
-        is_active: conn.is_active,
-        scopes: conn.scopes,
-    }))
-}
-
-async fn slack_disconnect(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    use orchestrate_core::SlackService;
-
-    let slack_service = SlackService::new(state.db.clone());
-    let conn = slack_service.get_active_connection().await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    if let Some(mut conn) = conn {
-        conn.is_active = false;
-        slack_service.save_connection(&conn).await
-            .map_err(|e| ApiError::internal(format!("Failed to disconnect: {}", e)))?;
-
-        Ok(Json(serde_json::json!({
-            "status": "disconnected",
-            "team_name": conn.team_name
-        })))
-    } else {
-        Err(ApiError::not_found("Active Slack connection"))
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SlackStatusResponse {
-    connected: bool,
-    team_id: Option<String>,
-    team_name: Option<String>,
-    connected_at: Option<String>,
-    scopes: Vec<String>,
-    default_channel: Option<String>,
-    channel_mappings: std::collections::HashMap<String, String>,
-}
-
-async fn slack_status(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<SlackStatusResponse>, ApiError> {
-    use orchestrate_core::SlackService;
-
-    let slack_service = SlackService::new(state.db.clone());
-    let conn = slack_service.get_active_connection().await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    if let Some(conn) = conn {
-        let config = slack_service.get_channel_config(&conn.id).await
-            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-        let (default_channel, channel_mappings) = if let Some(config) = config {
-            let mappings = config.channel_mappings.iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect();
-            (Some(config.default_channel), mappings)
-        } else {
-            (None, std::collections::HashMap::new())
-        };
-
-        Ok(Json(SlackStatusResponse {
-            connected: true,
-            team_id: Some(conn.team_id),
-            team_name: Some(conn.team_name),
-            connected_at: Some(conn.connected_at.to_rfc3339()),
-            scopes: conn.scopes,
-            default_channel,
-            channel_mappings,
-        }))
-    } else {
-        Ok(Json(SlackStatusResponse {
-            connected: false,
-            team_id: None,
-            team_name: None,
-            connected_at: None,
-            scopes: Vec::new(),
-            default_channel: None,
-            channel_mappings: std::collections::HashMap::new(),
-        }))
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SlackChannel {
-    id: String,
-    name: String,
-    is_private: bool,
-}
-
-async fn slack_channels(
-    State(_state): State<Arc<AppState>>,
-) -> Result<Json<Vec<SlackChannel>>, ApiError> {
-    // In production, would fetch from Slack API
-    Ok(Json(vec![
-        SlackChannel {
-            id: "C_GENERAL".to_string(),
-            name: "#general".to_string(),
-            is_private: false,
-        },
-        SlackChannel {
-            id: "C_ORCHESTRATE".to_string(),
-            name: "#orchestrate".to_string(),
-            is_private: false,
-        },
-        SlackChannel {
-            id: "C_DEPLOYMENTS".to_string(),
-            name: "#deployments".to_string(),
-            is_private: false,
-        },
-        SlackChannel {
-            id: "C_ALERTS".to_string(),
-            name: "#alerts".to_string(),
-            is_private: false,
-        },
-    ]))
-}
-
-#[derive(Debug, Deserialize)]
-struct SlackSetChannelRequest {
-    notification_type: String,
-    channel: String,
-}
-
-async fn slack_set_channel(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SlackSetChannelRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    use orchestrate_core::{SlackService, NotificationType, ChannelConfig};
-
-    let slack_service = SlackService::new(state.db.clone());
-    let conn = slack_service.get_active_connection().await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::not_found("Active Slack connection"))?;
-
-    // Parse notification type
-    let notif_type = match req.notification_type.as_str() {
-        "agent_started" => NotificationType::AgentStarted,
-        "agent_completed" => NotificationType::AgentCompleted,
-        "agent_failed" => NotificationType::AgentFailed,
-        "pr_created" => NotificationType::PrCreated,
-        "pr_merged" => NotificationType::PrMerged,
-        "ci_failed" => NotificationType::CiFailed,
-        "deployment_failed" => NotificationType::DeploymentFailed,
-        "approval_required" => NotificationType::ApprovalRequired,
-        _ => return Err(ApiError::validation(format!("Invalid notification type: {}", req.notification_type))),
-    };
-
-    // Get or create channel config
-    let mut config = slack_service.get_channel_config(&conn.id).await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-        .unwrap_or_else(|| ChannelConfig::new("#orchestrate"));
-
-    config.channel_mappings.insert(notif_type, req.channel.clone());
-    slack_service.save_channel_config(&conn.id, &config).await
-        .map_err(|e| ApiError::internal(format!("Failed to save config: {}", e)))?;
-
-    Ok(Json(serde_json::json!({
-        "notification_type": req.notification_type,
-        "channel": req.channel,
-        "status": "updated"
-    })))
-}
-
-#[derive(Debug, Deserialize)]
-struct SlackTestRequest {
-    channel: String,
-}
-
-async fn slack_test_notification(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SlackTestRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    use orchestrate_core::{SlackService, SlackMessage, NotificationType, SlackBlock, SlackText};
-
-    let slack_service = SlackService::new(state.db.clone());
-
-    let message = SlackMessage::new(&req.channel, "Test message from Orchestrate")
-        .with_blocks(vec![
-            SlackBlock::Section {
-                text: SlackText::mrkdwn("🧪 *Test Message*\n\nThis is a test notification from Orchestrate."),
-                accessory: None,
-                fields: None,
+            name: tc.name,
+            category: match tc.category {
+                orchestrate_core::TestCategory::HappyPath => "happy_path".to_string(),
+                orchestrate_core::TestCategory::EdgeCase => "edge_case".to_string(),
+                orchestrate_core::TestCategory::ErrorCondition => "error_condition".to_string(),
             },
-        ]);
+            code: tc.code,
+        }
+    }
+}
 
-    let result = slack_service.send_notification(
-        NotificationType::Custom("test".to_string()),
-        message,
-        None,
-        None,
-    ).await
-        .map_err(|e| ApiError::internal(format!("Failed to send message: {}", e)))?;
-
-    Ok(Json(serde_json::json!({
-        "status": "sent",
-        "channel": result.channel,
-        "timestamp": result.ts
-    })))
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateTestsResponse {
+    pub test_cases: Vec<TestCaseResponse>,
+    pub generated_count: usize,
+    pub target: String,
+    pub test_type: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct SlackMapUserRequest {
-    github_username: String,
-    slack_user_id: String,
-    slack_username: String,
+pub struct CoverageReportParams {
+    pub module: Option<String>,
+    pub diff: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
-struct SlackUserMappingResponse {
-    id: String,
-    github_username: String,
-    slack_user_id: String,
-    slack_username: String,
-    notify_on_pr: bool,
-    notify_on_mention: bool,
-    notify_on_failure: bool,
-    created_at: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileCoverageResponse {
+    pub file_path: String,
+    pub lines_covered: u32,
+    pub lines_total: u32,
+    pub coverage_percent: f64,
 }
 
-async fn slack_map_user(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SlackMapUserRequest>,
-) -> Result<Json<SlackUserMappingResponse>, ApiError> {
-    use orchestrate_core::{SlackService, SlackUserService};
-
-    let slack_service = SlackService::new(state.db.clone());
-    let user_service = SlackUserService::new(state.db.clone(), SlackService::new(state.db.clone()));
-
-    let mapping = user_service.map_user(&req.github_username, &req.slack_user_id, &req.slack_username).await
-        .map_err(|e| ApiError::internal(format!("Failed to map user: {}", e)))?;
-
-    Ok(Json(SlackUserMappingResponse {
-        id: mapping.id,
-        github_username: mapping.github_username,
-        slack_user_id: mapping.slack_user_id,
-        slack_username: mapping.slack_username,
-        notify_on_pr: mapping.notify_on_pr,
-        notify_on_mention: mapping.notify_on_mention,
-        notify_on_failure: mapping.notify_on_failure,
-        created_at: mapping.created_at.to_rfc3339(),
-    }))
+impl From<orchestrate_core::FileCoverage> for FileCoverageResponse {
+    fn from(fc: orchestrate_core::FileCoverage) -> Self {
+        Self {
+            file_path: fc.file_path,
+            lines_covered: fc.lines_covered,
+            lines_total: fc.lines_total,
+            coverage_percent: fc.coverage_percent,
+        }
+    }
 }
 
-async fn slack_list_users(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<SlackUserMappingResponse>>, ApiError> {
-    use orchestrate_core::{SlackService, SlackUserService};
-
-    let slack_service = SlackService::new(state.db.clone());
-    let user_service = SlackUserService::new(state.db.clone(), SlackService::new(state.db.clone()));
-
-    let mappings = user_service.list_user_mappings().await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(mappings.into_iter().map(|m| SlackUserMappingResponse {
-        id: m.id,
-        github_username: m.github_username,
-        slack_user_id: m.slack_user_id,
-        slack_username: m.slack_username,
-        notify_on_pr: m.notify_on_pr,
-        notify_on_mention: m.notify_on_mention,
-        notify_on_failure: m.notify_on_failure,
-        created_at: m.created_at.to_rfc3339(),
-    }).collect()))
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModuleCoverageResponse {
+    pub module_name: String,
+    pub lines_covered: u32,
+    pub lines_total: u32,
+    pub coverage_percent: f64,
+    pub threshold: f64,
+    pub files: Vec<FileCoverageResponse>,
 }
 
-async fn slack_delete_user(
-    State(state): State<Arc<AppState>>,
-    Path(github_username): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    use orchestrate_core::{SlackService, SlackUserService};
+impl From<orchestrate_core::ModuleCoverage> for ModuleCoverageResponse {
+    fn from(mc: orchestrate_core::ModuleCoverage) -> Self {
+        Self {
+            module_name: mc.module_name,
+            lines_covered: mc.lines_covered,
+            lines_total: mc.lines_total,
+            coverage_percent: mc.coverage_percent,
+            threshold: mc.threshold,
+            files: mc.files.into_iter().map(Into::into).collect(),
+        }
+    }
+}
 
-    let slack_service = SlackService::new(state.db.clone());
-    let user_service = SlackUserService::new(state.db.clone(), SlackService::new(state.db.clone()));
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CoverageReportResponse {
+    pub timestamp: String,
+    pub modules: Vec<ModuleCoverageResponse>,
+    pub overall_percent: f64,
+}
 
-    user_service.delete_user_mapping(&github_username).await
-        .map_err(|e| ApiError::internal(format!("Failed to delete mapping: {}", e)))?;
-
-    Ok(Json(serde_json::json!({
-        "status": "deleted",
-        "github_username": github_username
-    })))
+impl From<orchestrate_core::CoverageReport> for CoverageReportResponse {
+    fn from(cr: orchestrate_core::CoverageReport) -> Self {
+        Self {
+            timestamp: cr.timestamp.to_rfc3339(),
+            modules: cr.modules.into_iter().map(Into::into).collect(),
+            overall_percent: cr.overall_percent,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
-struct SlackNotifyRequest {
-    channel: String,
-    message: String,
-    notification_type: String,
+pub struct CoverageHistoryParams {
+    pub limit: Option<usize>,
+    pub module: Option<String>,
 }
 
-async fn slack_send_notification(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SlackNotifyRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    use orchestrate_core::{SlackService, SlackMessage, NotificationType};
+#[derive(Debug, Deserialize)]
+pub struct TriggerTestRunRequest {
+    pub scope: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub with_coverage: Option<bool>,
+}
 
-    let slack_service = SlackService::new(state.db.clone());
+impl TriggerTestRunRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        // Validate scope
+        match self.scope.as_str() {
+            "all" | "changed" | "module" => Ok(()),
+            _ => Err(ApiError::validation(format!(
+                "Invalid scope: {}. Must be 'all', 'changed', or 'module'",
+                self.scope
+            ))),
+        }?;
 
-    let notif_type = NotificationType::Custom(req.notification_type);
-    let message = SlackMessage::new(&req.channel, &req.message);
+        // If scope is module, target is required
+        if self.scope == "module" && self.target.is_none() {
+            return Err(ApiError::validation(
+                "target is required when scope is 'module'",
+            ));
+        }
 
-    let result = slack_service.send_notification(notif_type, message, None, None).await
-        .map_err(|e| ApiError::internal(format!("Failed to send notification: {}", e)))?;
+        Ok(())
+    }
+}
 
-    Ok(Json(serde_json::json!({
-        "status": "sent",
-        "channel": result.channel,
-        "timestamp": result.ts
-    })))
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestRunResponse {
+    pub run_id: String,
+    pub status: String,
+    pub scope: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub test_results: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestRunResultsParams {
+    pub include_details: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestSuggestionsParams {
+    pub pr_number: Option<u64>,
+    pub branch: Option<String>,
+    pub priority: Option<String>,
+}
+
+impl TestSuggestionsParams {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.pr_number.is_none() && self.branch.is_none() {
+            return Err(ApiError::validation(
+                "Either pr_number or branch must be provided",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChangedFunctionResponse {
+    pub name: String,
+    pub file_path: String,
+    pub line_number: usize,
+    pub change_type: String,
+    pub signature: String,
+    pub is_public: bool,
+}
+
+impl From<orchestrate_core::ChangedFunction> for ChangedFunctionResponse {
+    fn from(cf: orchestrate_core::ChangedFunction) -> Self {
+        Self {
+            name: cf.name,
+            file_path: cf.file_path.display().to_string(),
+            line_number: cf.line_number,
+            change_type: match cf.change_type {
+                orchestrate_core::ChangeType::Added => "added".to_string(),
+                orchestrate_core::ChangeType::Modified => "modified".to_string(),
+                orchestrate_core::ChangeType::Deleted => "deleted".to_string(),
+            },
+            signature: cf.signature,
+            is_public: cf.is_public,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestSuggestionResponse {
+    pub function: ChangedFunctionResponse,
+    pub suggested_tests: Vec<String>,
+    pub priority: String,
+    pub reason: String,
+}
+
+impl From<orchestrate_core::TestSuggestion> for TestSuggestionResponse {
+    fn from(ts: orchestrate_core::TestSuggestion) -> Self {
+        Self {
+            function: ts.function.into(),
+            suggested_tests: ts.suggested_tests,
+            priority: match ts.priority {
+                orchestrate_core::Priority::High => "high".to_string(),
+                orchestrate_core::Priority::Medium => "medium".to_string(),
+                orchestrate_core::Priority::Low => "low".to_string(),
+            },
+            reason: ts.reason,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4140,935 +2158,5 @@ mod tests {
 
         assert_eq!(response.role, "user");
         assert_eq!(response.content, "Hello");
-    }
-
-    // ==================== Pipeline CRUD Tests ====================
-
-    #[tokio::test]
-    async fn test_list_pipelines_empty() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/pipelines")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let pipelines: Vec<PipelineResponse> = serde_json::from_str(&body).unwrap();
-        assert!(pipelines.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_create_pipeline_success() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/pipelines")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"name":"test-pipeline","definition":"name: test\nstages: []"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let pipeline: PipelineResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(pipeline.name, "test-pipeline");
-        assert!(pipeline.enabled);
-        assert!(pipeline.id > 0);
-    }
-
-    #[tokio::test]
-    async fn test_create_pipeline_empty_name_fails() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/pipelines")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"","definition":"test"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_pipeline_empty_definition_fails() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/pipelines")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"test","definition":""}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_pipeline_long_name_fails() {
-        let test_app = setup_app().await;
-
-        let long_name = "x".repeat(256);
-        let body = format!(r#"{{"name":"{}","definition":"test"}}"#, long_name);
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/pipelines")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_get_pipeline_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline directly in DB
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "name: test".to_string());
-        let id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-        assert!(id > 0);
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/pipelines/test-pipeline")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: PipelineResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.name, "test-pipeline");
-        assert_eq!(resp.definition, "name: test");
-    }
-
-    #[tokio::test]
-    async fn test_get_pipeline_not_found() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/pipelines/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_update_pipeline_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "old definition".to_string());
-        test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::PUT)
-                    .uri("/api/pipelines/test-pipeline")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"definition":"new definition","enabled":false}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: PipelineResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.definition, "new definition");
-        assert!(!resp.enabled);
-    }
-
-    #[tokio::test]
-    async fn test_delete_pipeline_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::DELETE)
-                    .uri("/api/pipelines/test-pipeline")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // Verify deleted
-        let deleted = test_app
-            .state
-            .db
-            .get_pipeline_by_name("test-pipeline")
-            .await
-            .unwrap();
-        assert!(deleted.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_delete_pipeline_not_found() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::DELETE)
-                    .uri("/api/pipelines/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // ==================== Pipeline Run Tests ====================
-
-    #[tokio::test]
-    async fn test_trigger_pipeline_run_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/pipelines/test-pipeline/run")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"trigger_event":"manual"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let run: PipelineRunResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(run.status, "pending");
-        assert_eq!(run.trigger_event, Some("manual".to_string()));
-        assert!(run.id > 0);
-    }
-
-    #[tokio::test]
-    async fn test_trigger_pipeline_run_nonexistent_pipeline() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/pipelines/nonexistent/run")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_list_pipeline_runs_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline and runs
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let run1 = PipelineRun::new(pipeline_id, Some("event1".to_string()));
-        test_app.state.db.insert_pipeline_run(&run1).await.unwrap();
-
-        let run2 = PipelineRun::new(pipeline_id, Some("event2".to_string()));
-        test_app.state.db.insert_pipeline_run(&run2).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/pipelines/test-pipeline/runs")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let runs: Vec<PipelineRunResponse> = serde_json::from_str(&body).unwrap();
-        assert_eq!(runs.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_get_pipeline_run_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline and run
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let run = PipelineRun::new(pipeline_id, Some("test-event".to_string()));
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/api/pipeline-runs/{}", run_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: PipelineRunResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.id, run_id);
-        assert_eq!(resp.trigger_event, Some("test-event".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_get_pipeline_run_not_found() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/pipeline-runs/99999")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_cancel_pipeline_run_pending() {
-        let test_app = setup_app().await;
-
-        // Create pipeline and pending run
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let run = PipelineRun::new(pipeline_id, None);
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/pipeline-runs/{}/cancel", run_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: PipelineRunResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.status, "cancelled");
-    }
-
-    #[tokio::test]
-    async fn test_cancel_pipeline_run_running() {
-        let test_app = setup_app().await;
-
-        // Create pipeline and running run
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let mut run = PipelineRun::new(pipeline_id, None);
-        run.mark_running();
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/pipeline-runs/{}/cancel", run_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: PipelineRunResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.status, "cancelled");
-    }
-
-    #[tokio::test]
-    async fn test_cancel_pipeline_run_already_completed() {
-        let test_app = setup_app().await;
-
-        // Create pipeline and completed run
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let mut run = PipelineRun::new(pipeline_id, None);
-        run.mark_succeeded();
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/pipeline-runs/{}/cancel", run_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn test_list_pipeline_stages() {
-        let test_app = setup_app().await;
-
-        // Create pipeline and run
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-
-        let run = PipelineRun::new(pipeline_id, None);
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-
-        // Create stages
-        let stage1 = PipelineStage::new(run_id, "build".to_string());
-        let stage2 = PipelineStage::new(run_id, "test".to_string());
-        test_app.state.db.insert_pipeline_stage(&stage1).await.unwrap();
-        test_app.state.db.insert_pipeline_stage(&stage2).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!("/api/pipeline-runs/{}/stages", run_id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let stages: Vec<PipelineStageResponse> = serde_json::from_str(&body).unwrap();
-        assert_eq!(stages.len(), 2);
-        assert_eq!(stages[0].stage_name, "build");
-        assert_eq!(stages[1].stage_name, "test");
-    }
-
-    // ==================== Approval Tests ====================
-
-    #[tokio::test]
-    async fn test_list_pending_approvals_empty() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/approvals")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let approvals: Vec<ApprovalResponse> = serde_json::from_str(&body).unwrap();
-        assert!(approvals.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_list_pending_approvals_with_data() {
-        let test_app = setup_app().await;
-
-        // Create pipeline, run, and stage first
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-        let run = PipelineRun::new(pipeline_id, None);
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-        let stage = PipelineStage::new(run_id, "deploy".to_string());
-        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
-
-        // Create approval request
-        let approval = ApprovalRequest::new(
-            stage_id,
-            run_id,
-            "user1@example.com".to_string(),
-            1,
-            None,
-            None,
-        );
-        test_app
-            .state
-            .db
-            .create_approval_request(approval)
-            .await
-            .unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/approvals")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let approvals: Vec<ApprovalResponse> = serde_json::from_str(&body).unwrap();
-        assert_eq!(approvals.len(), 1);
-        assert_eq!(approvals[0].status, "pending");
-    }
-
-    #[tokio::test]
-    async fn test_approve_approval_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline, run, and stage first
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-        let run = PipelineRun::new(pipeline_id, None);
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-        let stage = PipelineStage::new(run_id, "deploy".to_string());
-        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
-
-        // Create approval request
-        let approval = ApprovalRequest::new(
-            stage_id,
-            run_id,
-            "user1@example.com".to_string(),
-            1,
-            None,
-            None,
-        );
-        let created = test_app
-            .state
-            .db
-            .create_approval_request(approval)
-            .await
-            .unwrap();
-        let approval_id = created.id.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/approvals/{}/approve", approval_id))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"approver":"user1@example.com","comment":"LGTM"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: ApprovalResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.status, "approved");
-        assert_eq!(resp.approval_count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_approve_approval_empty_approver_fails() {
-        let test_app = setup_app().await;
-
-        // Create pipeline, run, and stage first
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-        let run = PipelineRun::new(pipeline_id, None);
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-        let stage = PipelineStage::new(run_id, "deploy".to_string());
-        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
-
-        // Create approval request
-        let approval = ApprovalRequest::new(
-            stage_id,
-            run_id,
-            "user1@example.com".to_string(),
-            1,
-            None,
-            None,
-        );
-        let created = test_app
-            .state
-            .db
-            .create_approval_request(approval)
-            .await
-            .unwrap();
-        let approval_id = created.id.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/approvals/{}/approve", approval_id))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"approver":""}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_approve_approval_unauthorized_approver() {
-        let test_app = setup_app().await;
-
-        // Create pipeline, run, and stage first
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-        let run = PipelineRun::new(pipeline_id, None);
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-        let stage = PipelineStage::new(run_id, "deploy".to_string());
-        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
-
-        // Create approval request requiring user1
-        let approval = ApprovalRequest::new(
-            stage_id,
-            run_id,
-            "user1@example.com".to_string(),
-            1,
-            None,
-            None,
-        );
-        let created = test_app
-            .state
-            .db
-            .create_approval_request(approval)
-            .await
-            .unwrap();
-        let approval_id = created.id.unwrap();
-
-        // Try to approve as user2
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/approvals/{}/approve", approval_id))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"approver":"user2@example.com"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_reject_approval_success() {
-        let test_app = setup_app().await;
-
-        // Create pipeline, run, and stage first
-        let pipeline = Pipeline::new("test-pipeline".to_string(), "definition".to_string());
-        let pipeline_id = test_app.state.db.insert_pipeline(&pipeline).await.unwrap();
-        let run = PipelineRun::new(pipeline_id, None);
-        let run_id = test_app.state.db.insert_pipeline_run(&run).await.unwrap();
-        let stage = PipelineStage::new(run_id, "deploy".to_string());
-        let stage_id = test_app.state.db.insert_pipeline_stage(&stage).await.unwrap();
-
-        // Create approval request
-        let approval = ApprovalRequest::new(
-            stage_id,
-            run_id,
-            "user1@example.com".to_string(),
-            1,
-            None,
-            None,
-        );
-        let created = test_app
-            .state
-            .db
-            .create_approval_request(approval)
-            .await
-            .unwrap();
-        let approval_id = created.id.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/api/approvals/{}/reject", approval_id))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"approver":"user1@example.com","comment":"Not ready"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let resp: ApprovalResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(resp.status, "rejected");
-        assert_eq!(resp.rejection_count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_approve_approval_not_found() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/approvals/99999/approve")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"approver":"user@example.com"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_reject_approval_not_found() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/approvals/99999/reject")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"approver":"user@example.com"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // ==================== Request Validation Tests ====================
-
-    #[test]
-    fn test_create_pipeline_request_validation() {
-        // Valid request
-        let valid = CreatePipelineRequest {
-            name: "test".to_string(),
-            definition: "definition".to_string(),
-            enabled: Some(true),
-        };
-        assert!(valid.validate().is_ok());
-
-        // Empty name
-        let empty_name = CreatePipelineRequest {
-            name: "".to_string(),
-            definition: "definition".to_string(),
-            enabled: None,
-        };
-        assert!(empty_name.validate().is_err());
-
-        // Empty definition
-        let empty_def = CreatePipelineRequest {
-            name: "test".to_string(),
-            definition: "".to_string(),
-            enabled: None,
-        };
-        assert!(empty_def.validate().is_err());
-
-        // Name too long
-        let long_name = CreatePipelineRequest {
-            name: "x".repeat(256),
-            definition: "definition".to_string(),
-            enabled: None,
-        };
-        assert!(long_name.validate().is_err());
-    }
-
-    #[test]
-    fn test_approval_decision_request_validation() {
-        // Valid request
-        let valid = ApprovalDecisionRequest {
-            approver: "user@example.com".to_string(),
-            comment: Some("LGTM".to_string()),
-        };
-        assert!(valid.validate().is_ok());
-
-        // Empty approver
-        let empty = ApprovalDecisionRequest {
-            approver: "".to_string(),
-            comment: None,
-        };
-        assert!(empty.validate().is_err());
-
-        // Whitespace approver
-        let whitespace = ApprovalDecisionRequest {
-            approver: "   ".to_string(),
-            comment: None,
-        };
-        assert!(whitespace.validate().is_err());
-    }
-
-    // ==================== Response Conversion Tests ====================
-
-    #[test]
-    fn test_pipeline_response_from_pipeline() {
-        let mut pipeline = Pipeline::new("test".to_string(), "definition".to_string());
-        pipeline.id = Some(42);
-        pipeline.enabled = false;
-
-        let response: PipelineResponse = pipeline.clone().into();
-
-        assert_eq!(response.id, 42);
-        assert_eq!(response.name, "test");
-        assert_eq!(response.definition, "definition");
-        assert!(!response.enabled);
-    }
-
-    #[test]
-    fn test_pipeline_run_response_from_run() {
-        let mut run = PipelineRun::new(1, Some("event".to_string()));
-        run.id = Some(42);
-        run.mark_running();
-
-        let response: PipelineRunResponse = run.clone().into();
-
-        assert_eq!(response.id, 42);
-        assert_eq!(response.pipeline_id, 1);
-        assert_eq!(response.status, "running");
-        assert_eq!(response.trigger_event, Some("event".to_string()));
-        assert!(response.started_at.is_some());
-    }
-
-    #[test]
-    fn test_approval_response_from_approval() {
-        let mut approval = ApprovalRequest::new(
-            1,
-            2,
-            "user@example.com".to_string(),
-            1,
-            Some(3600),
-            Some("approve".to_string()),
-        );
-        approval.id = Some(42);
-
-        let response: ApprovalResponse = approval.clone().into();
-
-        assert_eq!(response.id, 42);
-        assert_eq!(response.stage_id, 1);
-        assert_eq!(response.run_id, 2);
-        assert_eq!(response.status, "pending");
-        assert_eq!(response.required_approvers, "user@example.com");
-        assert_eq!(response.required_count, 1);
-        assert_eq!(response.timeout_seconds, Some(3600));
     }
 }
