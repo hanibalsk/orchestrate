@@ -4,6 +4,9 @@
 -- Enhances the existing audit_log table with comprehensive auditing capabilities
 -- including actor tracking, IP addresses, and structured details.
 
+-- Drop the old indexes first (they reference old columns)
+DROP INDEX IF EXISTS idx_audit_entity;
+
 -- Drop the old simple audit_log table if it exists
 DROP TABLE IF EXISTS audit_log;
 

@@ -1467,13 +1467,13 @@ enum DeployAction {
     /// Deploy to an environment
     Run {
         /// Target environment
-        #[arg(short, long)]
+        #[arg(short = 'e', long)]
         env: String,
         /// Version to deploy
-        #[arg(short, long)]
+        #[arg(short = 'V', long)]
         version: String,
         /// Deployment strategy (rolling, blue_green, canary, recreate)
-        #[arg(short, long)]
+        #[arg(short = 's', long)]
         strategy: Option<String>,
         /// Skip pre-deployment validation
         #[arg(long)]
@@ -1482,37 +1482,37 @@ enum DeployAction {
     /// Show deployment status
     Status {
         /// Environment name
-        #[arg(short, long)]
+        #[arg(short = 'e', long)]
         env: String,
     },
     /// Show deployment history
     History {
         /// Environment name
-        #[arg(short, long)]
+        #[arg(short = 'e', long)]
         env: String,
         /// Maximum number of entries
-        #[arg(short, long, default_value = "10")]
+        #[arg(short = 'l', long, default_value = "10")]
         limit: usize,
     },
     /// Rollback to previous version
     Rollback {
         /// Environment name
-        #[arg(short, long)]
+        #[arg(short = 'e', long)]
         env: String,
         /// Specific version to rollback to
-        #[arg(short, long)]
+        #[arg(short = 'V', long)]
         version: Option<String>,
     },
     /// Validate deployment before executing
     Validate {
         /// Environment name
-        #[arg(short, long)]
+        #[arg(short = 'e', long)]
         env: String,
     },
     /// Show what changes would be deployed
     Diff {
         /// Environment name
-        #[arg(short, long)]
+        #[arg(short = 'e', long)]
         env: String,
     },
 }

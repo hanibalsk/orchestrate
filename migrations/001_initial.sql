@@ -104,16 +104,8 @@ CREATE TABLE IF NOT EXISTS stories (
     completed_at TEXT
 );
 
--- Audit log
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity_type TEXT NOT NULL,
-    entity_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    old_value TEXT,
-    new_value TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+-- Audit log is now created by migration 019_audit_log.sql
+-- (Old audit_log table was replaced with enhanced version)
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_agents_state ON agents(state);
@@ -127,6 +119,5 @@ CREATE INDEX IF NOT EXISTS idx_pr_queue_pr_number ON pr_queue(pr_number);
 CREATE INDEX IF NOT EXISTS idx_epics_status ON epics(status);
 CREATE INDEX IF NOT EXISTS idx_stories_epic ON stories(epic_id);
 CREATE INDEX IF NOT EXISTS idx_stories_status ON stories(status);
-CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
 CREATE INDEX IF NOT EXISTS idx_worktrees_agent ON worktrees(agent_id);

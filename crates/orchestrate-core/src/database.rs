@@ -170,6 +170,18 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/016_incidents.sql"))
             .execute(&self.pool)
             .await?;
+        // Feature flags migration
+        sqlx::query(include_str!("../../../migrations/017_feature_flags.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Cost analytics migration
+        sqlx::query(include_str!("../../../migrations/018_cost_analytics.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Audit log enhancement migration
+        sqlx::query(include_str!("../../../migrations/019_audit_log.sql"))
+            .execute(&self.pool)
+            .await?;
         // Autonomous sessions migration (Epic 016)
         sqlx::query(include_str!(
             "../../../migrations/020_autonomous_sessions.sql"
@@ -6698,30 +6710,32 @@ impl Database {
     // ==================== Audit Log ====================
 
     /// Insert an audit entry
-    pub async fn insert_audit_entry(&self, entry: &crate::monitoring::AuditEntry) -> Result<i64> {
+    pub async fn insert_audit_entry(&self, entry: &crate::monitoring::AuditEntry) -> Result<String> {
         let details_json = if entry.details.is_empty() {
-            None
+            "{}".to_string()
         } else {
-            serde_json::to_string(&entry.details).ok()
+            serde_json::to_string(&entry.details).unwrap_or_else(|_| "{}".to_string())
         };
 
-        let id = sqlx::query_scalar(
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
             r#"
-            INSERT INTO audit_log (actor, actor_type, action, resource_type, resource_id, details, success, error_message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
+            INSERT INTO audit_log (id, timestamp, actor, actor_type, action, resource_type, resource_id, details, success, error_message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#
         )
+        .bind(&id)
+        .bind(entry.timestamp.to_rfc3339())
         .bind(&entry.actor)
         .bind(format!("{:?}", entry.actor_type).to_lowercase())
         .bind(format!("{:?}", entry.action).to_lowercase())
         .bind(&entry.resource_type)
         .bind(&entry.resource_id)
-        .bind(details_json)
+        .bind(&details_json)
         .bind(entry.success)
         .bind(&entry.error_message)
         .bind(entry.timestamp.to_rfc3339())
-        .fetch_one(&self.pool)
+        .execute(&self.pool)
         .await?;
 
         Ok(id)

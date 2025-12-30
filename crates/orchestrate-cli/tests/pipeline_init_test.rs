@@ -4,13 +4,22 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
+fn setup_test_env() -> (TempDir, String) {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db").to_string_lossy().to_string();
+    (temp_dir, db_path)
+}
+
 #[test]
 fn test_pipeline_init_ci() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_file = temp_dir.path().join("ci-pipeline.yaml");
+    let (_temp2, db_path) = setup_test_env();
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("ci")
         .arg("--output")
@@ -38,9 +47,12 @@ fn test_pipeline_init_ci() -> Result<()> {
 fn test_pipeline_init_cd() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_file = temp_dir.path().join("cd-pipeline.yaml");
+    let (_temp2, db_path) = setup_test_env();
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("cd")
         .arg("--output")
@@ -63,9 +75,12 @@ fn test_pipeline_init_cd() -> Result<()> {
 fn test_pipeline_init_release() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_file = temp_dir.path().join("release-pipeline.yaml");
+    let (_temp2, db_path) = setup_test_env();
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("release")
         .arg("--output")
@@ -88,9 +103,12 @@ fn test_pipeline_init_release() -> Result<()> {
 fn test_pipeline_init_security() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_file = temp_dir.path().join("security-pipeline.yaml");
+    let (_temp2, db_path) = setup_test_env();
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("security")
         .arg("--output")
@@ -113,9 +131,12 @@ fn test_pipeline_init_security() -> Result<()> {
 fn test_pipeline_init_invalid_template() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_file = temp_dir.path().join("invalid.yaml");
+    let (_temp2, db_path) = setup_test_env();
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("invalid-template")
         .arg("--output")
@@ -133,8 +154,12 @@ fn test_pipeline_init_invalid_template() -> Result<()> {
 
 #[test]
 fn test_pipeline_init_list_templates() -> Result<()> {
+    let (_temp, db_path) = setup_test_env();
+
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("--list");
 
@@ -152,12 +177,15 @@ fn test_pipeline_init_list_templates() -> Result<()> {
 #[test]
 fn test_pipeline_init_default_filename() -> Result<()> {
     let temp_dir = TempDir::new()?;
+    let (_temp2, db_path) = setup_test_env();
 
     // Change to temp directory
     std::env::set_current_dir(&temp_dir)?;
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("ci");
 
@@ -176,12 +204,15 @@ fn test_pipeline_init_default_filename() -> Result<()> {
 fn test_pipeline_init_overwrite_existing_file() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_file = temp_dir.path().join("test.yaml");
+    let (_temp2, db_path) = setup_test_env();
 
     // Create existing file
     fs::write(&output_file, "existing content")?;
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("ci")
         .arg("--output")
@@ -202,12 +233,15 @@ fn test_pipeline_init_overwrite_existing_file() -> Result<()> {
 fn test_pipeline_init_force_overwrite() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_file = temp_dir.path().join("test.yaml");
+    let (_temp2, db_path) = setup_test_env();
 
     // Create existing file
     fs::write(&output_file, "existing content")?;
 
     let mut cmd = Command::cargo_bin("orchestrate")?;
-    cmd.arg("pipeline")
+    cmd.arg("--db-path")
+        .arg(&db_path)
+        .arg("pipeline")
         .arg("init")
         .arg("ci")
         .arg("--output")

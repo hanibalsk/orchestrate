@@ -18,7 +18,7 @@ fn test_deploy_command_requires_env() {
     cmd.arg("--db-path")
         .arg(&db_path)
         .arg("deploy")
-        .arg("deploy")
+        .arg("run")
         .arg("--version")
         .arg("1.0.0");
 
@@ -35,7 +35,7 @@ fn test_deploy_command_requires_version() {
     cmd.arg("--db-path")
         .arg(&db_path)
         .arg("deploy")
-        .arg("deploy")
+        .arg("run")
         .arg("--env")
         .arg("staging");
 
