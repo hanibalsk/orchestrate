@@ -8,6 +8,7 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod agent_continuation;
 pub mod autonomous_session;
 pub mod decision_engine;
 pub mod approval;
@@ -23,6 +24,8 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 #[cfg(test)]
 mod database_autonomous_session_tests;
+#[cfg(test)]
+mod database_continuation_tests;
 #[cfg(test)]
 mod database_incident_tests;
 pub mod documentation;
@@ -279,4 +282,10 @@ pub use autonomous_session::{
 pub use decision_engine::{
     AgentStatus, Decision, DecisionEngine, DecisionEngineConfig, EscalationSeverity,
     EvaluationResult as DecisionEvaluationResult, ReviewType, StatusSignal, WaitType,
+};
+
+// Re-export agent continuation types (Epic 016)
+pub use agent_continuation::{
+    AgentContinuation, ContinuationBuilder, ContinuationReason, ContinuationResult,
+    ContinuationStatus,
 };

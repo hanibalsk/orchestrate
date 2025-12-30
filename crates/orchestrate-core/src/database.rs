@@ -175,6 +175,12 @@ impl Database {
         ))
         .execute(&self.pool)
         .await?;
+        // Agent continuations migration (Epic 016 - Story 3)
+        sqlx::query(include_str!(
+            "../../../migrations/021_agent_continuations.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -7250,6 +7256,228 @@ impl Database {
     pub async fn count_sessions_by_state(&self) -> Result<std::collections::HashMap<String, i64>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT state, COUNT(*) as count FROM autonomous_sessions GROUP BY state",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().collect())
+    }
+}
+
+// ==================== Agent Continuation Row ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct AgentContinuationRow {
+    id: i64,
+    agent_id: String,
+    session_id: Option<String>,
+    reason: String,
+    message: String,
+    context: String,
+    status: String,
+    created_at: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    result: Option<String>,
+    error_message: Option<String>,
+}
+
+impl AgentContinuationRow {
+    fn into_continuation(self) -> Result<crate::agent_continuation::AgentContinuation> {
+        Ok(crate::agent_continuation::AgentContinuation {
+            id: self.id,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            reason: crate::agent_continuation::ContinuationReason::from_str(&self.reason)?,
+            message: self.message,
+            context: serde_json::from_str(&self.context)?,
+            status: crate::agent_continuation::ContinuationStatus::from_str(&self.status)?,
+            created_at: parse_datetime(&self.created_at)?,
+            started_at: self.started_at.map(|s| parse_datetime(&s)).transpose()?,
+            completed_at: self.completed_at.map(|s| parse_datetime(&s)).transpose()?,
+            result: self
+                .result
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
+            error_message: self.error_message,
+        })
+    }
+}
+
+impl Database {
+    // ==================== Agent Continuation Operations ====================
+
+    /// Create a new agent continuation request
+    pub async fn create_continuation(
+        &self,
+        continuation: &crate::agent_continuation::AgentContinuation,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO agent_continuations (
+                agent_id, session_id, reason, message, context, status,
+                started_at, completed_at, result, error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&continuation.agent_id)
+        .bind(&continuation.session_id)
+        .bind(continuation.reason.as_str())
+        .bind(&continuation.message)
+        .bind(serde_json::to_string(&continuation.context)?)
+        .bind(continuation.status.as_str())
+        .bind(continuation.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(continuation.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(
+            continuation
+                .result
+                .as_ref()
+                .map(|r| serde_json::to_string(r))
+                .transpose()?,
+        )
+        .bind(&continuation.error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Update an agent continuation
+    pub async fn update_continuation(
+        &self,
+        continuation: &crate::agent_continuation::AgentContinuation,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE agent_continuations SET
+                status = ?, started_at = ?, completed_at = ?,
+                result = ?, error_message = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(continuation.status.as_str())
+        .bind(continuation.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(continuation.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(
+            continuation
+                .result
+                .as_ref()
+                .map(|r| serde_json::to_string(r))
+                .transpose()?,
+        )
+        .bind(&continuation.error_message)
+        .bind(continuation.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get a continuation by ID
+    pub async fn get_continuation(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::agent_continuation::AgentContinuation>> {
+        let row = sqlx::query_as::<_, AgentContinuationRow>(
+            r#"
+            SELECT id, agent_id, session_id, reason, message, context, status,
+                   created_at, started_at, completed_at, result, error_message
+            FROM agent_continuations
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_continuation()).transpose()
+    }
+
+    /// Get pending continuations for an agent
+    pub async fn get_pending_continuations(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::agent_continuation::AgentContinuation>> {
+        let rows = sqlx::query_as::<_, AgentContinuationRow>(
+            r#"
+            SELECT id, agent_id, session_id, reason, message, context, status,
+                   created_at, started_at, completed_at, result, error_message
+            FROM agent_continuations
+            WHERE agent_id = ? AND status = 'pending'
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_continuation()).collect()
+    }
+
+    /// Get all continuations for an agent
+    pub async fn get_continuations_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::agent_continuation::AgentContinuation>> {
+        let rows = sqlx::query_as::<_, AgentContinuationRow>(
+            r#"
+            SELECT id, agent_id, session_id, reason, message, context, status,
+                   created_at, started_at, completed_at, result, error_message
+            FROM agent_continuations
+            WHERE agent_id = ?
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_continuation()).collect()
+    }
+
+    /// Get the next pending continuation (oldest first)
+    pub async fn get_next_pending_continuation(
+        &self,
+    ) -> Result<Option<crate::agent_continuation::AgentContinuation>> {
+        let row = sqlx::query_as::<_, AgentContinuationRow>(
+            r#"
+            SELECT id, agent_id, session_id, reason, message, context, status,
+                   created_at, started_at, completed_at, result, error_message
+            FROM agent_continuations
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_continuation()).transpose()
+    }
+
+    /// Cancel all pending continuations for an agent
+    pub async fn cancel_pending_continuations(&self, agent_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE agent_continuations
+            SET status = 'cancelled', completed_at = datetime('now')
+            WHERE agent_id = ? AND status = 'pending'
+            "#,
+        )
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Count continuations by status
+    pub async fn count_continuations_by_status(
+        &self,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) as count FROM agent_continuations GROUP BY status",
         )
         .fetch_all(&self.pool)
         .await?;
