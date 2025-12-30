@@ -20,7 +20,7 @@ mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
 #[cfg(test)]
-mod database_learning_tests;
+mod database_requirements_tests;
 pub mod documentation;
 pub mod epic;
 pub mod requirements;
@@ -32,9 +32,6 @@ pub mod deployment;
 pub mod monitoring;
 pub mod slack;
 pub mod security;
-pub mod security_fix_agent;
-pub mod security_report;
-pub mod security_gate;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -158,7 +155,7 @@ pub use pattern_export::{
 pub use learning_automation::{
     predict_task_outcome, ActionType, AreaForImprovement, AutomationAction, AutomationResults,
     AutomationRun, AutomationRunStatus, AutomationTrigger, DurationEstimate, Improvement,
-    ImprovementCategory, LearningAutomationConfig, LearningAutomationEngine, LearningReport, ReportSummary, RiskFactor,
+    ImprovementCategory, LearningAutomationConfig, LearningReport, ReportSummary, RiskFactor,
     RiskSeverity, TaskPrediction, TokenEstimate,
 };
 
@@ -236,19 +233,9 @@ pub use slack::{
 
 // Re-export security types
 pub use security::{
-    ContainerScanner, DependencyScanner, DetectedSecret, FixChange, FixStatus, FixType,
-    LicenseCheckResult, LicenseIssue, LicenseIssueType, LicenseScanner, PackageManager,
-    SarifArtifactLocation, SarifDriver, SarifLocation, SarifMessage, SarifPhysicalLocation,
-    SarifRegion, SarifReport, SarifResult, SarifRun, SarifTool, SastScanner, ScanStatus,
-    ScanSummary, ScanType, SecretDetector, SecretType, SecurityException, SecurityFix,
+    DetectedSecret, FixChange, FixStatus, FixType, LicenseCheckResult, LicenseIssue,
+    LicenseIssueType, SarifArtifactLocation, SarifDriver, SarifLocation, SarifMessage,
+    SarifPhysicalLocation, SarifRegion, SarifReport, SarifResult, SarifRun, SarifTool,
+    ScanStatus, ScanSummary, ScanType, SecretType, SecurityException, SecurityFix,
     SecurityPolicy, SecurityScan, Severity, Vulnerability, VulnerabilityType,
 };
-
-// Re-export security fix agent types
-pub use security_fix_agent::{FixCategory, SecurityFixAgent};
-
-// Re-export security report types
-pub use security_report::{HtmlReportGenerator, JsonReportGenerator, ReportFormat, SecurityReportGenerator};
-
-// Re-export security gate types
-pub use security_gate::{GateDecision, GateDetails, GateResult, SecurityGate};
