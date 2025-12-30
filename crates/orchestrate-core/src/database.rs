@@ -5534,4 +5534,89 @@ impl Database {
 
         Ok(row.count)
     }
+
+    // ==================== Business Metrics Operations ====================
+
+    /// Get PR cycle times (time from created to merged) grouped by epic
+    /// Returns tuples of (epic_id, cycle_time_seconds)
+    pub async fn get_pr_cycle_times(&self) -> Result<Vec<(Option<String>, f64)>> {
+        #[derive(sqlx::FromRow)]
+        struct PrCycleTimeRow {
+            epic_id: Option<String>,
+            cycle_time_seconds: f64,
+        }
+
+        let rows = sqlx::query_as::<_, PrCycleTimeRow>(
+            r#"
+            SELECT
+                epic_id,
+                (julianday(merged_at) - julianday(created_at)) * 86400 as cycle_time_seconds
+            FROM pr_queue
+            WHERE status = 'merged' AND merged_at IS NOT NULL
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter()
+            .map(|row| (row.epic_id, row.cycle_time_seconds))
+            .collect())
+    }
+
+    /// Get story completion rates by epic
+    /// Returns tuples of (epic_id, completion_rate) where rate is 0.0 to 1.0
+    pub async fn get_story_completion_rates(&self) -> Result<Vec<(String, f64)>> {
+        #[derive(sqlx::FromRow)]
+        struct StoryRateRow {
+            epic_id: String,
+            completion_rate: f64,
+        }
+
+        let rows = sqlx::query_as::<_, StoryRateRow>(
+            r#"
+            SELECT
+                epic_id,
+                CAST(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS REAL) /
+                    COUNT(*) as completion_rate
+            FROM stories
+            GROUP BY epic_id
+            HAVING COUNT(*) > 0
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter()
+            .map(|row| (row.epic_id, row.completion_rate))
+            .collect())
+    }
+
+    /// Get agent success rates by type
+    /// Returns tuples of (agent_type, success_rate) where rate is 0.0 to 1.0
+    pub async fn get_agent_success_rates(&self) -> Result<Vec<(String, f64)>> {
+        #[derive(sqlx::FromRow)]
+        struct AgentSuccessRow {
+            agent_type: String,
+            success_rate: f64,
+        }
+
+        let rows = sqlx::query_as::<_, AgentSuccessRow>(
+            r#"
+            SELECT
+                agent_type,
+                CAST(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) AS REAL) /
+                    COUNT(*) as success_rate
+            FROM agents
+            WHERE state IN ('completed', 'failed')
+            GROUP BY agent_type
+            HAVING COUNT(*) > 0
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter()
+            .map(|row| (row.agent_type, row.success_rate))
+            .collect())
+    }
 }
