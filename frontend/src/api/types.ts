@@ -269,55 +269,78 @@ export interface ScheduleRun {
   created_at: string;
 }
 
-// Deployment types
-export type DeploymentStatus = 'Pending' | 'InProgress' | 'Completed' | 'Failed' | 'RolledBack';
+// Monitoring types
+export type AlertSeverity = 'Info' | 'Warning' | 'Critical';
+export type AlertStatus = 'Active' | 'Acknowledged' | 'Resolved';
+export type HealthStatus = 'Healthy' | 'Degraded' | 'Unhealthy';
 
-export interface Environment {
+export interface Alert {
   id: number;
+  rule_id: number;
+  status: AlertStatus;
+  severity: AlertSeverity;
+  message: string;
+  fingerprint: string;
+  labels: Record<string, string>;
+  triggered_at: string;
+  resolved_at: string | null;
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
+}
+
+export interface MetricValue {
   name: string;
-  type: string;
-  url: string | null;
-  config: string;
-  created_at: string;
-  updated_at: string;
+  value: number;
+  labels: Record<string, string>;
+  timestamp: string;
 }
 
-export interface Deployment {
-  id: number;
-  environment_id: number;
-  environment_name: string;
-  version: string;
-  provider: string;
-  strategy: string | null;
-  status: string;
-  error_message: string | null;
-  started_at: string;
-  completed_at: string | null;
-  timeout_seconds: number;
+export interface MetricsSummary {
+  active_agents: number;
+  total_requests_24h: number;
+  avg_response_time_ms: number;
+  error_rate: number;
+  total_tokens_24h: number;
 }
 
-export interface CreateDeploymentRequest {
-  environment: string;
-  version: string;
-  provider?: string;
-  strategy?: string;
-  timeout_seconds?: number;
-  skip_validation?: boolean;
+export interface ComponentHealth {
+  name: string;
+  status: HealthStatus;
+  message: string | null;
+  last_check: string;
 }
 
-export interface Release {
-  id: number;
-  version: string;
-  tag_name: string;
-  changelog: string | null;
-  published: boolean;
-  github_release_url: string | null;
-  created_at: string;
-  published_at: string | null;
+export interface SystemHealth {
+  status: HealthStatus;
+  components: ComponentHealth[];
+  active_alerts: number;
+  metrics_summary: MetricsSummary;
 }
 
-export interface CreateReleaseRequest {
-  version: string;
-  tag_name: string;
-  changelog?: string;
+export interface AgentPerformance {
+  agent_type: string;
+  total_executions: number;
+  successful_executions: number;
+  failed_executions: number;
+  avg_duration_seconds: number;
+  success_rate: number;
+}
+
+export interface CostBreakdown {
+  agent_type: string;
+  total_cost: number;
+  token_count: number;
+}
+
+export interface CostReport {
+  period_start: string;
+  period_end: string;
+  total_cost: number;
+  breakdown_by_agent: CostBreakdown[];
+  breakdown_by_epic: Record<string, number>;
+}
+
+export interface AcknowledgeAlertRequest {
+  acknowledged_by: string;
+  notes?: string;
 }
