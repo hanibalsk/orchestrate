@@ -74,8 +74,11 @@ pub mod work_evaluation;
 pub mod code_review;
 pub mod pr_workflow;
 pub mod epic_discovery;
+pub mod edge_case_handler;
 #[cfg(test)]
 mod database_stuck_detection_tests;
+#[cfg(test)]
+mod database_edge_case_tests;
 #[cfg(test)]
 mod database_recovery_tests;
 #[cfg(test)]
@@ -347,4 +350,10 @@ pub use epic_discovery::{
     DiscoveredEpic, DiscoveredStory, EpicDiscoveryConfig, EpicDiscoveryService,
     EpicProcessingStatus, ExecutionPlan, StoryDependencyGraph, StoryProcessingStatus,
     WorkQueueItem,
+};
+
+// Re-export edge case handler types (Epic 016 - Story 14)
+pub use edge_case_handler::{
+    EdgeCaseAction, EdgeCaseConfig, EdgeCaseEvent, EdgeCaseHandler, EdgeCaseLearning,
+    EdgeCaseResolution, EdgeCaseStats, EdgeCaseType, HandlerResult,
 };

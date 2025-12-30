@@ -206,6 +206,12 @@ impl Database {
         ))
         .execute(&self.pool)
         .await?;
+        // Edge case handling migration (Epic 016 - Story 14)
+        sqlx::query(include_str!(
+            "../../../migrations/026_edge_case_handling.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -8507,6 +8513,333 @@ impl Database {
             total_blocking_issues: total_blocking,
         })
     }
+
+    // ==================== Edge Case Operations (Epic 016 - Story 14) ====================
+
+    /// Create an edge case event
+    pub async fn create_edge_case_event(
+        &self,
+        event: &crate::edge_case_handler::EdgeCaseEvent,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO edge_case_events
+                (session_id, agent_id, story_id, edge_case_type, resolution,
+                 action_taken, retry_count, error_message, context,
+                 detected_at, resolved_at, resolution_notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&event.session_id)
+        .bind(&event.agent_id)
+        .bind(&event.story_id)
+        .bind(event.edge_case_type.as_str())
+        .bind(event.resolution.as_str())
+        .bind(&event.action_taken)
+        .bind(event.retry_count as i64)
+        .bind(&event.error_message)
+        .bind(serde_json::to_string(&event.context)?)
+        .bind(event.detected_at.to_rfc3339())
+        .bind(event.resolved_at.map(|dt| dt.to_rfc3339()))
+        .bind(&event.resolution_notes)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get an edge case event by ID
+    pub async fn get_edge_case_event(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::edge_case_handler::EdgeCaseEvent>> {
+        let row = sqlx::query_as::<_, EdgeCaseEventRow>(
+            "SELECT * FROM edge_case_events WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_event()).transpose()
+    }
+
+    /// Update an edge case event
+    pub async fn update_edge_case_event(
+        &self,
+        event: &crate::edge_case_handler::EdgeCaseEvent,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE edge_case_events
+            SET resolution = ?, action_taken = ?, retry_count = ?,
+                resolved_at = ?, resolution_notes = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(event.resolution.as_str())
+        .bind(&event.action_taken)
+        .bind(event.retry_count as i64)
+        .bind(event.resolved_at.map(|dt| dt.to_rfc3339()))
+        .bind(&event.resolution_notes)
+        .bind(event.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get edge case events for a session
+    pub async fn get_edge_case_events_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::edge_case_handler::EdgeCaseEvent>> {
+        let rows = sqlx::query_as::<_, EdgeCaseEventRow>(
+            r#"
+            SELECT * FROM edge_case_events
+            WHERE session_id = ?
+            ORDER BY detected_at DESC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_event()).collect()
+    }
+
+    /// Get edge case events for an agent
+    pub async fn get_edge_case_events_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::edge_case_handler::EdgeCaseEvent>> {
+        let rows = sqlx::query_as::<_, EdgeCaseEventRow>(
+            r#"
+            SELECT * FROM edge_case_events
+            WHERE agent_id = ?
+            ORDER BY detected_at DESC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_event()).collect()
+    }
+
+    /// Get unresolved edge case events
+    pub async fn get_unresolved_edge_case_events(
+        &self,
+    ) -> Result<Vec<crate::edge_case_handler::EdgeCaseEvent>> {
+        let rows = sqlx::query_as::<_, EdgeCaseEventRow>(
+            r#"
+            SELECT * FROM edge_case_events
+            WHERE resolution NOT IN ('auto_resolved', 'manual_resolved', 'bypassed')
+            ORDER BY detected_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_event()).collect()
+    }
+
+    /// Get edge case events by type
+    pub async fn get_edge_case_events_by_type(
+        &self,
+        edge_case_type: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<crate::edge_case_handler::EdgeCaseEvent>> {
+        let limit_val = limit.unwrap_or(100) as i64;
+        let rows = sqlx::query_as::<_, EdgeCaseEventRow>(
+            r#"
+            SELECT * FROM edge_case_events
+            WHERE edge_case_type = ?
+            ORDER BY detected_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(edge_case_type)
+        .bind(limit_val)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_event()).collect()
+    }
+
+    /// Get edge case statistics
+    pub async fn get_edge_case_stats(&self) -> Result<EdgeCaseStats> {
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM edge_case_events",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let resolved: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM edge_case_events WHERE resolution IN ('auto_resolved', 'manual_resolved', 'bypassed')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let pending: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM edge_case_events WHERE resolution IN ('pending', 'retrying', 'waiting')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let failed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM edge_case_events WHERE resolution = 'failed'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let by_type_rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT edge_case_type, COUNT(*) as count
+            FROM edge_case_events
+            GROUP BY edge_case_type
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let avg_time: (Option<f64>,) = sqlx::query_as(
+            r#"
+            SELECT AVG(
+                CAST((julianday(resolved_at) - julianday(detected_at)) * 86400 AS REAL)
+            )
+            FROM edge_case_events
+            WHERE resolved_at IS NOT NULL
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(EdgeCaseStats {
+            total: total.0 as u32,
+            resolved: resolved.0 as u32,
+            pending: pending.0 as u32,
+            failed: failed.0 as u32,
+            by_type: by_type_rows.into_iter().map(|(k, v)| (k, v as u32)).collect(),
+            avg_resolution_time_seconds: avg_time.0,
+        })
+    }
+
+    /// Create or update edge case learning record
+    pub async fn upsert_edge_case_learning(
+        &self,
+        learning: &crate::edge_case_handler::EdgeCaseLearning,
+    ) -> Result<i64> {
+        let existing = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM edge_case_learnings WHERE edge_case_type = ? AND pattern = ?",
+        )
+        .bind(learning.edge_case_type.as_str())
+        .bind(&learning.pattern)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((id,)) = existing {
+            // Update existing
+            sqlx::query(
+                r#"
+                UPDATE edge_case_learnings
+                SET success_rate = ?, avg_resolution_time_seconds = ?,
+                    recommended_action = ?, occurrence_count = ?,
+                    last_occurrence = ?, updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(learning.success_rate)
+            .bind(learning.avg_resolution_time_seconds)
+            .bind(&learning.recommended_action)
+            .bind(learning.occurrence_count as i64)
+            .bind(learning.last_occurrence.to_rfc3339())
+            .bind(learning.updated_at.to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(id)
+        } else {
+            // Insert new
+            let result = sqlx::query(
+                r#"
+                INSERT INTO edge_case_learnings
+                    (edge_case_type, pattern, success_rate, avg_resolution_time_seconds,
+                     recommended_action, occurrence_count, last_occurrence, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(learning.edge_case_type.as_str())
+            .bind(&learning.pattern)
+            .bind(learning.success_rate)
+            .bind(learning.avg_resolution_time_seconds)
+            .bind(&learning.recommended_action)
+            .bind(learning.occurrence_count as i64)
+            .bind(learning.last_occurrence.to_rfc3339())
+            .bind(learning.created_at.to_rfc3339())
+            .bind(learning.updated_at.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    /// Get edge case learning by type and pattern
+    pub async fn get_edge_case_learning(
+        &self,
+        edge_case_type: &str,
+        pattern: &str,
+    ) -> Result<Option<crate::edge_case_handler::EdgeCaseLearning>> {
+        let row = sqlx::query_as::<_, EdgeCaseLearningRow>(
+            "SELECT * FROM edge_case_learnings WHERE edge_case_type = ? AND pattern = ?",
+        )
+        .bind(edge_case_type)
+        .bind(pattern)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_learning()).transpose()
+    }
+
+    /// Get all edge case learnings for a type
+    pub async fn get_edge_case_learnings_by_type(
+        &self,
+        edge_case_type: &str,
+    ) -> Result<Vec<crate::edge_case_handler::EdgeCaseLearning>> {
+        let rows = sqlx::query_as::<_, EdgeCaseLearningRow>(
+            r#"
+            SELECT * FROM edge_case_learnings
+            WHERE edge_case_type = ?
+            ORDER BY occurrence_count DESC
+            "#,
+        )
+        .bind(edge_case_type)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_learning()).collect()
+    }
+
+    /// Get top edge case learnings by success rate
+    pub async fn get_top_edge_case_learnings(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<crate::edge_case_handler::EdgeCaseLearning>> {
+        let rows = sqlx::query_as::<_, EdgeCaseLearningRow>(
+            r#"
+            SELECT * FROM edge_case_learnings
+            WHERE occurrence_count >= 3
+            ORDER BY success_rate DESC, occurrence_count DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_learning()).collect()
+    }
 }
 
 // ==================== Review Iteration Row (Epic 016 - Story 9) ====================
@@ -8771,4 +9104,91 @@ pub struct RecoveryStats {
     pub successful: u32,
     pub failed: u32,
     pub success_rate: f64,
+}
+
+// ==================== Edge Case Handler Row (Epic 016 - Story 14) ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct EdgeCaseEventRow {
+    id: i64,
+    session_id: Option<String>,
+    agent_id: Option<String>,
+    story_id: Option<String>,
+    edge_case_type: String,
+    resolution: String,
+    action_taken: Option<String>,
+    retry_count: i64,
+    error_message: Option<String>,
+    context: String,
+    detected_at: String,
+    resolved_at: Option<String>,
+    resolution_notes: Option<String>,
+}
+
+impl EdgeCaseEventRow {
+    fn into_event(self) -> Result<crate::edge_case_handler::EdgeCaseEvent> {
+        use crate::edge_case_handler::{EdgeCaseResolution, EdgeCaseType};
+        use std::str::FromStr;
+
+        Ok(crate::edge_case_handler::EdgeCaseEvent {
+            id: self.id,
+            session_id: self.session_id,
+            agent_id: self.agent_id,
+            story_id: self.story_id,
+            edge_case_type: EdgeCaseType::from_str(&self.edge_case_type)?,
+            resolution: EdgeCaseResolution::from_str(&self.resolution)?,
+            action_taken: self.action_taken,
+            retry_count: self.retry_count as u32,
+            error_message: self.error_message,
+            context: serde_json::from_str(&self.context).unwrap_or_default(),
+            detected_at: parse_datetime(&self.detected_at)?,
+            resolved_at: self.resolved_at.map(|s| parse_datetime(&s)).transpose()?,
+            resolution_notes: self.resolution_notes,
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct EdgeCaseLearningRow {
+    id: i64,
+    edge_case_type: String,
+    pattern: String,
+    success_rate: f64,
+    avg_resolution_time_seconds: Option<f64>,
+    recommended_action: String,
+    occurrence_count: i64,
+    last_occurrence: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl EdgeCaseLearningRow {
+    fn into_learning(self) -> Result<crate::edge_case_handler::EdgeCaseLearning> {
+        use crate::edge_case_handler::EdgeCaseType;
+        use std::str::FromStr;
+
+        Ok(crate::edge_case_handler::EdgeCaseLearning {
+            id: self.id,
+            edge_case_type: EdgeCaseType::from_str(&self.edge_case_type)?,
+            pattern: self.pattern,
+            success_rate: self.success_rate,
+            avg_resolution_time_seconds: self.avg_resolution_time_seconds,
+            recommended_action: self.recommended_action,
+            occurrence_count: self.occurrence_count as u32,
+            last_occurrence: parse_datetime(&self.last_occurrence)?,
+            created_at: parse_datetime(&self.created_at)?,
+            updated_at: parse_datetime(&self.updated_at)?,
+        })
+    }
+}
+
+/// Edge case statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EdgeCaseStats {
+    pub total: u32,
+    pub resolved: u32,
+    pub pending: u32,
+    pub failed: u32,
+    pub by_type: std::collections::HashMap<String, u32>,
+    pub avg_resolution_time_seconds: Option<f64>,
 }
