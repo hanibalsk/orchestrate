@@ -200,6 +200,12 @@ impl Database {
         ))
         .execute(&self.pool)
         .await?;
+        // Review iterations migration (Epic 016 - Story 9)
+        sqlx::query(include_str!(
+            "../../../migrations/025_review_iterations.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -8291,6 +8297,310 @@ impl Database {
 
         Ok(stats)
     }
+
+    // ==================== Review Iteration Operations (Epic 016 - Story 9) ====================
+
+    /// Create a review iteration
+    pub async fn create_review_iteration(
+        &self,
+        iteration: &crate::code_review::ReviewIteration,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO review_iterations
+                (story_id, iteration, reviewer_type, reviewer, verdict,
+                 issue_count, blocking_issue_count, escalation_level,
+                 duration_secs, started_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&iteration.story_id)
+        .bind(iteration.iteration as i64)
+        .bind(iteration.reviewer_type.as_str())
+        .bind(&iteration.reviewer)
+        .bind(iteration.verdict.as_str())
+        .bind(iteration.issue_count as i64)
+        .bind(iteration.blocking_issue_count as i64)
+        .bind(iteration.escalation_level.as_str())
+        .bind(iteration.duration_secs.map(|d| d as i64))
+        .bind(iteration.started_at.to_rfc3339())
+        .bind(iteration.completed_at.map(|t| t.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Update a review iteration
+    pub async fn update_review_iteration(
+        &self,
+        iteration: &crate::code_review::ReviewIteration,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE review_iterations SET
+                reviewer = ?,
+                verdict = ?,
+                issue_count = ?,
+                blocking_issue_count = ?,
+                escalation_level = ?,
+                duration_secs = ?,
+                completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&iteration.reviewer)
+        .bind(iteration.verdict.as_str())
+        .bind(iteration.issue_count as i64)
+        .bind(iteration.blocking_issue_count as i64)
+        .bind(iteration.escalation_level.as_str())
+        .bind(iteration.duration_secs.map(|d| d as i64))
+        .bind(iteration.completed_at.map(|t| t.to_rfc3339()))
+        .bind(iteration.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get review iterations for a story
+    pub async fn get_review_iterations(
+        &self,
+        story_id: &str,
+    ) -> Result<Vec<crate::code_review::ReviewIteration>> {
+        let rows = sqlx::query_as::<_, ReviewIterationRow>(
+            r#"
+            SELECT * FROM review_iterations
+            WHERE story_id = ?
+            ORDER BY iteration ASC
+            "#,
+        )
+        .bind(story_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_iteration()).collect()
+    }
+
+    /// Get latest review iteration for a story
+    pub async fn get_latest_review_iteration(
+        &self,
+        story_id: &str,
+    ) -> Result<Option<crate::code_review::ReviewIteration>> {
+        let row = sqlx::query_as::<_, ReviewIterationRow>(
+            r#"
+            SELECT * FROM review_iterations
+            WHERE story_id = ?
+            ORDER BY iteration DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(story_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_iteration()).transpose()
+    }
+
+    /// Get review iteration count for a story
+    pub async fn get_review_iteration_number(
+        &self,
+        story_id: &str,
+    ) -> Result<u32> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(iteration), 0) FROM review_iterations WHERE story_id = ?",
+        )
+        .bind(story_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count.0 as u32)
+    }
+
+    /// Create a review request
+    pub async fn create_review_request(
+        &self,
+        request: &crate::code_review::ReviewRequest,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO review_requests
+                (story_id, agent_id, session_id, branch, base_branch, pr_number,
+                 iteration, changed_files, criteria, previous_issues, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))
+            "#,
+        )
+        .bind(&request.story_id)
+        .bind(&request.agent_id)
+        .bind(&request.session_id)
+        .bind(&request.branch)
+        .bind(&request.base_branch)
+        .bind(request.pr_number.map(|n| n as i64))
+        .bind(request.iteration as i64)
+        .bind(serde_json::to_string(&request.changed_files)?)
+        .bind(serde_json::to_string(&request.criteria)?)
+        .bind(serde_json::to_string(&request.previous_issues)?)
+        .bind(request.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get pending review requests
+    pub async fn get_pending_review_requests(
+        &self,
+    ) -> Result<Vec<crate::code_review::ReviewRequest>> {
+        let rows = sqlx::query_as::<_, ReviewRequestRow>(
+            r#"
+            SELECT * FROM review_requests
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_request()).collect()
+    }
+
+    /// Update review request status
+    pub async fn update_review_request_status(
+        &self,
+        id: i64,
+        status: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE review_requests SET status = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(status)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get review stats for a story
+    pub async fn get_review_stats(
+        &self,
+        story_id: &str,
+    ) -> Result<ReviewStats> {
+        let rows = sqlx::query_as::<_, ReviewIterationRow>(
+            "SELECT * FROM review_iterations WHERE story_id = ?",
+        )
+        .bind(story_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total_iterations = rows.len() as u32;
+        let approved_count = rows.iter().filter(|r| r.verdict == "approved").count() as u32;
+        let changes_requested_count = rows.iter().filter(|r| r.verdict == "changes_requested").count() as u32;
+        let total_issues: u32 = rows.iter().map(|r| r.issue_count as u32).sum();
+        let total_blocking: u32 = rows.iter().map(|r| r.blocking_issue_count as u32).sum();
+
+        Ok(ReviewStats {
+            total_iterations,
+            approved_count,
+            changes_requested_count,
+            total_issues,
+            total_blocking_issues: total_blocking,
+        })
+    }
+}
+
+// ==================== Review Iteration Row (Epic 016 - Story 9) ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReviewIterationRow {
+    id: i64,
+    story_id: String,
+    iteration: i64,
+    reviewer_type: String,
+    reviewer: Option<String>,
+    verdict: String,
+    issue_count: i64,
+    blocking_issue_count: i64,
+    escalation_level: String,
+    duration_secs: Option<i64>,
+    started_at: String,
+    completed_at: Option<String>,
+}
+
+impl ReviewIterationRow {
+    fn into_iteration(self) -> Result<crate::code_review::ReviewIteration> {
+        use crate::code_review::{ReviewEscalationLevel, ReviewerType};
+        use crate::work_evaluation::ReviewVerdict;
+        use std::str::FromStr;
+
+        Ok(crate::code_review::ReviewIteration {
+            id: self.id,
+            story_id: self.story_id,
+            iteration: self.iteration as u32,
+            reviewer_type: ReviewerType::from_str(&self.reviewer_type)?,
+            reviewer: self.reviewer,
+            verdict: ReviewVerdict::from_str(&self.verdict)?,
+            issue_count: self.issue_count as u32,
+            blocking_issue_count: self.blocking_issue_count as u32,
+            escalation_level: match self.escalation_level.as_str() {
+                "none" => ReviewEscalationLevel::None,
+                "suggest_human" => ReviewEscalationLevel::SuggestHuman,
+                "require_human" => ReviewEscalationLevel::RequireHuman,
+                "senior" => ReviewEscalationLevel::Senior,
+                "block" => ReviewEscalationLevel::Block,
+                _ => ReviewEscalationLevel::None,
+            },
+            duration_secs: self.duration_secs.map(|d| d as u64),
+            started_at: parse_datetime(&self.started_at)?,
+            completed_at: self.completed_at.map(|s| parse_datetime(&s)).transpose()?,
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReviewRequestRow {
+    id: i64,
+    story_id: String,
+    agent_id: String,
+    session_id: Option<String>,
+    branch: String,
+    base_branch: String,
+    pr_number: Option<i64>,
+    iteration: i64,
+    changed_files: String,
+    criteria: String,
+    previous_issues: String,
+    status: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl ReviewRequestRow {
+    fn into_request(self) -> Result<crate::code_review::ReviewRequest> {
+        Ok(crate::code_review::ReviewRequest {
+            story_id: self.story_id,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            branch: self.branch,
+            base_branch: self.base_branch,
+            pr_number: self.pr_number.map(|n| n as u64),
+            iteration: self.iteration as u32,
+            changed_files: serde_json::from_str(&self.changed_files)?,
+            criteria: serde_json::from_str(&self.criteria)?,
+            previous_issues: serde_json::from_str(&self.previous_issues)?,
+            created_at: parse_datetime(&self.created_at)?,
+        })
+    }
+}
+
+/// Review statistics for a story
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewStats {
+    pub total_iterations: u32,
+    pub approved_count: u32,
+    pub changes_requested_count: u32,
+    pub total_issues: u32,
+    pub total_blocking_issues: u32,
 }
 
 // ==================== Story Evaluation Row (Epic 016 - Story 8) ====================

@@ -71,6 +71,7 @@ pub mod test_stubs;
 pub mod stuck_detection;
 pub mod recovery;
 pub mod work_evaluation;
+pub mod code_review;
 #[cfg(test)]
 mod database_stuck_detection_tests;
 #[cfg(test)]
@@ -324,4 +325,10 @@ pub use work_evaluation::{
     CiCheckResult, CiStatus, CriterionCheck, FeedbackItem, FeedbackType, PrMergeStatus,
     ReviewIssue, ReviewIssueSeverity, ReviewResult, ReviewVerdict, StoryEvaluationRecord,
     WorkCompletionStatus, WorkEvaluationResult, WorkEvaluator, WorkEvaluatorConfig,
+};
+
+// Re-export code review types (Epic 016 - Story 9)
+pub use code_review::{
+    CodeReviewConfig, CodeReviewCoordinator, ReviewEscalationLevel, ReviewIteration,
+    ReviewRequest, ReviewResponse, ReviewerType,
 };
