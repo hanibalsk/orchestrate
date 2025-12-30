@@ -251,6 +251,11 @@ enum Commands {
         #[command(subcommand)]
         action: SecurityAction,
     },
+    /// Epic autonomous processing
+    Epic {
+        #[command(subcommand)]
+        action: EpicAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1802,6 +1807,59 @@ enum SecurityAction {
     Exceptions,
     /// Update security baseline (ignore existing issues)
     Baseline,
+}
+
+#[derive(Subcommand)]
+enum EpicAction {
+    /// Start autonomous epic processing
+    AutoProcess {
+        /// Pattern to match epic files (e.g., "epic-016-*")
+        #[arg(short, long)]
+        pattern: Option<String>,
+        /// Maximum concurrent agents
+        #[arg(short = 'c', long, default_value = "3")]
+        max_agents: usize,
+        /// Claude model to use
+        #[arg(short, long, default_value = "sonnet")]
+        model: String,
+        /// Dry run - show execution plan without running
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show autonomous processing status
+    AutoStatus {
+        /// Show detailed status with metrics
+        #[arg(long)]
+        detailed: bool,
+    },
+    /// Pause autonomous processing
+    AutoPause,
+    /// Resume autonomous processing
+    AutoResume,
+    /// Stop autonomous processing
+    AutoStop {
+        /// Force stop without cleanup
+        #[arg(long)]
+        force: bool,
+    },
+    /// List stuck agents
+    StuckAgents,
+    /// Unblock a blocked epic
+    Unblock {
+        /// Epic ID to unblock
+        epic_id: String,
+    },
+    /// Show work queue
+    Queue,
+    /// Discover and parse epics
+    Discover {
+        /// Pattern to match epic files
+        #[arg(short, long)]
+        pattern: Option<String>,
+        /// Epics directory
+        #[arg(short, long, default_value = "docs/bmad/epics")]
+        dir: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -6313,6 +6371,35 @@ async fn main() -> Result<()> {
                 println!("Note: New vulnerabilities will still be flagged.");
             }
         },
+        Commands::Epic { action } => match action {
+            EpicAction::AutoProcess { pattern, max_agents, model, dry_run } => {
+                handle_epic_auto_process(&db, pattern.as_deref(), max_agents, &model, dry_run).await?;
+            }
+            EpicAction::AutoStatus { detailed } => {
+                handle_epic_auto_status(&db, detailed).await?;
+            }
+            EpicAction::AutoPause => {
+                handle_epic_auto_pause(&db).await?;
+            }
+            EpicAction::AutoResume => {
+                handle_epic_auto_resume(&db).await?;
+            }
+            EpicAction::AutoStop { force } => {
+                handle_epic_auto_stop(&db, force).await?;
+            }
+            EpicAction::StuckAgents => {
+                handle_epic_stuck_agents(&db).await?;
+            }
+            EpicAction::Unblock { epic_id } => {
+                handle_epic_unblock(&db, &epic_id).await?;
+            }
+            EpicAction::Queue => {
+                handle_epic_queue(&db).await?;
+            }
+            EpicAction::Discover { pattern, dir } => {
+                handle_epic_discover(&db, pattern.as_deref(), &dir).await?;
+            }
+        },
     }
 
     Ok(())
@@ -8180,5 +8267,411 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     } else {
         format!("{}...", &s[..max_len - 3])
     }
+}
+
+// ==================== Epic Autonomous Processing Handlers ====================
+
+async fn handle_epic_auto_process(
+    db: &Database,
+    pattern: Option<&str>,
+    max_agents: usize,
+    model: &str,
+    dry_run: bool,
+) -> Result<()> {
+    use orchestrate_core::{EpicDiscoveryService, AutonomousSession, AutonomousSessionState};
+
+    println!("=== Autonomous Epic Processing ===");
+    println!();
+
+    // Discover epics
+    let service = EpicDiscoveryService::new();
+    let epics_dir = PathBuf::from("docs/bmad/epics");
+
+    if !epics_dir.exists() {
+        anyhow::bail!("Epics directory not found: {:?}", epics_dir);
+    }
+
+    // Find epic files
+    let mut epic_files: Vec<_> = std::fs::read_dir(&epics_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(pat) = pattern {
+                service.matches_pattern(&name, pat)
+            } else {
+                name.starts_with("epic-")
+            }
+        })
+        .collect();
+
+    epic_files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    if epic_files.is_empty() {
+        println!("No epics found matching pattern: {:?}", pattern);
+        return Ok(());
+    }
+
+    println!("Found {} epic(s):", epic_files.len());
+    for entry in &epic_files {
+        println!("  - {}", entry.file_name().to_string_lossy());
+    }
+    println!();
+
+    // Parse epics
+    let mut discovered_epics = Vec::new();
+    for entry in &epic_files {
+        let content = std::fs::read_to_string(entry.path())?;
+        let epic_id = entry.path()
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let epic = service.parse_epic(&epic_id, &content, entry.path());
+        discovered_epics.push(epic);
+    }
+
+    // Create execution plan
+    let plan = service.create_execution_plan(&discovered_epics);
+
+    println!("Execution Plan:");
+    println!("  Epics: {}", plan.epics.len());
+    println!("  Stories: {}", plan.total_stories);
+    println!("  Dependencies: {}", plan.dependency_count);
+    println!();
+
+    println!("Work Queue:");
+    for (i, item) in plan.work_queue.iter().enumerate() {
+        let deps = if item.dependencies.is_empty() {
+            String::new()
+        } else {
+            format!(" (deps: {})", item.dependencies.join(", "))
+        };
+        println!("  {}. {} - {}{}", i + 1, item.full_id, item.title, deps);
+    }
+    println!();
+
+    if dry_run {
+        println!("DRY RUN - No agents will be spawned.");
+        println!();
+        println!("Would process with:");
+        println!("  Max agents: {}", max_agents);
+        println!("  Model: {}", model);
+        return Ok(());
+    }
+
+    // Create autonomous session with config
+    let config = orchestrate_core::SessionConfig {
+        max_agents: max_agents as u32,
+        model: Some(model.to_string()),
+        ..Default::default()
+    };
+    let session = AutonomousSession::new().with_config(config);
+
+    // Save session
+    db.create_autonomous_session(&session).await?;
+
+    println!("Created autonomous session: {}", session.id);
+    println!();
+    println!("Processing will begin in background.");
+    println!("Use 'orchestrate epic auto-status' to monitor progress.");
+
+    Ok(())
+}
+
+async fn handle_epic_auto_status(db: &Database, detailed: bool) -> Result<()> {
+    use orchestrate_core::AutonomousSessionState;
+
+    println!("=== Autonomous Processing Status ===");
+    println!();
+
+    // Get active sessions
+    let sessions = db.list_autonomous_sessions(Some("active"), None).await?;
+
+    if sessions.is_empty() {
+        println!("No active autonomous sessions.");
+        println!();
+        println!("Start one with: orchestrate epic auto-process");
+        return Ok(());
+    }
+
+    for session in &sessions {
+        println!("Session: {}", session.id);
+        println!("  State: {:?}", session.state);
+        println!("  Started: {}", session.started_at.format("%Y-%m-%d %H:%M:%S"));
+        if let Some(epic) = &session.current_epic_id {
+            println!("  Current Epic: {}", epic);
+        }
+        if let Some(story) = &session.current_story_id {
+            println!("  Current Story: {}", story);
+        }
+
+        if detailed {
+            println!();
+            println!("  Metrics:");
+            println!("    Stories Completed: {}", session.metrics.stories_completed);
+            println!("    Stories Failed: {}", session.metrics.stories_failed);
+            println!("    Reviews Passed: {}", session.metrics.reviews_passed);
+            println!("    Reviews Failed: {}", session.metrics.reviews_failed);
+            println!("    Total Iterations: {}", session.metrics.total_iterations);
+            println!();
+            println!("  Completed Items: {}", session.completed_items.len());
+            for item in &session.completed_items {
+                let status = if item.success { "success" } else { "failed" };
+                println!("    - {} ({})", item.id, status);
+            }
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+async fn handle_epic_auto_pause(db: &Database) -> Result<()> {
+    use orchestrate_core::AutonomousSessionState;
+
+    println!("Pausing autonomous processing...");
+
+    let sessions = db.list_autonomous_sessions(Some("active"), None).await?;
+
+    if sessions.is_empty() {
+        println!("No active sessions to pause.");
+        return Ok(());
+    }
+
+    for mut session in sessions {
+        let _ = session.pause("Paused by user via CLI");
+        db.update_autonomous_session(&session).await?;
+        println!("  Paused session: {}", session.id);
+    }
+
+    println!();
+    println!("Use 'orchestrate epic auto-resume' to continue.");
+
+    Ok(())
+}
+
+async fn handle_epic_auto_resume(db: &Database) -> Result<()> {
+    use orchestrate_core::AutonomousSessionState;
+
+    println!("Resuming autonomous processing...");
+
+    let sessions = db.list_autonomous_sessions(Some("paused"), None).await?;
+
+    if sessions.is_empty() {
+        println!("No paused sessions to resume.");
+        return Ok(());
+    }
+
+    for mut session in sessions {
+        let _ = session.resume();
+        db.update_autonomous_session(&session).await?;
+        println!("  Resumed session: {}", session.id);
+    }
+
+    Ok(())
+}
+
+async fn handle_epic_auto_stop(db: &Database, force: bool) -> Result<()> {
+    use orchestrate_core::AutonomousSessionState;
+
+    println!("Stopping autonomous processing...");
+
+    let sessions = db.list_autonomous_sessions(None, None).await?;
+    let active: Vec<_> = sessions.into_iter()
+        .filter(|s| !matches!(s.state, AutonomousSessionState::Done | AutonomousSessionState::Blocked))
+        .collect();
+
+    if active.is_empty() {
+        println!("No active sessions to stop.");
+        return Ok(());
+    }
+
+    for mut session in active {
+        if force {
+            // Force stop - mark as blocked
+            let _ = session.block("Force stopped by user");
+        } else {
+            let _ = session.complete();
+        }
+        db.update_autonomous_session(&session).await?;
+        println!("  Stopped session: {}", session.id);
+    }
+
+    if force {
+        println!();
+        println!("Force stop complete. Agents may be orphaned.");
+        println!("Use 'orchestrate agent list' to check.");
+    }
+
+    Ok(())
+}
+
+async fn handle_epic_stuck_agents(db: &Database) -> Result<()> {
+    use orchestrate_core::AgentState;
+
+    println!("=== Stuck Agents ===");
+    println!();
+
+    // Get all running agents
+    let all_agents = db.list_agents().await?;
+    let agents: Vec<_> = all_agents.into_iter()
+        .filter(|a| a.state == AgentState::Running)
+        .collect();
+
+    if agents.is_empty() {
+        println!("No running agents found.");
+        return Ok(());
+    }
+
+    let mut stuck_count = 0;
+    let now = chrono::Utc::now();
+
+    for agent in &agents {
+        let age = now - agent.created_at;
+        let age_mins = age.num_minutes();
+
+        // Consider stuck if running for more than 60 minutes
+        let is_stuck = age_mins > 60;
+
+        if is_stuck {
+            stuck_count += 1;
+            println!("Agent: {} ({:?})", agent.id, agent.agent_type);
+            println!("  Running for: {} minutes", age_mins);
+            println!("  Task: {}", agent.task);
+            if let Some(wt) = &agent.worktree_id {
+                println!("  Worktree: {}", wt);
+            }
+            println!();
+        }
+    }
+
+    if stuck_count == 0 {
+        println!("No stuck agents found.");
+        println!();
+        println!("{} agent(s) running normally.", agents.len());
+    } else {
+        println!("Found {} stuck agent(s).", stuck_count);
+        println!();
+        println!("To terminate: orchestrate agent terminate <id>");
+    }
+
+    Ok(())
+}
+
+async fn handle_epic_unblock(_db: &Database, epic_id: &str) -> Result<()> {
+    println!("Unblocking epic: {}", epic_id);
+    println!();
+
+    // TODO: Implement epic unblock when get_epic database method is added
+    // For now, show what would happen
+    println!("Would unblock epic {} and set status to InProgress.", epic_id);
+    println!();
+    println!("Note: Epic unblock requires additional database methods.");
+    println!("Processing will resume automatically once unblocked.");
+
+    Ok(())
+}
+
+async fn handle_epic_queue(db: &Database) -> Result<()> {
+    use orchestrate_core::AutonomousSessionState;
+
+    println!("=== Work Queue ===");
+    println!();
+
+    // Get active session
+    let sessions = db.list_autonomous_sessions(Some("active"), None).await?;
+
+    if sessions.is_empty() {
+        println!("No active session. Start one with: orchestrate epic auto-process");
+        return Ok(());
+    }
+
+    for session in &sessions {
+        println!("Session: {}", session.id);
+        println!();
+
+        if session.work_queue.is_empty() {
+            println!("  Queue is empty.");
+        } else {
+            println!("  Pending work items:");
+            for (i, item) in session.work_queue.iter().enumerate() {
+                println!("    {}. {} - {:?}", i + 1, item.id, item.work_type);
+            }
+        }
+
+        if !session.completed_items.is_empty() {
+            println!();
+            println!("  Completed items: {}", session.completed_items.len());
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+async fn handle_epic_discover(_db: &Database, pattern: Option<&str>, dir: &PathBuf) -> Result<()> {
+    use orchestrate_core::EpicDiscoveryService;
+
+    println!("=== Epic Discovery ===");
+    println!();
+
+    let service = EpicDiscoveryService::new();
+
+    if !dir.exists() {
+        anyhow::bail!("Epics directory not found: {:?}", dir);
+    }
+
+    // Find epic files
+    let mut epic_files: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(pat) = pattern {
+                service.matches_pattern(&name, pat)
+            } else {
+                name.starts_with("epic-")
+            }
+        })
+        .collect();
+
+    epic_files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    if epic_files.is_empty() {
+        println!("No epics found in {:?}", dir);
+        if let Some(pat) = pattern {
+            println!("Pattern: {}", pat);
+        }
+        return Ok(());
+    }
+
+    println!("Discovered {} epic(s):", epic_files.len());
+    println!();
+
+    for entry in &epic_files {
+        let content = std::fs::read_to_string(entry.path())?;
+        let epic_id = entry.path()
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let epic = service.parse_epic(&epic_id, &content, entry.path());
+
+        println!("Epic: {} - {}", epic.id, epic.title);
+        println!("  Stories: {}", epic.stories.len());
+        if let Some(desc) = &epic.description {
+            let short = truncate_str(desc, 60);
+            println!("  Description: {}", short);
+        }
+        println!();
+
+        for story in &epic.stories {
+            let criteria_count = story.acceptance_criteria.len();
+            println!("  Story {}: {} ({} criteria)", story.number, story.title, criteria_count);
+        }
+        println!();
+    }
+
+    Ok(())
 }
 
