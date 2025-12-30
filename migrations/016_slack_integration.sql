@@ -148,6 +148,15 @@ CREATE TABLE IF NOT EXISTS slack_command_audit (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Story 8: Code owners for file patterns (user mention support)
+CREATE TABLE IF NOT EXISTS slack_code_owners (
+    id TEXT PRIMARY KEY,
+    pattern TEXT NOT NULL,
+    github_username TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (pattern, github_username)
+);
+
 -- Indices for performance
 CREATE INDEX IF NOT EXISTS idx_slack_connections_active ON slack_connections(is_active);
 CREATE INDEX IF NOT EXISTS idx_slack_connections_team ON slack_connections(team_id);
@@ -168,3 +177,5 @@ CREATE INDEX IF NOT EXISTS idx_slack_rate_limits_connection ON slack_rate_limits
 CREATE INDEX IF NOT EXISTS idx_slack_command_audit_connection ON slack_command_audit(connection_id);
 CREATE INDEX IF NOT EXISTS idx_slack_command_audit_user ON slack_command_audit(user_id);
 CREATE INDEX IF NOT EXISTS idx_slack_command_audit_created ON slack_command_audit(created_at);
+CREATE INDEX IF NOT EXISTS idx_slack_code_owners_pattern ON slack_code_owners(pattern);
+CREATE INDEX IF NOT EXISTS idx_slack_code_owners_github ON slack_code_owners(github_username);

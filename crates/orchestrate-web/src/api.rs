@@ -6,7 +6,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use orchestrate_core::{
@@ -219,6 +219,16 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/docs/adrs", get(list_adrs).post(create_adr))
         .route("/api/docs/adrs/:number", get(get_adr).put(update_adr))
         .route("/api/docs/changelog", post(generate_changelog))
+        // Slack routes (Story 10)
+        .route("/api/slack/connect", post(slack_connect))
+        .route("/api/slack/disconnect", post(slack_disconnect))
+        .route("/api/slack/status", get(slack_status))
+        .route("/api/slack/channels", get(slack_channels))
+        .route("/api/slack/channel", post(slack_set_channel))
+        .route("/api/slack/test", post(slack_test_notification))
+        .route("/api/slack/users", get(slack_list_users).post(slack_map_user))
+        .route("/api/slack/users/:github_username", delete(slack_delete_user))
+        .route("/api/slack/notify", post(slack_send_notification))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -3000,6 +3010,372 @@ async fn generate_changelog(
         entries: entry_items,
         markdown: release.to_markdown(),
     }))
+}
+
+// ==================== Slack API Handlers (Story 10) ====================
+
+#[derive(Debug, Deserialize)]
+struct SlackConnectRequest {
+    token: String,
+    team_id: Option<String>,
+    team_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SlackConnectionResponse {
+    id: String,
+    team_id: String,
+    team_name: String,
+    connected_at: String,
+    is_active: bool,
+    scopes: Vec<String>,
+}
+
+async fn slack_connect(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SlackConnectRequest>,
+) -> Result<Json<SlackConnectionResponse>, ApiError> {
+    use orchestrate_core::{SlackConnection, SlackService};
+
+    // Validate token format
+    if !req.token.starts_with("xoxb-") {
+        return Err(ApiError::validation("Invalid token format. Bot tokens should start with 'xoxb-'"));
+    }
+
+    let slack_service = SlackService::new(state.db.clone());
+
+    // In production, would call Slack API to validate token and get team info
+    let team_id = req.team_id.unwrap_or_else(|| "T_WORKSPACE".to_string());
+    let team_name = req.team_name.unwrap_or_else(|| "Workspace".to_string());
+
+    let conn = SlackConnection::new(&team_id, &team_name, &req.token)
+        .with_scopes(vec![
+            "chat:write".to_string(),
+            "chat:write.public".to_string(),
+            "commands".to_string(),
+            "users:read".to_string(),
+            "channels:read".to_string(),
+        ]);
+
+    slack_service.save_connection(&conn).await
+        .map_err(|e| ApiError::internal(format!("Failed to save connection: {}", e)))?;
+
+    Ok(Json(SlackConnectionResponse {
+        id: conn.id,
+        team_id: conn.team_id,
+        team_name: conn.team_name,
+        connected_at: conn.connected_at.to_rfc3339(),
+        is_active: conn.is_active,
+        scopes: conn.scopes,
+    }))
+}
+
+async fn slack_disconnect(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::SlackService;
+
+    let slack_service = SlackService::new(state.db.clone());
+    let conn = slack_service.get_active_connection().await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    if let Some(mut conn) = conn {
+        conn.is_active = false;
+        slack_service.save_connection(&conn).await
+            .map_err(|e| ApiError::internal(format!("Failed to disconnect: {}", e)))?;
+
+        Ok(Json(serde_json::json!({
+            "status": "disconnected",
+            "team_name": conn.team_name
+        })))
+    } else {
+        Err(ApiError::not_found("Active Slack connection"))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SlackStatusResponse {
+    connected: bool,
+    team_id: Option<String>,
+    team_name: Option<String>,
+    connected_at: Option<String>,
+    scopes: Vec<String>,
+    default_channel: Option<String>,
+    channel_mappings: std::collections::HashMap<String, String>,
+}
+
+async fn slack_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SlackStatusResponse>, ApiError> {
+    use orchestrate_core::SlackService;
+
+    let slack_service = SlackService::new(state.db.clone());
+    let conn = slack_service.get_active_connection().await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    if let Some(conn) = conn {
+        let config = slack_service.get_channel_config(&conn.id).await
+            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+        let (default_channel, channel_mappings) = if let Some(config) = config {
+            let mappings = config.channel_mappings.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            (Some(config.default_channel), mappings)
+        } else {
+            (None, std::collections::HashMap::new())
+        };
+
+        Ok(Json(SlackStatusResponse {
+            connected: true,
+            team_id: Some(conn.team_id),
+            team_name: Some(conn.team_name),
+            connected_at: Some(conn.connected_at.to_rfc3339()),
+            scopes: conn.scopes,
+            default_channel,
+            channel_mappings,
+        }))
+    } else {
+        Ok(Json(SlackStatusResponse {
+            connected: false,
+            team_id: None,
+            team_name: None,
+            connected_at: None,
+            scopes: Vec::new(),
+            default_channel: None,
+            channel_mappings: std::collections::HashMap::new(),
+        }))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SlackChannel {
+    id: String,
+    name: String,
+    is_private: bool,
+}
+
+async fn slack_channels(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SlackChannel>>, ApiError> {
+    // In production, would fetch from Slack API
+    Ok(Json(vec![
+        SlackChannel {
+            id: "C_GENERAL".to_string(),
+            name: "#general".to_string(),
+            is_private: false,
+        },
+        SlackChannel {
+            id: "C_ORCHESTRATE".to_string(),
+            name: "#orchestrate".to_string(),
+            is_private: false,
+        },
+        SlackChannel {
+            id: "C_DEPLOYMENTS".to_string(),
+            name: "#deployments".to_string(),
+            is_private: false,
+        },
+        SlackChannel {
+            id: "C_ALERTS".to_string(),
+            name: "#alerts".to_string(),
+            is_private: false,
+        },
+    ]))
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackSetChannelRequest {
+    notification_type: String,
+    channel: String,
+}
+
+async fn slack_set_channel(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SlackSetChannelRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::{SlackService, NotificationType, ChannelConfig};
+
+    let slack_service = SlackService::new(state.db.clone());
+    let conn = slack_service.get_active_connection().await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Active Slack connection"))?;
+
+    // Parse notification type
+    let notif_type = match req.notification_type.as_str() {
+        "agent_started" => NotificationType::AgentStarted,
+        "agent_completed" => NotificationType::AgentCompleted,
+        "agent_failed" => NotificationType::AgentFailed,
+        "pr_created" => NotificationType::PrCreated,
+        "pr_merged" => NotificationType::PrMerged,
+        "ci_failed" => NotificationType::CiFailed,
+        "deployment_failed" => NotificationType::DeploymentFailed,
+        "approval_required" => NotificationType::ApprovalRequired,
+        _ => return Err(ApiError::validation(format!("Invalid notification type: {}", req.notification_type))),
+    };
+
+    // Get or create channel config
+    let mut config = slack_service.get_channel_config(&conn.id).await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .unwrap_or_else(|| ChannelConfig::new("#orchestrate"));
+
+    config.channel_mappings.insert(notif_type, req.channel.clone());
+    slack_service.save_channel_config(&conn.id, &config).await
+        .map_err(|e| ApiError::internal(format!("Failed to save config: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "notification_type": req.notification_type,
+        "channel": req.channel,
+        "status": "updated"
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackTestRequest {
+    channel: String,
+}
+
+async fn slack_test_notification(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SlackTestRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::{SlackService, SlackMessage, NotificationType, SlackBlock, SlackText};
+
+    let slack_service = SlackService::new(state.db.clone());
+
+    let message = SlackMessage::new(&req.channel, "Test message from Orchestrate")
+        .with_blocks(vec![
+            SlackBlock::Section {
+                text: SlackText::mrkdwn("🧪 *Test Message*\n\nThis is a test notification from Orchestrate."),
+                accessory: None,
+                fields: None,
+            },
+        ]);
+
+    let result = slack_service.send_notification(
+        NotificationType::Custom("test".to_string()),
+        message,
+        None,
+        None,
+    ).await
+        .map_err(|e| ApiError::internal(format!("Failed to send message: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "sent",
+        "channel": result.channel,
+        "timestamp": result.ts
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackMapUserRequest {
+    github_username: String,
+    slack_user_id: String,
+    slack_username: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SlackUserMappingResponse {
+    id: String,
+    github_username: String,
+    slack_user_id: String,
+    slack_username: String,
+    notify_on_pr: bool,
+    notify_on_mention: bool,
+    notify_on_failure: bool,
+    created_at: String,
+}
+
+async fn slack_map_user(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SlackMapUserRequest>,
+) -> Result<Json<SlackUserMappingResponse>, ApiError> {
+    use orchestrate_core::{SlackService, SlackUserService};
+
+    let slack_service = SlackService::new(state.db.clone());
+    let user_service = SlackUserService::new(state.db.clone(), SlackService::new(state.db.clone()));
+
+    let mapping = user_service.map_user(&req.github_username, &req.slack_user_id, &req.slack_username).await
+        .map_err(|e| ApiError::internal(format!("Failed to map user: {}", e)))?;
+
+    Ok(Json(SlackUserMappingResponse {
+        id: mapping.id,
+        github_username: mapping.github_username,
+        slack_user_id: mapping.slack_user_id,
+        slack_username: mapping.slack_username,
+        notify_on_pr: mapping.notify_on_pr,
+        notify_on_mention: mapping.notify_on_mention,
+        notify_on_failure: mapping.notify_on_failure,
+        created_at: mapping.created_at.to_rfc3339(),
+    }))
+}
+
+async fn slack_list_users(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SlackUserMappingResponse>>, ApiError> {
+    use orchestrate_core::{SlackService, SlackUserService};
+
+    let slack_service = SlackService::new(state.db.clone());
+    let user_service = SlackUserService::new(state.db.clone(), SlackService::new(state.db.clone()));
+
+    let mappings = user_service.list_user_mappings().await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(mappings.into_iter().map(|m| SlackUserMappingResponse {
+        id: m.id,
+        github_username: m.github_username,
+        slack_user_id: m.slack_user_id,
+        slack_username: m.slack_username,
+        notify_on_pr: m.notify_on_pr,
+        notify_on_mention: m.notify_on_mention,
+        notify_on_failure: m.notify_on_failure,
+        created_at: m.created_at.to_rfc3339(),
+    }).collect()))
+}
+
+async fn slack_delete_user(
+    State(state): State<Arc<AppState>>,
+    Path(github_username): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::{SlackService, SlackUserService};
+
+    let slack_service = SlackService::new(state.db.clone());
+    let user_service = SlackUserService::new(state.db.clone(), SlackService::new(state.db.clone()));
+
+    user_service.delete_user_mapping(&github_username).await
+        .map_err(|e| ApiError::internal(format!("Failed to delete mapping: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "deleted",
+        "github_username": github_username
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackNotifyRequest {
+    channel: String,
+    message: String,
+    notification_type: String,
+}
+
+async fn slack_send_notification(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SlackNotifyRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::{SlackService, SlackMessage, NotificationType};
+
+    let slack_service = SlackService::new(state.db.clone());
+
+    let notif_type = NotificationType::Custom(req.notification_type);
+    let message = SlackMessage::new(&req.channel, &req.message);
+
+    let result = slack_service.send_notification(notif_type, message, None, None).await
+        .map_err(|e| ApiError::internal(format!("Failed to send notification: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "sent",
+        "channel": result.channel,
+        "timestamp": result.ts
+    })))
 }
 
 #[cfg(test)]

@@ -6006,94 +6006,190 @@ async fn main() -> Result<()> {
                 println!("(In production, would export actual audit logs)");
             }
         },
-        Commands::Slack { action } => match action {
-            SlackAction::Connect { token } => {
-                use orchestrate_core::SlackConnection;
+        Commands::Slack { action } => {
+            use orchestrate_core::{SlackConnection, SlackService, SlackUserService, ChannelConfig, NotificationType, SlackMessage};
 
-                // Validate token format
-                if !token.starts_with("xoxb-") {
-                    anyhow::bail!("Invalid token format. Bot tokens should start with 'xoxb-'");
+            let db = Database::new(&db_path).await?;
+            let slack_service = SlackService::new(db.clone());
+            let user_service = SlackUserService::new(db.clone(), SlackService::new(db.clone()));
+
+            match action {
+                SlackAction::Connect { token } => {
+                    // Validate token format
+                    if !token.starts_with("xoxb-") {
+                        anyhow::bail!("Invalid token format. Bot tokens should start with 'xoxb-'");
+                    }
+
+                    // In production, would call Slack API to get team info
+                    // For now, use placeholder values
+                    let conn = SlackConnection::new("T_WORKSPACE", "Workspace", &token)
+                        .with_scopes(vec![
+                            "chat:write".to_string(),
+                            "chat:write.public".to_string(),
+                            "commands".to_string(),
+                            "users:read".to_string(),
+                            "channels:read".to_string(),
+                        ]);
+
+                    slack_service.save_connection(&conn).await?;
+
+                    println!("Connecting to Slack...");
+                    println!("  Team: {}", conn.team_name);
+                    println!("  Team ID: {}", conn.team_id);
+                    println!("  Scopes: {}", conn.scopes.join(", "));
+                    println!();
+                    println!("Connected successfully!");
+                    println!("Connection ID: {}", conn.id);
                 }
+                SlackAction::Disconnect => {
+                    let conn = slack_service.get_active_connection().await?;
 
-                let conn = SlackConnection::new("T12345", "Workspace", &token)
-                    .with_scopes(vec![
-                        "chat:write".to_string(),
-                        "commands".to_string(),
-                        "users:read".to_string(),
-                    ]);
+                    if let Some(mut conn) = conn {
+                        conn.is_active = false;
+                        slack_service.save_connection(&conn).await?;
+                        println!("Disconnected from Slack workspace: {}", conn.team_name);
+                    } else {
+                        println!("No active Slack connection found.");
+                    }
+                }
+                SlackAction::Status => {
+                    let conn = slack_service.get_active_connection().await?;
 
-                println!("Connecting to Slack...");
-                println!("  Team: {}", conn.team_name);
-                println!("  Scopes: {:?}", conn.scopes);
-                println!();
-                println!("Connected successfully!");
-                println!("(In production, would validate token with Slack API)");
-            }
-            SlackAction::Disconnect => {
-                println!("Disconnecting from Slack...");
-                println!("Disconnected.");
-            }
-            SlackAction::Status => {
-                println!("Slack Connection Status:");
-                println!();
-                println!("  Status: Connected ✓");
-                println!("  Team: Acme Corp (T12345)");
-                println!("  Bot: @orchestrate-bot");
-                println!("  Connected: 2024-01-15 10:00:00");
-                println!();
-                println!("Scopes:");
-                println!("  ✓ chat:write");
-                println!("  ✓ commands");
-                println!("  ✓ users:read");
-                println!();
-                println!("(In production, would fetch actual status)");
-            }
-            SlackAction::Channels => {
-                println!("Available Channels:");
-                println!();
-                println!("  #general         (public)");
-                println!("  #orchestrate     (public)  [default]");
-                println!("  #deployments     (public)");
-                println!("  #alerts          (public)");
-                println!("  #pr-reviews      (private)");
-                println!();
-                println!("(In production, would fetch from Slack API)");
-            }
-            SlackAction::Channel { notification_type, channel } => {
-                println!("Setting channel for {}:", notification_type);
-                println!("  Channel: {}", channel);
-                println!();
-                println!("Channel mapping updated.");
-                println!("(In production, would save to database)");
-            }
-            SlackAction::Test { channel } => {
-                println!("Sending test message to: {}", channel);
-                println!();
-                println!("Message sent successfully!");
-                println!("  Timestamp: 1234567890.123456");
-                println!();
-                println!("(In production, would send actual Slack message)");
-            }
-            SlackAction::MapUser { github, slack } => {
-                use orchestrate_core::UserMapping;
+                    if let Some(conn) = conn {
+                        println!("Slack Connection Status:");
+                        println!();
+                        println!("  Status: Connected ✓");
+                        println!("  Team: {} ({})", conn.team_name, conn.team_id);
+                        println!("  Bot User ID: {}", conn.bot_user_id);
+                        println!("  Connected: {}", conn.connected_at.format("%Y-%m-%d %H:%M:%S"));
+                        println!("  Connected By: {}", conn.connected_by);
+                        println!();
+                        println!("Scopes:");
+                        for scope in &conn.scopes {
+                            println!("  ✓ {}", scope);
+                        }
 
-                let mapping = UserMapping::new(&github, &slack);
+                        // Show channel config if exists
+                        if let Ok(Some(config)) = slack_service.get_channel_config(&conn.id).await {
+                            println!();
+                            println!("Channel Configuration:");
+                            println!("  Default: {}", config.default_channel);
+                            if !config.channel_mappings.is_empty() {
+                                println!("  Mappings:");
+                                for (notif_type, channel) in &config.channel_mappings {
+                                    println!("    {} -> {}", notif_type, channel);
+                                }
+                            }
+                        }
+                    } else {
+                        println!("No active Slack connection.");
+                        println!("Run 'orchestrate slack connect --token <TOKEN>' to connect.");
+                    }
+                }
+                SlackAction::Channels => {
+                    println!("Available Channels:");
+                    println!();
+                    println!("Note: In production, this would fetch from Slack API.");
+                    println!("For now, configure channels using:");
+                    println!("  orchestrate slack channel -t <type> -c <channel>");
+                    println!();
+                    println!("Common channels:");
+                    println!("  #orchestrate     - Default notifications");
+                    println!("  #deployments     - Deployment notifications");
+                    println!("  #alerts          - Alert and failure notifications");
+                    println!("  #pr-reviews      - PR and review notifications");
+                }
+                SlackAction::Channel { notification_type, channel } => {
+                    let conn = slack_service.get_active_connection().await?
+                        .ok_or_else(|| anyhow::anyhow!("No active Slack connection. Connect first."))?;
 
-                println!("Mapping GitHub user to Slack:");
-                println!("  GitHub: {}", github);
-                println!("  Slack: {}", slack);
-                println!();
-                println!("Mapping created: {}", mapping.id);
-                println!("(In production, would save to database)");
-            }
-            SlackAction::Users => {
-                println!("User Mappings:");
-                println!();
-                println!("  github-alice  ->  U12345 (@alice)");
-                println!("  github-bob    ->  U67890 (@bob)");
-                println!("  github-carol  ->  U11111 (@carol)");
-                println!();
-                println!("(In production, would fetch from database)");
+                    // Parse notification type
+                    let notif_type = match notification_type.as_str() {
+                        "agent_started" => NotificationType::AgentStarted,
+                        "agent_completed" => NotificationType::AgentCompleted,
+                        "agent_failed" => NotificationType::AgentFailed,
+                        "pr_created" => NotificationType::PrCreated,
+                        "pr_merged" => NotificationType::PrMerged,
+                        "ci_failed" => NotificationType::CiFailed,
+                        "deployment_failed" => NotificationType::DeploymentFailed,
+                        "approval_required" => NotificationType::ApprovalRequired,
+                        _ => anyhow::bail!("Invalid notification type: {}", notification_type),
+                    };
+
+                    // Get or create channel config
+                    let mut config = slack_service.get_channel_config(&conn.id).await?
+                        .unwrap_or_else(|| ChannelConfig::new("#orchestrate"));
+
+                    config.channel_mappings.insert(notif_type.clone(), channel.clone());
+                    slack_service.save_channel_config(&conn.id, &config).await?;
+
+                    println!("Channel mapping updated:");
+                    println!("  {} -> {}", notification_type, channel);
+                }
+                SlackAction::Test { channel } => {
+                    let message = SlackMessage::new(&channel, "Test message from Orchestrate")
+                        .with_blocks(vec![
+                            orchestrate_core::SlackBlock::Section {
+                                text: orchestrate_core::SlackText::mrkdwn("🧪 *Test Message*\n\nThis is a test notification from Orchestrate."),
+                                accessory: None,
+                                fields: None,
+                            },
+                        ]);
+
+                    let result = slack_service.send_notification(
+                        NotificationType::Custom("test".to_string()),
+                        message,
+                        None,
+                        None,
+                    ).await?;
+
+                    println!("Test message sent successfully!");
+                    println!("  Channel: {}", result.channel);
+                    println!("  Timestamp: {}", result.ts);
+                }
+                SlackAction::MapUser { github, slack } => {
+                    // Extract username from slack user ID or handle format
+                    let slack_username = if slack.starts_with('@') {
+                        slack.trim_start_matches('@').to_string()
+                    } else {
+                        slack.clone()
+                    };
+
+                    let mapping = user_service.map_user(&github, &slack, &slack_username).await?;
+
+                    println!("User mapping created:");
+                    println!("  GitHub: {}", mapping.github_username);
+                    println!("  Slack: {} ({})", mapping.slack_username, mapping.slack_user_id);
+                    println!("  ID: {}", mapping.id);
+                    println!();
+                    println!("Notification preferences:");
+                    println!("  On PR: {}", if mapping.notify_on_pr { "✓" } else { "✗" });
+                    println!("  On Mention: {}", if mapping.notify_on_mention { "✓" } else { "✗" });
+                    println!("  On Failure: {}", if mapping.notify_on_failure { "✓" } else { "✗" });
+                }
+                SlackAction::Users => {
+                    let mappings = user_service.list_user_mappings().await?;
+
+                    if mappings.is_empty() {
+                        println!("No user mappings found.");
+                        println!("Create one with: orchestrate slack map-user --github <user> --slack <id>");
+                    } else {
+                        println!("User Mappings:");
+                        println!();
+                        for mapping in mappings {
+                            println!("  {} -> {} (@{})",
+                                mapping.github_username,
+                                mapping.slack_user_id,
+                                mapping.slack_username
+                            );
+                            print!("    Notifications:");
+                            if mapping.notify_on_pr { print!(" PR"); }
+                            if mapping.notify_on_mention { print!(" Mention"); }
+                            if mapping.notify_on_failure { print!(" Failure"); }
+                            println!();
+                        }
+                    }
+                }
             }
         },
         Commands::Security { action } => match action {

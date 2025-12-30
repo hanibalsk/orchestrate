@@ -33,6 +33,7 @@ pub mod monitoring;
 pub mod slack;
 pub mod slack_interactions;
 pub mod slack_service;
+pub mod slack_user_service;
 pub mod security;
 pub mod error;
 pub mod experiment;
@@ -242,6 +243,9 @@ pub use slack_interactions::{
 pub use slack_service::{
     AgentLifecycleEvent, PrNotificationEvent, RateLimitConfig, SlackService,
 };
+
+// Re-export Slack user service types
+pub use slack_user_service::{CodeOwner, SlackUserService};
 
 // Re-export security types
 pub use security::{
