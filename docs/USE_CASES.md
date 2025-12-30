@@ -1084,6 +1084,352 @@ orchestrate chaos run --experiment <id>
 orchestrate chaos report --experiment <id>
 ```
 
+### UC-021: Positive Feedback Closed Loop
+**Status:** 🔲 Not Implemented
+**Priority:** High
+**Effort:** Large
+
+Learn from successes, not just failures. Extends UC-501 with emphasis on positive reinforcement.
+
+**Learning Sources:**
+- Test result analysis (patterns leading to passing tests)
+- Positive feedback collection (thumbs up, successful completions)
+- Success pattern extraction and reinforcement
+- Code review approvals (what made reviewers approve)
+- Fast PR merges (what led to quick approvals)
+
+**Features:**
+- Success pattern extraction and database storage
+- A/B testing for prompts with automatic winner selection
+- Model selection optimization based on success rates
+- Confidence scoring for learned positive patterns
+- Pattern decay (reduce confidence over time without reinforcement)
+
+**Commands:**
+```bash
+orchestrate learn feedback --agent-id <id> --positive
+orchestrate learn experiment create --name "prompt-v2"
+orchestrate learn experiment results --name "prompt-v2"
+orchestrate learn success-patterns --agent-type story-developer
+orchestrate learn reinforce --pattern-id <id>
+```
+
+### UC-022: Sprint State Management
+**Status:** 🔲 Not Implemented
+**Priority:** Medium
+**Effort:** Medium
+
+Formalize sprint lifecycle with explicit state machine for tracking development progress.
+
+**State Machine:**
+```
+PLANNING → READY → IN_PROGRESS → REVIEW → RETROSPECTIVE → DONE
+    ↓          ↓           ↓          ↓
+  BLOCKED   BLOCKED     BLOCKED    BLOCKED
+```
+
+**Features:**
+- Sprint creation with capacity planning (story points)
+- Story assignment and automatic rebalancing
+- Burndown tracking with velocity calculation
+- Sprint health indicators (on track, at risk, behind)
+- Automatic rollover for incomplete stories
+- Sprint retrospective generation
+
+**Commands:**
+```bash
+orchestrate sprint create --name "Sprint 1" --capacity 20
+orchestrate sprint start
+orchestrate sprint status
+orchestrate sprint burndown
+orchestrate sprint add-story --story story-1.1
+orchestrate sprint rebalance
+orchestrate sprint retrospective
+orchestrate sprint complete
+```
+
+### UC-023: Multi-Perspective Code Review
+**Status:** 🔲 Not Implemented
+**Priority:** High
+**Effort:** Medium
+
+Extended review dimensions beyond the current five (correctness, security, performance, maintainability, testing).
+
+**New Review Perspectives:**
+1. **Architecture compliance** - Clean architecture, DDD patterns, layer separation
+2. **API contract validation** - OpenAPI/protobuf schema verification, breaking change detection
+3. **Accessibility (a11y)** - WCAG compliance for UI components, screen reader support
+4. **Cost/Token efficiency** - LLM token optimization in agent code, API call efficiency
+
+**Features:**
+- Configurable review dimensions per project
+- Severity weighting per dimension
+- Specialized reviewer agents per perspective
+- Aggregate verdict from all perspectives
+- Review perspective templates
+
+**Review Output:**
+```
+VERDICT: CHANGES_REQUESTED
+PERSPECTIVES:
+  - Architecture: APPROVED (no violations)
+  - API Contract: CHANGES_REQUESTED (breaking change in /api/users)
+  - Accessibility: APPROVED (all WCAG 2.1 AA criteria met)
+  - Token Efficiency: WARNING (3 redundant API calls detected)
+AGGREGATE_SCORE: 7/10
+```
+
+**Commands:**
+```bash
+orchestrate review --perspectives arch,api,a11y,cost
+orchestrate review configure --enable a11y --severity high
+orchestrate review report --detailed
+orchestrate review template create --name "frontend-review"
+```
+
+### UC-024: Automatic Issue Fixing (Autofix)
+**Status:** 🔲 Not Implemented
+**Priority:** Critical
+**Effort:** Large
+
+Extended autofix capabilities beyond CI failures to cover a wide range of issues.
+
+**Autofix Scenarios:**
+- Lint/format violations (auto-apply rustfmt, prettier, eslint --fix)
+- Type errors (suggest and apply type annotations)
+- Security vulnerabilities (upgrade vulnerable dependencies)
+- Test failures (debug, identify root cause, fix)
+- Review comments (parse feedback, implement suggestions)
+- Schema drift (generate database migrations)
+- Import sorting (auto-organize imports)
+- Dead code removal (remove unused functions/variables)
+
+**Features:**
+- Confidence scoring for fixes (0.0-1.0)
+- Dry-run mode with diff preview
+- Rollback capability for applied fixes
+- Human approval required for low-confidence fixes (<0.7)
+- Fix explanation generation
+- Batch fixing for multiple issues
+
+**Commands:**
+```bash
+orchestrate autofix --type lint
+orchestrate autofix --type security --dry-run
+orchestrate autofix --pr 123 --review-comments
+orchestrate autofix rollback --fix-id <id>
+orchestrate autofix batch --types lint,format,imports
+orchestrate autofix explain --fix-id <id>
+```
+
+### UC-025: Gap Analysis and Epic Generation
+**Status:** 🔲 Not Implemented
+**Priority:** High
+**Effort:** Large
+
+Automatically identify gaps in implementation and generate new epics to address them.
+
+**Gap Detection Sources:**
+- Code review findings (patterns not covered by tests)
+- Incomplete acceptance criteria (unmet requirements)
+- Missing documentation (undocumented APIs, features)
+- Technical debt accumulation (TODOs, FIXMEs, complexity)
+- Security audit findings (vulnerabilities, compliance gaps)
+- Performance regression patterns (slow queries, memory leaks)
+- Coverage gaps (untested code paths)
+
+**Epic Generation Modes:**
+- `--auto-create`: Automatically create epic files in docs/bmad/epics/
+- `--suggest`: Propose gaps for human approval (default)
+
+**Gap Analysis Output:**
+```yaml
+gaps:
+  - id: gap-001
+    type: test_coverage
+    description: "Auth module has 40% test coverage, below 80% threshold"
+    severity: high
+    suggested_epic:
+      title: "Improve Auth Module Test Coverage"
+      stories: 3
+      effort: medium
+  - id: gap-002
+    type: documentation
+    description: "REST API endpoints undocumented"
+    severity: medium
+```
+
+**Commands:**
+```bash
+orchestrate gaps analyze --scope project
+orchestrate gaps report --format markdown
+orchestrate gaps create-epic --gap-id <id>
+orchestrate gaps create-epic --all --auto-create
+orchestrate gaps dashboard
+```
+
+### UC-026: Completeness Review
+**Status:** 🔲 Not Implemented
+**Priority:** High
+**Effort:** Medium
+
+Validate implementation completeness before marking work as done.
+
+**Completeness Checklist:**
+- [ ] All acceptance criteria met (parsed from story file)
+- [ ] Tests cover all requirements (traceability matrix)
+- [ ] Documentation updated (README, API docs, inline comments)
+- [ ] No TODO/FIXME in committed code
+- [ ] No hardcoded secrets/credentials
+- [ ] Error handling complete (all error paths covered)
+- [ ] Logging/observability added (structured logs, metrics)
+- [ ] Performance benchmarks pass (if applicable)
+- [ ] Accessibility requirements met (for UI changes)
+- [ ] Breaking changes documented (for API changes)
+
+**Features:**
+- Pre-PR completeness gate (block PR if incomplete)
+- Automatic checklist generation from story
+- Verification automation where possible
+- Manual verification prompts where needed
+- Completeness score (percentage complete)
+
+**Commands:**
+```bash
+orchestrate completeness check --story story-1.1
+orchestrate completeness report --epic epic-016
+orchestrate completeness gate --strict  # Block PR if incomplete
+orchestrate completeness waive --item "performance" --reason "Not applicable"
+```
+
+### UC-027: Workflow Memory System
+**Status:** 🔲 Not Implemented
+**Priority:** High
+**Effort:** Large
+
+Persistent memory across workflow execution at multiple scopes.
+
+**Memory Tiers:**
+1. **Session Memory** - Within single workflow run
+   - Current decisions, context, intermediate results
+   - Lost on restart
+   - Fast access (in-memory HashMap)
+
+2. **Project Memory** - Persists in SQLite
+   - Learned patterns, instructions, preferences
+   - Project-specific conventions and decisions
+   - Historical context for similar tasks
+
+3. **Global Memory** - Cross-project sharing
+   - Universal patterns and best practices
+   - Shared instruction marketplace
+   - Domain expertise transfer between projects
+
+**Features:**
+- Memory scoping (session/project/global)
+- Semantic search and retrieval
+- Memory decay (relevance decreases over time)
+- Export/import for backup and sharing
+- Size limits with intelligent pruning
+- Memory tagging and categorization
+
+**Memory Entry Structure:**
+```yaml
+key: "auth-jwt-pattern"
+scope: project
+tags: ["authentication", "security", "jwt"]
+content: "Use RS256 algorithm with 1-hour expiry..."
+confidence: 0.95
+created_at: "2024-01-15T10:00:00Z"
+last_accessed: "2024-01-20T14:30:00Z"
+access_count: 12
+```
+
+**Commands:**
+```bash
+orchestrate memory store --key "auth-pattern" --scope project
+orchestrate memory recall --key "auth-pattern"
+orchestrate memory search "authentication"
+orchestrate memory export --scope project --output memory.json
+orchestrate memory import --from memory.json --scope global
+orchestrate memory prune --older-than 90d --scope project
+```
+
+### UC-028: Self-Management Capabilities
+**Status:** 🔲 Not Implemented
+**Priority:** Medium
+**Effort:** Large
+
+System manages its own operation without human intervention.
+
+**Self-Management Features:**
+- **Resource Management**: Auto-scale agents based on workload
+- **Health Monitoring**: Self-diagnosis and automatic recovery
+- **Configuration Tuning**: Auto-adjust thresholds based on performance
+- **Quota Management**: Stay within token/cost budgets automatically
+- **Queue Management**: Prioritize and reorder work dynamically
+- **Conflict Resolution**: Auto-resolve merge conflicts where possible
+
+**Self-Healing Scenarios:**
+| Condition | Detection | Recovery |
+|-----------|-----------|----------|
+| Stuck agent | No output for N turns | Auto-restart with fresh context |
+| API rate limit | 429 response | Automatic exponential backoff |
+| Database lock | Timeout on query | Connection pool refresh |
+| Memory pressure | Context >90% full | Summarize and fork context |
+| CI flakiness | Same test fails intermittently | Retry with exponential backoff |
+| Model overload | High latency | Fallback to alternative model |
+
+**Commands:**
+```bash
+orchestrate self health
+orchestrate self tune --optimize cost
+orchestrate self tune --optimize speed
+orchestrate self budget --monthly 100 --alert-at 80
+orchestrate self heal --agent-id <id>
+orchestrate self status --detailed
+```
+
+### UC-029: Fault-Tolerant Autonomous Operation
+**Status:** 🔲 Not Implemented
+**Priority:** Medium
+**Effort:** Large
+
+Enhanced resilience for truly autonomous, long-running operation.
+
+**Fault Tolerance Mechanisms:**
+1. **Checkpoint/Restore** - Periodic state saves, restore on failure
+2. **Graceful Degradation** - Continue with reduced capability when services unavailable
+3. **Circuit Breaker** - Stop retrying after threshold, prevent cascade failures
+4. **Bulkhead Isolation** - Failures in one area don't cascade to others
+5. **Timeout Management** - Configurable timeouts with sensible fallbacks
+6. **Idempotent Operations** - Safe to retry any operation multiple times
+
+**Monitoring Metrics:**
+- System health score (0-100)
+- Failure rate (failures per hour)
+- MTTR (Mean Time To Recovery)
+- Availability (uptime percentage)
+- Recovery success rate
+
+**Recovery Strategies:**
+- Automatic rollback on deployment failure
+- Agent pool recovery after crash
+- Database integrity checks on startup
+- Orphan resource cleanup (stale worktrees, processes)
+- Graceful shutdown with state persistence
+
+**Commands:**
+```bash
+orchestrate fault checkpoint --create
+orchestrate fault checkpoint --list
+orchestrate fault restore --checkpoint-id <id>
+orchestrate fault circuit-breaker --status
+orchestrate fault circuit-breaker --reset service-name
+orchestrate fault health --detailed
+orchestrate fault simulate --type network-partition
+```
+
 ---
 
 ## Epic Mapping
@@ -1091,6 +1437,15 @@ orchestrate chaos report --experiment <id>
 | Use Case | Epic | Status |
 |----------|------|--------|
 | UC-020: Autonomous Epic Processing | [Epic 016](bmad/epics/epic-016-autonomous-processing.md) | 🔲 Not Started |
+| UC-021: Positive Feedback Closed Loop | [Epic 017](bmad/epics/epic-017-positive-feedback-loop.md) | 🔲 Not Started |
+| UC-022: Sprint State Management | [Epic 018](bmad/epics/epic-018-sprint-states.md) | 🔲 Not Started |
+| UC-023: Multi-Perspective Code Review | [Epic 019](bmad/epics/epic-019-multi-perspective-review.md) | 🔲 Not Started |
+| UC-024: Automatic Issue Fixing | [Epic 020](bmad/epics/epic-020-autofix.md) | 🔲 Not Started |
+| UC-025: Gap Analysis & Epic Generation | [Epic 021](bmad/epics/epic-021-gap-analysis.md) | 🔲 Not Started |
+| UC-026: Completeness Review | [Epic 022](bmad/epics/epic-022-completeness-review.md) | 🔲 Not Started |
+| UC-027: Workflow Memory System | [Epic 023](bmad/epics/epic-023-workflow-memory.md) | 🔲 Not Started |
+| UC-028: Self-Management Capabilities | [Epic 024](bmad/epics/epic-024-self-management.md) | 🔲 Not Started |
+| UC-029: Fault-Tolerant Operation | [Epic 025](bmad/epics/epic-025-fault-tolerance.md) | 🔲 Not Started |
 | UC-101: GitHub Webhook Triggers | [Epic 002](bmad/epics/epic-002-webhook-triggers.md) | 🔲 Not Started |
 | UC-102: Scheduled Agent Execution | [Epic 003](bmad/epics/epic-003-scheduled-execution.md) | 🔲 Not Started |
 | UC-103, UC-104: Event Pipelines & Approvals | [Epic 004](bmad/epics/epic-004-event-pipelines.md) | 🔲 Not Started |
@@ -1112,28 +1467,37 @@ orchestrate chaos report --experiment <id>
 
 ### Immediate (Next 2 Sprints)
 1. **Epic 016**: Autonomous Epic Processing (UC-020)
-2. **Epic 002**: GitHub Webhook Triggers (UC-101)
-3. **Epic 005**: Test Generation Agent (UC-203)
-4. **Epic 007**: Monitoring & Alerting - Metrics + Audit (UC-301, UC-306)
+2. **Epic 020**: Automatic Issue Fixing (UC-024) - extends issue-fixer
+3. **Epic 022**: Completeness Review (UC-026) - quality gate
+4. **Epic 002**: GitHub Webhook Triggers (UC-101)
+5. **Epic 005**: Test Generation Agent (UC-203)
 
 ### Short-Term (1-2 Months)
-5. **Epic 003**: Scheduled Agent Execution (UC-102)
-6. **Epic 004**: Event-Driven Pipelines (UC-103, UC-104)
-7. **Epic 006**: Deployment Orchestrator (UC-205, UC-206)
-8. **Epic 008**: Slack Integration (UC-401)
-9. **Epic 014**: CI/CD Integration (UC-404)
+6. **Epic 017**: Positive Feedback Closed Loop (UC-021)
+7. **Epic 019**: Multi-Perspective Code Review (UC-023)
+8. **Epic 018**: Sprint State Management (UC-022)
+9. **Epic 007**: Monitoring & Alerting - Metrics + Audit (UC-301, UC-306)
+10. **Epic 003**: Scheduled Agent Execution (UC-102)
+11. **Epic 004**: Event-Driven Pipelines (UC-103, UC-104)
 
 ### Medium-Term (3-6 Months)
-10. **Epic 009**: Security Scanner Agent (UC-207)
-11. **Epic 010**: Closed-Loop Learning (UC-501, UC-505)
-12. **Epic 011**: Documentation Generator (UC-204)
-13. **Epic 012**: Requirements Capture Agent (UC-201)
+12. **Epic 021**: Gap Analysis & Epic Generation (UC-025)
+13. **Epic 023**: Workflow Memory System (UC-027)
+14. **Epic 024**: Self-Management Capabilities (UC-028)
+15. **Epic 006**: Deployment Orchestrator (UC-205, UC-206)
+16. **Epic 008**: Slack Integration (UC-401)
+17. **Epic 014**: CI/CD Integration (UC-404)
+18. **Epic 009**: Security Scanner Agent (UC-207)
+19. **Epic 010**: Closed-Loop Learning (UC-501, UC-505)
 
 ### Long-Term (6+ Months)
-14. **Epic 013**: Multi-Repository Orchestration (UC-506)
-15. **Epic 015**: Autonomous Incident Response (UC-504)
-16. UC-502: Predictive Scaling (future epic)
-17. UC-507, UC-508: NL Commands & Chaos Engineering (future epics)
+20. **Epic 025**: Fault-Tolerant Operation (UC-029)
+21. **Epic 011**: Documentation Generator (UC-204)
+22. **Epic 012**: Requirements Capture Agent (UC-201)
+23. **Epic 013**: Multi-Repository Orchestration (UC-506)
+24. **Epic 015**: Autonomous Incident Response (UC-504)
+25. UC-502: Predictive Scaling (future epic)
+26. UC-507, UC-508: NL Commands & Chaos Engineering (future epics)
 
 ---
 
