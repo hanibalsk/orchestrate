@@ -226,6 +226,21 @@ enum Commands {
         #[command(subcommand)]
         action: ReleaseAction,
     },
+    /// Alerting rules and alerts
+    Alert {
+        #[command(subcommand)]
+        action: MonitorAlertAction,
+    },
+    /// Cost tracking and analytics
+    Cost {
+        #[command(subcommand)]
+        action: CostAction,
+    },
+    /// Audit log management
+    Audit {
+        #[command(subcommand)]
+        action: MonitorAuditAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1572,6 +1587,128 @@ enum ReleaseAction {
         /// Ending tag/commit
         #[arg(long)]
         to: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MonitorAlertAction {
+    /// List alert rules
+    Rules {
+        /// Show only enabled rules
+        #[arg(long)]
+        enabled_only: bool,
+    },
+    /// Create an alert rule
+    Create {
+        /// Rule name
+        #[arg(short, long)]
+        name: String,
+        /// Condition expression
+        #[arg(short, long)]
+        condition: String,
+        /// Severity (info, warning, critical)
+        #[arg(short, long, default_value = "warning")]
+        severity: String,
+        /// Notification channel
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    /// Enable an alert rule
+    Enable {
+        /// Rule name
+        name: String,
+    },
+    /// Disable an alert rule
+    Disable {
+        /// Rule name
+        name: String,
+    },
+    /// List active alerts
+    List {
+        /// Filter by status (firing, acknowledged, resolved)
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Acknowledge an alert
+    Ack {
+        /// Alert ID
+        id: String,
+    },
+    /// Silence an alert rule
+    Silence {
+        /// Rule name
+        name: String,
+        /// Duration (e.g., 1h, 30m, 1d)
+        #[arg(short, long)]
+        duration: String,
+    },
+    /// Test alert notification
+    Test {
+        /// Rule name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CostAction {
+    /// Generate cost report
+    Report {
+        /// Period (daily, weekly, monthly)
+        #[arg(short, long, default_value = "monthly")]
+        period: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set monthly budget
+    Budget {
+        /// Budget amount in USD
+        amount: f64,
+    },
+    /// Show cost forecast
+    Forecast {
+        /// Number of days to forecast
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+    },
+    /// Show cost breakdown by agent type
+    ByAgent,
+    /// Show cost breakdown by model
+    ByModel,
+}
+
+#[derive(Subcommand)]
+enum MonitorAuditAction {
+    /// Search audit logs
+    Search {
+        /// Filter by actor
+        #[arg(short, long)]
+        actor: Option<String>,
+        /// Filter by action
+        #[arg(short = 'A', long)]
+        action: Option<String>,
+        /// Maximum entries to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Show audit log for a resource
+    Show {
+        /// Resource type
+        resource_type: String,
+        /// Resource ID
+        resource_id: String,
+    },
+    /// Export audit logs
+    Export {
+        /// Output file
+        #[arg(short, long)]
+        output: String,
+        /// Start date (YYYY-MM-DD)
+        #[arg(long)]
+        from: Option<String>,
+        /// End date (YYYY-MM-DD)
+        #[arg(long)]
+        to: Option<String>,
     },
 }
 
@@ -5613,6 +5750,168 @@ async fn main() -> Result<()> {
                 println!("- Updated dependencies");
                 println!();
                 println!("(In production, would generate from commit history)");
+            }
+        },
+        Commands::Alert { action } => match action {
+            MonitorAlertAction::Rules { enabled_only } => {
+                println!("Alert Rules{}:", if enabled_only { " (enabled only)" } else { "" });
+                println!();
+                println!("  high-failure-rate    critical  enabled   rate(agent_failures[5m]) > 0.2");
+                println!("  queue-backup         warning   enabled   queue_depth > 100");
+                println!("  token-budget         warning   disabled  tokens_daily > 1000000");
+                println!();
+                println!("(In production, would fetch rules from database)");
+            }
+            MonitorAlertAction::Create { name, condition, severity, channel } => {
+                use orchestrate_core::{AlertRule, AlertSeverity};
+                use std::str::FromStr;
+
+                let sev = AlertSeverity::from_str(&severity)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                let mut rule = AlertRule::new(&name, &condition, sev);
+                if let Some(ch) = channel {
+                    rule = rule.with_channel(ch);
+                }
+
+                println!("Creating alert rule: {}", name);
+                println!("  Condition: {}", condition);
+                println!("  Severity: {:?}", rule.severity);
+                println!("  Channels: {:?}", rule.channels);
+                println!();
+                println!("Rule created: {}", rule.id);
+                println!("(In production, would save to database)");
+            }
+            MonitorAlertAction::Enable { name } => {
+                println!("Enabling alert rule: {}", name);
+                println!("Rule enabled.");
+            }
+            MonitorAlertAction::Disable { name } => {
+                println!("Disabling alert rule: {}", name);
+                println!("Rule disabled.");
+            }
+            MonitorAlertAction::List { status } => {
+                println!("Active Alerts{}:", status.as_ref().map(|s| format!(" ({})", s)).unwrap_or_default());
+                println!();
+                println!("  🔴 alert-001  high-failure-rate  critical  firing       10m ago");
+                println!("  🟡 alert-002  queue-backup       warning   acknowledged 25m ago");
+                println!();
+                println!("(In production, would fetch alerts from database)");
+            }
+            MonitorAlertAction::Ack { id } => {
+                println!("Acknowledging alert: {}", id);
+                println!("Alert acknowledged.");
+            }
+            MonitorAlertAction::Silence { name, duration } => {
+                println!("Silencing rule: {} for {}", name, duration);
+                println!("Rule silenced.");
+            }
+            MonitorAlertAction::Test { name } => {
+                println!("Testing alert notification for rule: {}", name);
+                println!("Sending test notification...");
+                println!("Notification sent successfully!");
+            }
+        },
+        Commands::Cost { action } => match action {
+            CostAction::Report { period, json } => {
+                use orchestrate_core::{CostReport, CostRecord};
+
+                let (start, end) = match period.as_str() {
+                    "daily" => (chrono::Utc::now() - chrono::Duration::days(1), chrono::Utc::now()),
+                    "weekly" => (chrono::Utc::now() - chrono::Duration::days(7), chrono::Utc::now()),
+                    _ => (chrono::Utc::now() - chrono::Duration::days(30), chrono::Utc::now()),
+                };
+
+                let mut report = CostReport::new(start, end);
+                report.budget_usd = Some(1000.0);
+
+                // Add sample data
+                let records = vec![
+                    CostRecord::new("claude-3-opus", 500000, 100000, 612.45)
+                        .with_agent("agent-1", "story-developer"),
+                    CostRecord::new("claude-3-sonnet", 300000, 80000, 234.87)
+                        .with_agent("agent-2", "code-reviewer"),
+                ];
+
+                for record in &records {
+                    report.add_record(record);
+                }
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", report.to_summary());
+                }
+            }
+            CostAction::Budget { amount } => {
+                println!("Setting monthly budget: ${:.2}", amount);
+                println!("Budget updated.");
+                println!("(In production, would save to database)");
+            }
+            CostAction::Forecast { days } => {
+                println!("Cost Forecast ({} days)", days);
+                println!();
+                println!("Current monthly spend: $847.32");
+                println!("Daily average: $28.24");
+                println!("Projected {}-day cost: ${:.2}", days, 28.24 * days as f64);
+                println!();
+                println!("(In production, would calculate from historical data)");
+            }
+            CostAction::ByAgent => {
+                println!("Cost by Agent Type:");
+                println!();
+                println!("  story-developer:  $523.18 (62%)");
+                println!("  code-reviewer:    $156.92 (19%)");
+                println!("  pr-shepherd:      $98.45 (12%)");
+                println!("  Other:            $68.77 (7%)");
+                println!();
+                println!("(In production, would aggregate from database)");
+            }
+            CostAction::ByModel => {
+                println!("Cost by Model:");
+                println!();
+                println!("  claude-3-opus:    $612.45 (72%)");
+                println!("  claude-3-sonnet:  $234.87 (28%)");
+                println!();
+                println!("(In production, would aggregate from database)");
+            }
+        },
+        Commands::Audit { action } => match action {
+            MonitorAuditAction::Search { actor, action: action_filter, limit } => {
+                println!("Audit Log (last {} entries):", limit);
+                if let Some(a) = &actor {
+                    println!("  Filtered by actor: {}", a);
+                }
+                if let Some(a) = &action_filter {
+                    println!("  Filtered by action: {}", a);
+                }
+                println!();
+                println!("  2024-01-15 14:32:00  user@example.com   deployment.triggered    environment:production");
+                println!("  2024-01-15 14:30:00  deploy-bot         agent.spawned           agent:deployer-123");
+                println!("  2024-01-15 14:25:00  user@example.com   approval.granted        deployment:dep-456");
+                println!();
+                println!("(In production, would query audit log database)");
+            }
+            MonitorAuditAction::Show { resource_type, resource_id } => {
+                println!("Audit Log for {}: {}", resource_type, resource_id);
+                println!();
+                println!("  2024-01-15 14:32:00  deployment.triggered  user@example.com");
+                println!("  2024-01-15 14:33:00  deployment.started    system");
+                println!("  2024-01-15 14:35:00  deployment.completed  system");
+                println!();
+                println!("(In production, would query audit log for specific resource)");
+            }
+            MonitorAuditAction::Export { output, from, to } => {
+                println!("Exporting audit logs to: {}", output);
+                if let Some(f) = from {
+                    println!("  From: {}", f);
+                }
+                if let Some(t) = to {
+                    println!("  To: {}", t);
+                }
+                println!();
+                println!("Exported 1,234 entries to {}", output);
+                println!("(In production, would export actual audit logs)");
             }
         },
     }

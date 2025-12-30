@@ -27,6 +27,7 @@ pub mod ci_integration;
 pub mod incident;
 pub mod test_generation;
 pub mod deployment;
+pub mod monitoring;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -206,4 +207,12 @@ pub use deployment::{
     DeploymentStatus, DeploymentStrategy, Environment, EnvironmentType, FeatureFlag,
     PostDeploymentVerification, PreDeploymentValidation, Release, ReleaseAsset,
     ReleaseType, ValidationCheck, ValidationCheckType, VerificationCheck, VerificationCheckType,
+};
+
+// Re-export monitoring types
+pub use monitoring::{
+    ActorType, AgentPerformance, Alert, AlertRule, AlertSeverity, AlertStatus, AuditAction,
+    AuditEntry, ComponentHealth, ConditionType, CostRecord, CostReport, DailyCost, HealthStatus,
+    HistogramBucket, HistogramValue, MetricDefinition, MetricType, MetricValue, MetricsSummary,
+    NotificationChannel, NotificationChannelType, SystemHealth,
 };
