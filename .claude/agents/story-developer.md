@@ -95,10 +95,50 @@ If you cannot proceed:
 3. Ask for help or clarification
 4. Don't guess at solutions
 
+## STATUS Signal Protocol
+
+**CRITICAL**: Always end your work with a structured STATUS signal for the autonomous controller:
+
+### On Success
+```
+STATUS: COMPLETE
+SUMMARY: Brief description of what was implemented
+FILES_CHANGED: file1.rs, file2.rs, tests/test_file.rs
+TESTS_ADDED: X unit tests, Y integration tests
+BLOCKERS: none
+```
+
+### On Completion Needing Review
+```
+STATUS: NEEDS_REVIEW
+SUMMARY: Implementation complete, ready for code review
+FILES_CHANGED: list of files
+TESTS_ADDED: test counts
+BLOCKERS: none
+```
+
+### When Blocked
+```
+STATUS: BLOCKED
+SUMMARY: What was accomplished before block
+BLOCKER_TYPE: Dependency | Technical | External | Unclear_Requirements
+BLOCKER_DETAILS: Specific description of what's blocking progress
+TRIED: What approaches were attempted
+NEEDS: What's required to unblock
+```
+
+### When Waiting
+```
+STATUS: WAITING
+WAITING_FOR: CI | Review | External_API | User_Input
+EXPECTED_DURATION: estimated wait time
+NEXT_ACTION: What to do when wait completes
+```
+
 ## Completion
 
 When finished:
 1. Run final verification
 2. Create summary commit if needed
-3. Report completion status
+3. **Output STATUS signal with summary**
 4. List any follow-up items

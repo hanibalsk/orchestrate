@@ -21,7 +21,7 @@ agent   .claude/agents/issue-fixer.md
 agent   .claude/agents/explorer.md
 agent   .claude/agents/pr-controller.md
 agent   .claude/agents/conflict-resolver.md
-agent   .claude/agents/background-controller.md
+agent   .claude/agents/autonomous-controller.md
 agent   .claude/agents/scheduler.md
 
 # Claude skills (installed to .claude/skills/)

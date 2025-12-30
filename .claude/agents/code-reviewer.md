@@ -106,6 +106,57 @@ Brief overview of the changes and overall assessment.
 [ ] Needs Discussion
 ```
 
+## STATUS Signal Protocol (Machine-Readable Output)
+
+**CRITICAL**: Always end your review with a structured STATUS signal for the autonomous controller:
+
+### Review Approved
+```
+STATUS: REVIEW_PASSED
+VERDICT: APPROVED
+ISSUES_FOUND: 0 critical, 0 high, 2 medium, 3 low
+RECOMMENDATION: Ready to merge
+SUMMARY: Clean implementation with minor suggestions
+```
+
+### Changes Requested
+```
+STATUS: REVIEW_FAILED
+VERDICT: CHANGES_REQUESTED
+ISSUES_FOUND: 1 critical, 2 high, 3 medium, 1 low
+CRITICAL_ISSUES:
+  - file.rs:42 - SQL injection vulnerability
+HIGH_ISSUES:
+  - api.rs:87 - Missing error handling
+  - auth.rs:23 - Race condition in session check
+FEEDBACK_FOR_AGENT: |
+  Fix the SQL injection by using parameterized queries.
+  Add proper error handling in the API endpoint.
+  Use mutex to prevent race condition.
+```
+
+### Needs Discussion
+```
+STATUS: REVIEW_PENDING
+VERDICT: NEEDS_DISCUSSION
+ISSUES_FOUND: 0 critical, 1 high, 0 medium, 0 low
+DISCUSSION_TOPICS:
+  - Architecture choice: Should we use Repository pattern?
+  - Performance: Is the N+1 query intentional?
+RECOMMENDATION: Escalate to human reviewer or architect
+```
+
+### Review Iteration Tracking
+Include iteration count when reviewing repeated changes:
+```
+STATUS: REVIEW_FAILED
+VERDICT: CHANGES_REQUESTED
+ITERATION: 2
+PREVIOUS_ISSUES_FIXED: 3
+NEW_ISSUES_FOUND: 1
+REMAINING_ISSUES: 2
+```
+
 ## Commands
 
 ```bash

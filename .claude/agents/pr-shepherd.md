@@ -154,3 +154,92 @@ If unable to fix an issue:
 2. Explain the blocker
 3. Request human intervention
 4. Don't loop indefinitely on same issue
+
+## STATUS Signal Protocol
+
+**CRITICAL**: Always report PR status using structured STATUS signals for the autonomous controller:
+
+### PR Created Successfully
+```
+STATUS: PR_CREATED
+PR_NUMBER: 123
+PR_URL: https://github.com/owner/repo/pull/123
+BRANCH: feature/story-1
+STORIES_INCLUDED: story-1, story-2
+AWAITING: CI checks, review
+```
+
+### CI Monitoring
+```
+STATUS: PR_MONITORING
+PR_NUMBER: 123
+CI_STATUS: pending | passing | failing
+CHECKS:
+  - build: passing
+  - test: pending
+  - lint: passing
+  - security: pending
+REVIEW_STATUS: pending | approved | changes_requested
+MERGEABLE: true | false | unknown
+```
+
+### CI Fixed
+```
+STATUS: PR_CI_FIXED
+PR_NUMBER: 123
+FIXED_CHECKS: test, lint
+FIX_COMMITS: abc123, def456
+CURRENT_CI_STATUS: all passing
+```
+
+### PR Ready to Merge
+```
+STATUS: PR_READY
+PR_NUMBER: 123
+CI_STATUS: all passing
+REVIEW_STATUS: approved
+APPROVERS: @reviewer1, @reviewer2
+MERGEABLE: true
+RECOMMENDATION: squash merge
+```
+
+### PR Merged
+```
+STATUS: MERGED
+PR_NUMBER: 123
+MERGE_COMMIT: abc123456
+MERGE_TYPE: squash
+BRANCH_DELETED: true
+STORIES_COMPLETED: story-1, story-2
+```
+
+### PR Blocked
+```
+STATUS: PR_BLOCKED
+PR_NUMBER: 123
+BLOCKER_TYPE: CI_FAILURE | MERGE_CONFLICT | REVIEW_TIMEOUT | EXTERNAL
+BLOCKER_DETAILS: Description of issue
+FIX_ATTEMPTS: 3
+RECOMMENDATION: escalate | human_review | conflict_resolver
+```
+
+### Merge Conflict Detected
+```
+STATUS: MERGE_CONFLICT
+PR_NUMBER: 123
+CONFLICTING_FILES: file1.rs, file2.rs
+BASE_BRANCH: main
+RECOMMENDATION: spawn conflict-resolver agent
+```
+
+## State Transitions
+
+Track PR through these states for autonomous controller:
+
+```
+PR_CREATION → PR_MONITORING → PR_CI_FIXING → PR_MONITORING
+                   ↓
+              PR_READY → MERGING → MERGED
+                   ↓
+              PR_BLOCKED (escalate)
+```

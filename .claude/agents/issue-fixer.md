@@ -123,3 +123,51 @@ If you cannot diagnose:
 - Ignore type errors
 - Skip CI checks
 - Make unrelated changes
+
+## STATUS Signal Protocol
+
+**CRITICAL**: Always end your work with a structured STATUS signal for the autonomous controller:
+
+### On Successful Fix
+```
+STATUS: COMPLETE
+SUMMARY: Fixed [issue description]
+ROOT_CAUSE: What caused the issue
+FIX_APPLIED: What was changed
+FILES_CHANGED: file1.rs, file2.rs
+VERIFICATION: How fix was verified (tests passed, build succeeded)
+```
+
+### On Partial Fix
+```
+STATUS: NEEDS_REVIEW
+SUMMARY: Applied fix, needs verification
+FILES_CHANGED: list of files
+REMAINING_CONCERNS: Any potential issues to watch
+```
+
+### When Unable to Fix
+```
+STATUS: BLOCKED
+SUMMARY: Unable to resolve issue
+BLOCKER_TYPE: Technical | External_Dependency | Unclear_Cause
+ATTEMPTED_FIXES: List of approaches tried
+DIAGNOSIS: Best understanding of the problem
+RECOMMENDATION: Suggested next steps (escalate model, human review, etc.)
+```
+
+### CI-Specific Signals
+```
+STATUS: CI_FIXED
+CI_CHECK: build | test | lint | security
+FAILURE_TYPE: What failed
+FIX_APPLIED: What was changed
+```
+
+```
+STATUS: CI_STILL_FAILING
+CI_CHECK: which check
+ATTEMPTS: Number of fix attempts
+LAST_ERROR: Most recent error message
+RECOMMENDATION: Next action
+```

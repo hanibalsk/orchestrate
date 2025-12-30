@@ -86,3 +86,57 @@ After resolving:
 - **Binary conflicts** - Accept one side, flag for review
 - **Deleted vs modified** - Check if deletion intentional
 - **Large conflicts** - Break into smaller commits if needed
+
+## STATUS Signal Protocol
+
+**CRITICAL**: Always end your work with a structured STATUS signal for the autonomous controller:
+
+### Conflicts Resolved Successfully
+```
+STATUS: COMPLETE
+SUMMARY: Resolved merge conflicts in X files
+CONFLICTING_FILES: file1.rs, file2.rs
+RESOLUTION_STRATEGY: |
+  - file1.rs: Combined changes from both branches
+  - file2.rs: Accepted theirs (lock file regeneration)
+VERIFICATION:
+  build: passing
+  tests: passing
+  lint: passing
+COMMIT: abc123
+```
+
+### Partial Resolution
+```
+STATUS: NEEDS_REVIEW
+SUMMARY: Resolved N of M conflicts, human review needed
+RESOLVED_FILES: file1.rs, file2.rs
+UNRESOLVED_FILES: file3.rs
+REASON: |
+  file3.rs has semantic conflict - both branches modified
+  the same function with different business logic.
+  Need human decision on correct behavior.
+RECOMMENDATION: Review file3.rs conflict manually
+```
+
+### Unable to Resolve
+```
+STATUS: BLOCKED
+SUMMARY: Cannot automatically resolve conflicts
+BLOCKER_TYPE: Complex_Merge | Binary_File | Schema_Conflict
+CONFLICTING_FILES: list of files
+ANALYSIS: |
+  Description of the conflict complexity
+ATTEMPTED: What approaches were tried
+RECOMMENDATION: Human review required
+```
+
+### Merge Completed
+```
+STATUS: CONFLICT_RESOLVED
+PR_NUMBER: 123
+FILES_RESOLVED: 5
+RESOLUTION_COMMIT: abc123
+CI_STATUS: triggering
+READY_FOR: PR_MONITORING
+```

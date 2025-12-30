@@ -1,6 +1,6 @@
 # Epic 016: Autonomous Epic Processing
 
-Implement fully autonomous workflow where the background-controller orchestrates the complete development lifecycle from epic discovery through PR merge.
+Implement fully autonomous workflow where the autonomous-controller orchestrates the complete development lifecycle from epic discovery through PR merge.
 
 **Priority:** Critical
 **Effort:** Large

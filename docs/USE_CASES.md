@@ -120,7 +120,7 @@ Tracks and aggregates token usage with daily reports and cost analytics.
 **Priority:** Critical
 **Effort:** Large
 
-Fully autonomous workflow where the background-controller orchestrates the complete development lifecycle from epic discovery through PR merge, without human intervention after the initial command.
+Fully autonomous workflow where the autonomous-controller orchestrates the complete development lifecycle from epic discovery through PR merge, without human intervention after the initial command.
 
 **Full Development Cycle:**
 1. User issues command: "Work on existing epics"

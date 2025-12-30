@@ -245,7 +245,7 @@ Incident management:
 
 ```
 .claude/agents/
-├── background-controller.md   # Main orchestration daemon
+├── autonomous-controller.md   # Autonomous epic processing controller
 ├── bmad-orchestrator.md       # BMAD workflow orchestration
 ├── bmad-planner.md            # BMAD epic/story planning
 ├── code-reviewer.md           # Code review agent

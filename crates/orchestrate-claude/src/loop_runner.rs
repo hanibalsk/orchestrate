@@ -745,7 +745,7 @@ If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <re
             AgentType::PrShepherd => "pr-shepherd.md",
             AgentType::PrController => "pr-controller.md",
             AgentType::ConflictResolver => "conflict-resolver.md",
-            AgentType::BackgroundController => "background-controller.md",
+            AgentType::BackgroundController => "autonomous-controller.md",
             AgentType::Scheduler => "scheduler.md",
             AgentType::RegressionTester => "regression-tester.md",
             AgentType::IssueTriager => "issue-triager.md",
