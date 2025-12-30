@@ -3,7 +3,13 @@ import { Navbar } from './components/layout/Navbar';
 import { Dashboard } from './pages/Dashboard';
 import { AgentList } from './pages/AgentList';
 import { AgentDetail } from './pages/AgentDetail';
-import { Tests } from './pages/Tests';
+import { PipelineList } from './pages/PipelineList';
+import { PipelineDetail } from './pages/PipelineDetail';
+import { PipelineRunDetail } from './pages/PipelineRunDetail';
+import { PipelineNew } from './pages/PipelineNew';
+import { ScheduleList } from './pages/ScheduleList';
+import { Deployments } from './pages/Deployments';
+import { Releases } from './pages/Releases';
 
 function App() {
   return (
@@ -15,7 +21,13 @@ function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/agents" element={<AgentList />} />
             <Route path="/agents/:id" element={<AgentDetail />} />
-            <Route path="/tests" element={<Tests />} />
+            <Route path="/pipelines" element={<PipelineList />} />
+            <Route path="/pipelines/new" element={<PipelineNew />} />
+            <Route path="/pipelines/:name" element={<PipelineDetail />} />
+            <Route path="/pipelines/:name/runs/:runId" element={<PipelineRunDetail />} />
+            <Route path="/schedules" element={<ScheduleList />} />
+            <Route path="/deployments" element={<Deployments />} />
+            <Route path="/releases" element={<Releases />} />
           </Routes>
         </main>
       </div>

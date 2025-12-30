@@ -20,11 +20,10 @@ const badgeVariants = cva(
         destructive:
           'border-transparent bg-destructive text-destructive-foreground shadow',
         success:
-          'border-transparent bg-green-600 text-white shadow',
+          'border-transparent bg-success text-white shadow',
         warning:
           'border-transparent bg-yellow-600 text-white shadow',
         outline: 'text-foreground',
-        success: 'border-transparent bg-success text-white',
         // Agent states
         created: 'border-transparent bg-gray-500 text-white',
         initializing: 'border-transparent bg-cyan-600 text-white',
@@ -120,6 +119,42 @@ export function PipelineStageStatusBadge({ status }: { status: PipelineStageStat
   };
 
   return <Badge variant={variantMap[status]}>{status}</Badge>;
+}
+
+// Helper component for deployment status badges
+export function DeploymentStatusBadge({ status }: { status: string }) {
+  const getVariant = (status: string): 'default' | 'success' | 'warning' | 'destructive' | 'secondary' => {
+    switch (status.toLowerCase()) {
+      case 'completed':
+        return 'success';
+      case 'failed':
+        return 'destructive';
+      case 'inprogress':
+      case 'in_progress':
+        return 'default';
+      case 'rolledback':
+      case 'rolled_back':
+        return 'warning';
+      case 'pending':
+      default:
+        return 'secondary';
+    }
+  };
+
+  const getLabel = (status: string): string => {
+    switch (status.toLowerCase()) {
+      case 'inprogress':
+      case 'in_progress':
+        return 'In Progress';
+      case 'rolledback':
+      case 'rolled_back':
+        return 'Rolled Back';
+      default:
+        return status;
+    }
+  };
+
+  return <Badge variant={getVariant(status)}>{getLabel(status)}</Badge>;
 }
 
 export { Badge, badgeVariants };

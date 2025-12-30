@@ -124,10 +124,10 @@ export function ScheduleTable({
               <td className="py-3 px-4">
                 <div className="flex flex-col">
                   <span className="text-sm font-medium">
-                    {getTimeUntil(schedule.next_run)}
+                    {getTimeUntil(schedule.next_run_at)}
                   </span>
                   <span className="text-xs text-muted-foreground">
-                    {formatDateTime(schedule.next_run)}
+                    {formatDateTime(schedule.next_run_at)}
                   </span>
                 </div>
               </td>

@@ -72,3 +72,32 @@ export function formatDateTime(dateString: string | null): string {
     timeStyle: 'short',
   }).format(date);
 }
+
+/**
+ * Format a date as relative time (e.g., "2 hours ago")
+ * @param dateString ISO 8601 date string
+ * @returns Formatted relative time string
+ */
+export function formatDistanceToNow(dateString: string): string {
+  const now = new Date();
+  const date = new Date(dateString);
+  const diff = now.getTime() - date.getTime();
+  const absDiff = Math.abs(diff);
+
+  const seconds = Math.floor(absDiff / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  const suffix = diff > 0 ? 'ago' : 'from now';
+
+  if (days > 0) {
+    return `${days} day${days > 1 ? 's' : ''} ${suffix}`;
+  } else if (hours > 0) {
+    return `${hours} hour${hours > 1 ? 's' : ''} ${suffix}`;
+  } else if (minutes > 0) {
+    return `${minutes} minute${minutes > 1 ? 's' : ''} ${suffix}`;
+  } else {
+    return `${seconds} second${seconds !== 1 ? 's' : ''} ${suffix}`;
+  }
+}

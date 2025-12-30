@@ -5,11 +5,16 @@ use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
+use crate::environment::{CreateEnvironment, Environment, EnvironmentType};
+use crate::feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
 use crate::instruction::{
     CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
-    LearningPattern, PatternStatus, PatternType,
+    LearningPattern, PatternStatus, PatternType, SuccessPattern, SuccessPatternType,
 };
 use crate::network::{AgentId, StepOutput, StepOutputType};
+use crate::schedule::{Schedule, ScheduleRun, ScheduleRunStatus};
+use crate::secrets::{get_encryption_key, SecretsManager};
 use crate::webhook::{WebhookEvent, WebhookEventStatus};
 use crate::{
     Agent, AgentState, AgentType, Epic, EpicStatus, MergeStrategy, Message, MessageRole, PrStatus,
@@ -120,25 +125,61 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/006_webhook_events.sql"))
             .execute(&self.pool)
             .await?;
-        // Test coverage migration
-        sqlx::query(include_str!("../../../migrations/007_test_coverage.sql"))
+        // Schedules migration
+        sqlx::query(include_str!("../../../migrations/007_schedules.sql"))
             .execute(&self.pool)
             .await?;
-        // Test quality migration
-        sqlx::query(include_str!("../../../migrations/008_test_quality.sql"))
+        // Pipelines migration
+        sqlx::query(include_str!("../../../migrations/008_pipelines.sql"))
             .execute(&self.pool)
             .await?;
+        sqlx::query(include_str!("../../../migrations/009_approvals.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Rollback events migration
+        sqlx::query(include_str!("../../../migrations/010_rollback_events.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Success patterns migration
+        sqlx::query(include_str!("../../../migrations/011_success_patterns.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Feedback migration
+        sqlx::query(include_str!("../../../migrations/012_feedback.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Environments migration
+        sqlx::query(include_str!("../../../migrations/013_environments.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Deployments migration
+        sqlx::query(include_str!("../../../migrations/014_deployments.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Deployment verification migration
+        sqlx::query(include_str!(
+            "../../../migrations/015_deployment_verification.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
+        // Deployment rollback migration
+        sqlx::query(include_str!(
+            "../../../migrations/016_deployment_rollbacks.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
+        // Feature flags migration
+        sqlx::query(include_str!(
+            "../../../migrations/017_feature_flags.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     /// Begin a transaction
     pub async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
         Ok(self.pool.begin().await?)
-    }
-
-    /// Get reference to the connection pool (internal use only)
-    pub(crate) fn pool(&self) -> &SqlitePool {
-        &self.pool
     }
 
     // ==================== Agent Operations ====================
@@ -1523,6 +1564,1681 @@ impl Database {
         Ok(())
     }
 
+    // ==================== Success Pattern Operations ====================
+
+    /// Upsert a success pattern (insert or update occurrence count and averages)
+    #[tracing::instrument(skip(self, pattern), level = "debug")]
+    pub async fn upsert_success_pattern(&self, pattern: &SuccessPattern) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let pattern_type_str = pattern.pattern_type.as_str();
+        let agent_type_str = pattern.agent_type.as_ref().map(|a| a.as_str());
+        let pattern_data_str = pattern.pattern_data.to_string();
+
+        // Try to find existing pattern by signature
+        let existing: Option<SuccessPatternRow> = sqlx::query_as(
+            "SELECT * FROM success_patterns WHERE pattern_signature = ?",
+        )
+        .bind(&pattern.pattern_signature)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(existing) = existing {
+            // Update with weighted averages
+            let new_count = existing.occurrence_count + 1;
+
+            // Calculate weighted average for completion time
+            let new_avg_time = match (existing.avg_completion_time_ms, pattern.avg_completion_time_ms)
+            {
+                (Some(old), Some(new)) => {
+                    Some((old * existing.occurrence_count + new) / new_count)
+                }
+                (Some(old), None) => Some(old),
+                (None, Some(new)) => Some(new),
+                (None, None) => None,
+            };
+
+            // Calculate weighted average for token usage
+            let new_avg_tokens = match (existing.avg_token_usage, pattern.avg_token_usage) {
+                (Some(old), Some(new)) => {
+                    Some((old * existing.occurrence_count + new) / new_count)
+                }
+                (Some(old), None) => Some(old),
+                (None, Some(new)) => Some(new),
+                (None, None) => None,
+            };
+
+            sqlx::query(
+                r#"
+                UPDATE success_patterns
+                SET occurrence_count = ?,
+                    avg_completion_time_ms = ?,
+                    avg_token_usage = ?,
+                    last_seen_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(new_count)
+            .bind(new_avg_time)
+            .bind(new_avg_tokens)
+            .bind(&now)
+            .bind(existing.id)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(existing.id)
+        } else {
+            // Insert new pattern
+            let result = sqlx::query(
+                r#"
+                INSERT INTO success_patterns (
+                    pattern_type, agent_type, task_type, pattern_signature,
+                    pattern_data, occurrence_count, avg_completion_time_ms,
+                    avg_token_usage, success_rate, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(pattern_type_str)
+            .bind(agent_type_str)
+            .bind(&pattern.task_type)
+            .bind(&pattern.pattern_signature)
+            .bind(&pattern_data_str)
+            .bind(pattern.occurrence_count)
+            .bind(pattern.avg_completion_time_ms)
+            .bind(pattern.avg_token_usage)
+            .bind(pattern.success_rate)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    /// Get a success pattern by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_success_pattern(&self, id: i64) -> Result<Option<SuccessPattern>> {
+        let row: Option<SuccessPatternRow> =
+            sqlx::query_as("SELECT * FROM success_patterns WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List success patterns with optional type filter
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_success_patterns(
+        &self,
+        pattern_type: Option<SuccessPatternType>,
+        limit: i64,
+    ) -> Result<Vec<SuccessPattern>> {
+        let rows: Vec<SuccessPatternRow> = match pattern_type {
+            Some(pt) => {
+                sqlx::query_as(
+                    "SELECT * FROM success_patterns WHERE pattern_type = ? ORDER BY occurrence_count DESC LIMIT ?",
+                )
+                .bind(pt.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT * FROM success_patterns ORDER BY occurrence_count DESC LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get success patterns for a specific agent type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_success_patterns_for_agent(
+        &self,
+        agent_type: AgentType,
+        limit: i64,
+    ) -> Result<Vec<SuccessPattern>> {
+        let rows: Vec<SuccessPatternRow> = sqlx::query_as(
+            r#"
+            SELECT * FROM success_patterns
+            WHERE agent_type = ? OR agent_type IS NULL
+            ORDER BY occurrence_count DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(agent_type.as_str())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get success patterns by task type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_success_patterns_by_task(
+        &self,
+        task_type: &str,
+        limit: i64,
+    ) -> Result<Vec<SuccessPattern>> {
+        let rows: Vec<SuccessPatternRow> = sqlx::query_as(
+            r#"
+            SELECT * FROM success_patterns
+            WHERE task_type = ? OR task_type IS NULL
+            ORDER BY occurrence_count DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(task_type)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Cleanup old success patterns that haven't been seen recently
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn cleanup_old_success_patterns(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let result = sqlx::query(
+            "DELETE FROM success_patterns WHERE last_seen_at < ? AND occurrence_count < 5",
+        )
+        .bind(&cutoff_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    // ==================== Feedback Operations ====================
+
+    /// Insert a new feedback record
+    #[tracing::instrument(skip(self, feedback), level = "debug")]
+    pub async fn insert_feedback(&self, feedback: &Feedback) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO feedback (
+                agent_id, message_id, rating, comment, source, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(feedback.agent_id.to_string())
+        .bind(feedback.message_id)
+        .bind(feedback.rating.as_str())
+        .bind(&feedback.comment)
+        .bind(feedback.source.as_str())
+        .bind(&feedback.created_by)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get feedback by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback(&self, id: i64) -> Result<Option<Feedback>> {
+        let row: Option<FeedbackRow> = sqlx::query_as("SELECT * FROM feedback WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List feedback for an agent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_feedback_for_agent(
+        &self,
+        agent_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<Feedback>> {
+        let rows: Vec<FeedbackRow> = sqlx::query_as(
+            "SELECT * FROM feedback WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(agent_id.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List all feedback with optional filters
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_feedback(
+        &self,
+        rating: Option<FeedbackRating>,
+        source: Option<FeedbackSource>,
+        limit: i64,
+    ) -> Result<Vec<Feedback>> {
+        let rows: Vec<FeedbackRow> = match (rating, source) {
+            (Some(r), Some(s)) => {
+                sqlx::query_as(
+                    "SELECT * FROM feedback WHERE rating = ? AND source = ? ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(r.as_str())
+                .bind(s.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(r), None) => {
+                sqlx::query_as(
+                    "SELECT * FROM feedback WHERE rating = ? ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(r.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(s)) => {
+                sqlx::query_as(
+                    "SELECT * FROM feedback WHERE source = ? ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(s.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as("SELECT * FROM feedback ORDER BY created_at DESC LIMIT ?")
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Get feedback statistics for an agent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback_stats_for_agent(&self, agent_id: Uuid) -> Result<FeedbackStats> {
+        let row: Option<FeedbackStatsRow> = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN rating = 'positive' THEN 1 ELSE 0 END) as positive,
+                SUM(CASE WHEN rating = 'negative' THEN 1 ELSE 0 END) as negative,
+                SUM(CASE WHEN rating = 'neutral' THEN 1 ELSE 0 END) as neutral
+            FROM feedback
+            WHERE agent_id = ?
+            "#,
+        )
+        .bind(agent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(|r| FeedbackStats::from_counts(r.positive, r.negative, r.neutral))
+            .unwrap_or_else(FeedbackStats::empty))
+    }
+
+    /// Get overall feedback statistics
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback_stats(&self) -> Result<FeedbackStats> {
+        let row: Option<FeedbackStatsRow> = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN rating = 'positive' THEN 1 ELSE 0 END) as positive,
+                SUM(CASE WHEN rating = 'negative' THEN 1 ELSE 0 END) as negative,
+                SUM(CASE WHEN rating = 'neutral' THEN 1 ELSE 0 END) as neutral
+            FROM feedback
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .map(|r| FeedbackStats::from_counts(r.positive, r.negative, r.neutral))
+            .unwrap_or_else(FeedbackStats::empty))
+    }
+
+    /// Get feedback statistics grouped by agent type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feedback_stats_by_agent_type(
+        &self,
+    ) -> Result<Vec<(AgentType, FeedbackStats)>> {
+        let rows: Vec<FeedbackStatsByTypeRow> = sqlx::query_as(
+            r#"
+            SELECT
+                a.agent_type,
+                COUNT(*) as total,
+                SUM(CASE WHEN f.rating = 'positive' THEN 1 ELSE 0 END) as positive,
+                SUM(CASE WHEN f.rating = 'negative' THEN 1 ELSE 0 END) as negative,
+                SUM(CASE WHEN f.rating = 'neutral' THEN 1 ELSE 0 END) as neutral
+            FROM feedback f
+            JOIN agents a ON f.agent_id = a.id
+            GROUP BY a.agent_type
+            ORDER BY total DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                let agent_type = AgentType::from_str(&r.agent_type)?;
+                let stats = FeedbackStats::from_counts(r.positive, r.negative, r.neutral);
+                Ok((agent_type, stats))
+            })
+            .collect()
+    }
+
+    /// Delete feedback by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_feedback(&self, id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM feedback WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Cleanup old feedback records
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn cleanup_old_feedback(&self, days: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let result = sqlx::query("DELETE FROM feedback WHERE created_at < ?")
+            .bind(&cutoff_str)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    // ==================== Environment Operations ====================
+
+    /// Create a new environment
+    #[tracing::instrument(skip(self, env), level = "debug")]
+    pub async fn create_environment(&self, env: CreateEnvironment) -> Result<Environment> {
+        let secrets_manager = SecretsManager::new(&get_encryption_key());
+
+        // Encrypt secrets
+        let encrypted_secrets = secrets_manager.encrypt_secrets(&env.secrets)?;
+
+        // Serialize config
+        let config_json = serde_json::to_string(&env.config)?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO environments (
+                name, type, url, provider, config, secrets, requires_approval, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&env.name)
+        .bind(env.env_type.to_string())
+        .bind(&env.url)
+        .bind(&env.provider)
+        .bind(&config_json)
+        .bind(&encrypted_secrets)
+        .bind(if env.requires_approval { 1 } else { 0 })
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE constraint failed") {
+                crate::Error::Other(format!("Environment '{}' already exists", env.name))
+            } else {
+                e.into()
+            }
+        })?;
+
+        let id = result.last_insert_rowid();
+
+        Ok(Environment {
+            id,
+            name: env.name,
+            env_type: env.env_type,
+            url: env.url,
+            provider: env.provider,
+            config: env.config,
+            secrets: env.secrets,
+            requires_approval: env.requires_approval,
+            created_at: chrono::DateTime::parse_from_rfc3339(&now)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+
+    /// Get an environment by name
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_environment_by_name(&self, name: &str) -> Result<Environment> {
+        let row: Option<EnvironmentRow> =
+            sqlx::query_as("SELECT * FROM environments WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        row.ok_or_else(|| crate::Error::EnvironmentNotFound(name.to_string()))?
+            .try_into()
+    }
+
+    /// Get an environment by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_environment(&self, id: i64) -> Result<Environment> {
+        let row: Option<EnvironmentRow> = sqlx::query_as("SELECT * FROM environments WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.ok_or_else(|| crate::Error::EnvironmentNotFound(id.to_string()))?
+            .try_into()
+    }
+
+    /// List all environments
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_environments(&self) -> Result<Vec<Environment>> {
+        let rows: Vec<EnvironmentRow> =
+            sqlx::query_as("SELECT * FROM environments ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update an environment
+    #[tracing::instrument(skip(self, env), level = "debug")]
+    pub async fn update_environment(&self, env: &Environment) -> Result<()> {
+        let secrets_manager = SecretsManager::new(&get_encryption_key());
+
+        // Encrypt secrets
+        let encrypted_secrets = secrets_manager.encrypt_secrets(&env.secrets)?;
+
+        // Serialize config
+        let config_json = serde_json::to_string(&env.config)?;
+
+        sqlx::query(
+            r#"
+            UPDATE environments SET
+                type = ?, url = ?, provider = ?, config = ?, secrets = ?, requires_approval = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(env.env_type.to_string())
+        .bind(&env.url)
+        .bind(&env.provider)
+        .bind(&config_json)
+        .bind(&encrypted_secrets)
+        .bind(if env.requires_approval { 1 } else { 0 })
+        .bind(env.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete an environment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_environment(&self, name: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM environments WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    // ==================== Deployment Operations ====================
+
+    /// Create a new deployment record
+    #[tracing::instrument(skip(self, strategy, validation_result), level = "debug")]
+    pub async fn create_deployment(
+        &self,
+        environment_id: i64,
+        environment_name: &str,
+        version: &str,
+        provider: &crate::deployment_executor::DeploymentProvider,
+        strategy: Option<&crate::DeploymentStrategy>,
+        timeout_seconds: u32,
+        validation_result: Option<&crate::DeploymentValidation>,
+    ) -> Result<crate::deployment_executor::Deployment> {
+        use crate::deployment_executor::DeploymentStatus;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let provider_str = provider.to_string();
+        let strategy_json = strategy
+            .map(|s| serde_json::to_string(s).map_err(|e| crate::Error::Other(format!("Failed to serialize strategy: {}", e))))
+            .transpose()?;
+        let validation_json = validation_result
+            .map(|v| serde_json::to_string(v).map_err(|e| crate::Error::Other(format!("Failed to serialize validation: {}", e))))
+            .transpose()?;
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO deployments (
+                environment_id, environment_name, version, provider, strategy,
+                status, timeout_seconds, validation_result, started_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(environment_id)
+        .bind(environment_name)
+        .bind(version)
+        .bind(&provider_str)
+        .bind(&strategy_json)
+        .bind(DeploymentStatus::Pending.to_string())
+        .bind(timeout_seconds as i64)
+        .bind(&validation_json)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        self.get_deployment(id).await
+    }
+
+    /// Update deployment status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_deployment_status(
+        &self,
+        deployment_id: i64,
+        status: crate::deployment_executor::DeploymentStatus,
+        error_message: Option<&str>,
+    ) -> Result<crate::deployment_executor::Deployment> {
+        let completed_at = if matches!(
+            status,
+            crate::deployment_executor::DeploymentStatus::Completed
+                | crate::deployment_executor::DeploymentStatus::Failed
+                | crate::deployment_executor::DeploymentStatus::RolledBack
+                | crate::deployment_executor::DeploymentStatus::TimedOut
+        ) {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE deployments
+            SET status = ?, error_message = ?, completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(error_message)
+        .bind(&completed_at)
+        .bind(deployment_id)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_deployment(deployment_id).await
+    }
+
+    /// Get a deployment by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment(
+        &self,
+        deployment_id: i64,
+    ) -> Result<crate::deployment_executor::Deployment> {
+        use crate::deployment_executor::{DeploymentProvider, DeploymentStatus};
+
+        #[derive(sqlx::FromRow)]
+        struct DeploymentRow {
+            id: i64,
+            environment_id: i64,
+            environment_name: String,
+            version: String,
+            provider: String,
+            strategy: Option<String>,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            timeout_seconds: i64,
+            validation_result: Option<String>,
+        }
+
+        let row: DeploymentRow = sqlx::query_as("SELECT * FROM deployments WHERE id = ?")
+            .bind(deployment_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| crate::Error::Other(format!("Deployment {} not found", deployment_id)))?;
+
+        let provider: DeploymentProvider = row.provider.parse()?;
+        let strategy: Option<crate::DeploymentStrategy> = row
+            .strategy
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::from_str(s).map_err(|e| crate::Error::Other(format!("Failed to parse strategy: {}", e))))
+            .transpose()?;
+        let validation_result: Option<crate::DeploymentValidation> = row
+            .validation_result
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| serde_json::from_str(v).map_err(|e| crate::Error::Other(format!("Failed to parse validation_result: {}", e))))
+            .transpose()?;
+
+        let status = match row.status.as_str() {
+            "pending" => DeploymentStatus::Pending,
+            "validating" => DeploymentStatus::Validating,
+            "in_progress" => DeploymentStatus::InProgress,
+            "completed" => DeploymentStatus::Completed,
+            "failed" => DeploymentStatus::Failed,
+            "rolled_back" => DeploymentStatus::RolledBack,
+            "timed_out" => DeploymentStatus::TimedOut,
+            _ => DeploymentStatus::Pending,
+        };
+
+        let started_at = chrono::DateTime::parse_from_rfc3339(&row.started_at)
+            .map_err(|e| crate::Error::Other(format!("Failed to parse started_at: {}", e)))?
+            .into();
+        let completed_at = row
+            .completed_at
+            .as_ref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.into())
+                    .map_err(|e| crate::Error::Other(format!("Failed to parse completed_at: {}", e)))
+            })
+            .transpose()?;
+
+        Ok(crate::deployment_executor::Deployment {
+            id: row.id,
+            environment_id: row.environment_id,
+            environment_name: row.environment_name,
+            version: row.version,
+            provider,
+            strategy,
+            status,
+            error_message: row.error_message,
+            started_at,
+            completed_at,
+            timeout_seconds: row.timeout_seconds as u32,
+            validation_result,
+        })
+    }
+
+    /// List deployments for an environment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_deployments(
+        &self,
+        environment_name: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<crate::deployment_executor::Deployment>> {
+        use crate::deployment_executor::{DeploymentProvider, DeploymentStatus};
+
+        #[derive(sqlx::FromRow)]
+        struct DeploymentRow {
+            id: i64,
+            environment_id: i64,
+            environment_name: String,
+            version: String,
+            provider: String,
+            strategy: Option<String>,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            timeout_seconds: i64,
+            validation_result: Option<String>,
+        }
+
+        let limit = limit.unwrap_or(100);
+        let rows: Vec<DeploymentRow> = sqlx::query_as(
+            "SELECT * FROM deployments WHERE environment_name = ? ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(environment_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let provider: DeploymentProvider = row.provider.parse()?;
+                let strategy: Option<crate::DeploymentStrategy> = row
+                    .strategy
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| serde_json::from_str(s))
+                    .transpose()?;
+                let validation_result: Option<crate::DeploymentValidation> = row
+                    .validation_result
+                    .as_ref()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| serde_json::from_str(v))
+                    .transpose()?;
+
+                let status = match row.status.as_str() {
+                    "pending" => DeploymentStatus::Pending,
+                    "validating" => DeploymentStatus::Validating,
+                    "in_progress" => DeploymentStatus::InProgress,
+                    "completed" => DeploymentStatus::Completed,
+                    "failed" => DeploymentStatus::Failed,
+                    "rolled_back" => DeploymentStatus::RolledBack,
+                    "timed_out" => DeploymentStatus::TimedOut,
+                    _ => DeploymentStatus::Pending,
+                };
+
+                Ok(crate::deployment_executor::Deployment {
+                    id: row.id,
+                    environment_id: row.environment_id,
+                    environment_name: row.environment_name,
+                    version: row.version,
+                    provider,
+                    strategy,
+                    status,
+                    error_message: row.error_message,
+                    started_at: chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                        .map_err(|e| crate::Error::Other(e.to_string()))?
+                        .into(),
+                    completed_at: row
+                        .completed_at
+                        .as_ref()
+                        .map(|s| {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .map(|dt| dt.into())
+                                .map_err(|e| crate::Error::Other(e.to_string()))
+                        })
+                        .transpose()?,
+                    timeout_seconds: row.timeout_seconds as u32,
+                    validation_result,
+                })
+            })
+            .collect()
+    }
+
+    /// Add deployment progress event
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn add_deployment_progress(
+        &self,
+        deployment_id: i64,
+        message: &str,
+        progress_percent: u8,
+    ) -> Result<()> {
+        // Get current deployment status
+        let deployment = self.get_deployment(deployment_id).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO deployment_progress (deployment_id, status, message, progress_percent, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(deployment_id)
+        .bind(deployment.status.to_string())
+        .bind(message)
+        .bind(progress_percent as i64)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get deployment progress events
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment_progress(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Vec<crate::deployment_executor::DeploymentProgress>> {
+        use crate::deployment_executor::DeploymentStatus;
+
+        #[derive(sqlx::FromRow)]
+        struct ProgressRow {
+            deployment_id: i64,
+            status: String,
+            message: String,
+            progress_percent: i64,
+            details: Option<String>,
+            created_at: String,
+        }
+
+        let rows: Vec<ProgressRow> = sqlx::query_as(
+            "SELECT deployment_id, status, message, progress_percent, details, created_at
+             FROM deployment_progress
+             WHERE deployment_id = ?
+             ORDER BY created_at",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let status = match row.status.as_str() {
+                    "pending" => DeploymentStatus::Pending,
+                    "validating" => DeploymentStatus::Validating,
+                    "in_progress" => DeploymentStatus::InProgress,
+                    "completed" => DeploymentStatus::Completed,
+                    "failed" => DeploymentStatus::Failed,
+                    "rolled_back" => DeploymentStatus::RolledBack,
+                    "timed_out" => DeploymentStatus::TimedOut,
+                    _ => DeploymentStatus::Pending,
+                };
+
+                let details: Option<std::collections::HashMap<String, serde_json::Value>> = row
+                    .details
+                    .as_ref()
+                    .filter(|d| !d.is_empty())
+                    .map(|d| serde_json::from_str(d).map_err(|e| crate::Error::Other(format!("Failed to parse deployment progress details: {}", e))))
+                    .transpose()?;
+
+                Ok(crate::deployment_executor::DeploymentProgress {
+                    deployment_id: row.deployment_id,
+                    status,
+                    message: row.message,
+                    progress_percent: row.progress_percent as u8,
+                    timestamp: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                        .map_err(|e| crate::Error::Other(e.to_string()))?
+                        .into(),
+                    details,
+                })
+            })
+            .collect()
+    }
+
+    // ==================== Deployment Verification Operations ====================
+
+    /// Create a deployment verification record
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_deployment_verification(
+        &self,
+        deployment_id: i64,
+    ) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "INSERT INTO deployment_verifications (deployment_id, overall_status, should_rollback, started_at, created_at, updated_at)
+             VALUES (?, 'pending', 0, ?, ?, ?)",
+        )
+        .bind(deployment_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Add a verification check
+    #[tracing::instrument(skip(self, details), level = "debug")]
+    pub async fn add_verification_check(
+        &self,
+        verification_id: i64,
+        check_type: &str,
+        status: &str,
+        message: &str,
+        details: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let details_json = details.map(|d| serde_json::to_string(d).unwrap_or_default());
+
+        sqlx::query(
+            "INSERT INTO verification_checks (verification_id, check_type, status, message, details, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(verification_id)
+        .bind(check_type)
+        .bind(status)
+        .bind(message)
+        .bind(details_json)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update verification overall status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_verification_status(
+        &self,
+        verification_id: i64,
+        overall_status: &str,
+        should_rollback: bool,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE deployment_verifications
+             SET overall_status = ?, should_rollback = ?, completed_at = ?
+             WHERE id = ?",
+        )
+        .bind(overall_status)
+        .bind(should_rollback as i64)
+        .bind(&now)
+        .bind(verification_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get deployment verification by deployment ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment_verification(
+        &self,
+        deployment_id: i64,
+    ) -> Result<Option<crate::post_deploy_verification::VerificationResult>> {
+        use crate::post_deploy_verification::{
+            VerificationCheck, VerificationCheckStatus, VerificationCheckType, VerificationResult,
+        };
+
+        #[derive(sqlx::FromRow)]
+        struct VerificationRow {
+            id: i64,
+            deployment_id: i64,
+            overall_status: String,
+            should_rollback: i64,
+            started_at: String,
+            completed_at: Option<String>,
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct CheckRow {
+            check_type: String,
+            status: String,
+            message: String,
+            details: Option<String>,
+            created_at: String,
+        }
+
+        let verification_row: Option<VerificationRow> = sqlx::query_as(
+            "SELECT id, deployment_id, overall_status, should_rollback, started_at, completed_at
+             FROM deployment_verifications
+             WHERE deployment_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(verification_row) = verification_row else {
+            return Ok(None);
+        };
+
+        let check_rows: Vec<CheckRow> = sqlx::query_as(
+            "SELECT check_type, status, message, details, created_at
+             FROM verification_checks
+             WHERE verification_id = ?
+             ORDER BY created_at",
+        )
+        .bind(verification_row.id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let checks: Result<Vec<VerificationCheck>> = check_rows
+            .into_iter()
+            .map(|row| {
+                let check_type = match row.check_type.as_str() {
+                    "smoke_test" => VerificationCheckType::SmokeTest,
+                    "health_endpoint" => VerificationCheckType::HealthEndpoint,
+                    "version_check" => VerificationCheckType::VersionCheck,
+                    "log_error_check" => VerificationCheckType::LogErrorCheck,
+                    "error_rate_monitoring" => VerificationCheckType::ErrorRateMonitoring,
+                    _ => {
+                        return Err(crate::Error::Other(format!(
+                            "Invalid verification check type: {}",
+                            row.check_type
+                        )))
+                    }
+                };
+
+                let status = match row.status.as_str() {
+                    "pending" => VerificationCheckStatus::Pending,
+                    "running" => VerificationCheckStatus::Running,
+                    "passed" => VerificationCheckStatus::Passed,
+                    "failed" => VerificationCheckStatus::Failed,
+                    "skipped" => VerificationCheckStatus::Skipped,
+                    _ => {
+                        return Err(crate::Error::Other(format!(
+                            "Invalid verification status: {}",
+                            row.status
+                        )))
+                    }
+                };
+
+                let details = row
+                    .details
+                    .as_ref()
+                    .filter(|d| !d.is_empty())
+                    .map(|d| {
+                        serde_json::from_str(d).map_err(|e| {
+                            crate::Error::Other(format!(
+                                "Failed to parse verification check details: {}",
+                                e
+                            ))
+                        })
+                    })
+                    .transpose()?;
+
+                let timestamp = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .into();
+
+                Ok(VerificationCheck {
+                    check_type,
+                    status,
+                    message: row.message,
+                    details,
+                    timestamp,
+                })
+            })
+            .collect();
+
+        let overall_status = match verification_row.overall_status.as_str() {
+            "pending" => VerificationCheckStatus::Pending,
+            "running" => VerificationCheckStatus::Running,
+            "passed" => VerificationCheckStatus::Passed,
+            "failed" => VerificationCheckStatus::Failed,
+            "skipped" => VerificationCheckStatus::Skipped,
+            _ => {
+                return Err(crate::Error::Other(format!(
+                    "Invalid verification overall status: {}",
+                    verification_row.overall_status
+                )))
+            }
+        };
+
+        let started_at = chrono::DateTime::parse_from_rfc3339(&verification_row.started_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .into();
+
+        let completed_at = verification_row
+            .completed_at
+            .as_ref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.into())
+                    .map_err(|e| crate::Error::Other(e.to_string()))
+            })
+            .transpose()?;
+
+        Ok(Some(VerificationResult {
+            deployment_id: verification_row.deployment_id,
+            checks: checks?,
+            overall_status,
+            should_rollback: verification_row.should_rollback != 0,
+            started_at,
+            completed_at,
+        }))
+    }
+
+    // ==================== Deployment Rollback Operations ====================
+
+    /// Create a new deployment rollback event
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_deployment_rollback_event(
+        &self,
+        deployment_id: i64,
+        target_version: &str,
+        rollback_type: &crate::deployment_rollback::RollbackType,
+    ) -> Result<crate::deployment_rollback::RollbackEvent> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rollback_type_str = rollback_type.to_string();
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO deployment_rollback_events (
+                deployment_id, target_version, rollback_type, status, started_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(deployment_id)
+        .bind(target_version)
+        .bind(&rollback_type_str)
+        .bind("pending")
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        self.get_deployment_rollback_event(id).await
+    }
+
+    /// Update deployment rollback event status
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_deployment_rollback_status(
+        &self,
+        rollback_id: i64,
+        status: crate::deployment_rollback::RollbackStatus,
+        error_message: Option<&str>,
+    ) -> Result<crate::deployment_rollback::RollbackEvent> {
+        let completed_at = if matches!(
+            status,
+            crate::deployment_rollback::RollbackStatus::Completed
+                | crate::deployment_rollback::RollbackStatus::Failed
+        ) {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE deployment_rollback_events
+            SET status = ?, error_message = ?, completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.to_string())
+        .bind(error_message)
+        .bind(&completed_at)
+        .bind(rollback_id)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_deployment_rollback_event(rollback_id).await
+    }
+
+    /// Get a deployment rollback event by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_deployment_rollback_event(
+        &self,
+        rollback_id: i64,
+    ) -> Result<crate::deployment_rollback::RollbackEvent> {
+        use crate::deployment_rollback::{RollbackEvent, RollbackStatus, RollbackType};
+
+        #[derive(sqlx::FromRow)]
+        struct RollbackRow {
+            id: i64,
+            deployment_id: i64,
+            target_version: String,
+            rollback_type: String,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            notification_sent: i64,
+        }
+
+        let row: RollbackRow = sqlx::query_as(
+            "SELECT id, deployment_id, target_version, rollback_type, status, error_message,
+                    started_at, completed_at, notification_sent
+             FROM deployment_rollback_events
+             WHERE id = ?",
+        )
+        .bind(rollback_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            crate::Error::Other(format!("Deployment rollback event {} not found", rollback_id))
+        })?;
+
+        let rollback_type = match row.rollback_type.as_str() {
+            "previous" => RollbackType::Previous,
+            "specific" => RollbackType::Specific,
+            "blue_green_switch" => RollbackType::BlueGreenSwitch,
+            "automatic" => RollbackType::Automatic,
+            _ => RollbackType::Previous,
+        };
+
+        let status = match row.status.as_str() {
+            "pending" => RollbackStatus::Pending,
+            "in_progress" => RollbackStatus::InProgress,
+            "completed" => RollbackStatus::Completed,
+            "failed" => RollbackStatus::Failed,
+            _ => RollbackStatus::Pending,
+        };
+
+        let started_at = chrono::DateTime::parse_from_rfc3339(&row.started_at)
+            .map_err(|e| crate::Error::Other(format!("Failed to parse started_at: {}", e)))?
+            .into();
+
+        let completed_at = row
+            .completed_at
+            .as_ref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.into())
+                    .map_err(|e| crate::Error::Other(format!("Failed to parse completed_at: {}", e)))
+            })
+            .transpose()?;
+
+        Ok(RollbackEvent {
+            id: row.id,
+            deployment_id: row.deployment_id,
+            target_version: row.target_version,
+            rollback_type,
+            status,
+            error_message: row.error_message,
+            started_at,
+            completed_at,
+            notification_sent: row.notification_sent != 0,
+        })
+    }
+
+    /// List deployment rollback events for a deployment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_deployment_rollback_events(
+        &self,
+        environment_name: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<crate::deployment_rollback::RollbackEvent>> {
+        use crate::deployment_rollback::{RollbackEvent, RollbackStatus, RollbackType};
+
+        #[derive(sqlx::FromRow)]
+        struct RollbackRow {
+            id: i64,
+            deployment_id: i64,
+            target_version: String,
+            rollback_type: String,
+            status: String,
+            error_message: Option<String>,
+            started_at: String,
+            completed_at: Option<String>,
+            notification_sent: i64,
+        }
+
+        let limit = limit.unwrap_or(100);
+        let rows: Vec<RollbackRow> = sqlx::query_as(
+            r#"
+            SELECT dre.id, dre.deployment_id, dre.target_version, dre.rollback_type,
+                   dre.status, dre.error_message, dre.started_at, dre.completed_at,
+                   dre.notification_sent
+            FROM deployment_rollback_events dre
+            INNER JOIN deployments d ON dre.deployment_id = d.id
+            WHERE d.environment_name = ?
+            ORDER BY dre.started_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(environment_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut rollbacks = Vec::new();
+        for row in rows {
+            let rollback_type = match row.rollback_type.as_str() {
+                "previous" => RollbackType::Previous,
+                "specific" => RollbackType::Specific,
+                "blue_green_switch" => RollbackType::BlueGreenSwitch,
+                "automatic" => RollbackType::Automatic,
+                _ => RollbackType::Previous,
+            };
+
+            let status = match row.status.as_str() {
+                "pending" => RollbackStatus::Pending,
+                "in_progress" => RollbackStatus::InProgress,
+                "completed" => RollbackStatus::Completed,
+                "failed" => RollbackStatus::Failed,
+                _ => RollbackStatus::Pending,
+            };
+
+            let started_at = chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                .map_err(|e| crate::Error::Other(format!("Failed to parse started_at: {}", e)))?
+                .into();
+
+            let completed_at = row
+                .completed_at
+                .as_ref()
+                .map(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|dt| dt.into())
+                        .map_err(|e| {
+                            crate::Error::Other(format!("Failed to parse completed_at: {}", e))
+                        })
+                })
+                .transpose()?;
+
+            rollbacks.push(RollbackEvent {
+                id: row.id,
+                deployment_id: row.deployment_id,
+                target_version: row.target_version,
+                rollback_type,
+                status,
+                error_message: row.error_message,
+                started_at,
+                completed_at,
+                notification_sent: row.notification_sent != 0,
+            });
+        }
+
+        Ok(rollbacks)
+    }
+
+    /// Mark rollback notification as sent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn mark_deployment_rollback_notification_sent(
+        &self,
+        rollback_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE deployment_rollback_events SET notification_sent = 1 WHERE id = ?",
+        )
+        .bind(rollback_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // ==================== Feature Flags Operations ====================
+
+    /// Create a new feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_feature_flag(
+        &self,
+        flag: crate::CreateFeatureFlag,
+    ) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        use sqlx::Row;
+
+        // Validate rollout percentage
+        let rollout_percentage = flag.rollout_percentage.unwrap_or(100);
+        if !(0..=100).contains(&rollout_percentage) {
+            return Err(crate::Error::Other(
+                "Rollout percentage must be between 0 and 100".to_string(),
+            ));
+        }
+
+        let status_str = flag.status.to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO feature_flags (key, name, description, status, rollout_percentage, environment, metadata)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(&flag.key)
+        .bind(&flag.name)
+        .bind(&flag.description)
+        .bind(&status_str)
+        .bind(rollout_percentage)
+        .bind(&flag.environment)
+        .bind(&flag.metadata)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_feature_flag(&flag.key, flag.environment.as_deref()).await
+    }
+
+    /// Get a feature flag by key and optional environment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_feature_flag(
+        &self,
+        key: &str,
+        environment: Option<&str>,
+    ) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            r#"
+            SELECT id, key, name, description, status, rollout_percentage, environment, metadata, created_at, updated_at
+            FROM feature_flags
+            WHERE key = ?1 AND (environment = ?2 OR (?2 IS NULL AND environment IS NULL))
+            ORDER BY environment DESC NULLS LAST
+            LIMIT 1
+            "#,
+        )
+        .bind(key)
+        .bind(environment)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let id: i64 = r.get("id");
+                let key: String = r.get("key");
+                let name: String = r.get("name");
+                let description: Option<String> = r.get("description");
+                let status: String = r.get("status");
+                let rollout_percentage: i32 = r.get("rollout_percentage");
+                let environment: Option<String> = r.get("environment");
+                let metadata: Option<String> = r.get("metadata");
+                let created_at: String = r.get("created_at");
+                let updated_at: String = r.get("updated_at");
+
+                Ok(crate::FeatureFlag {
+                    id: Some(id),
+                    key,
+                    name,
+                    description,
+                    status: status.parse().unwrap_or(FlagStatus::Disabled),
+                    rollout_percentage,
+                    environment,
+                    metadata,
+                    created_at: Some(created_at),
+                    updated_at: Some(updated_at),
+                })
+            }
+            None => Err(crate::Error::Other(format!(
+                "Feature flag '{}' not found{}",
+                key,
+                environment
+                    .map(|e| format!(" for environment '{}'", e))
+                    .unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// List all feature flags, optionally filtered by environment
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_feature_flags(&self, environment: Option<&str>) -> Result<Vec<crate::FeatureFlag>> {
+        use crate::FlagStatus;
+        use sqlx::Row;
+
+        let rows = if let Some(env) = environment {
+            sqlx::query(
+                r#"
+                SELECT id, key, name, description, status, rollout_percentage, environment, metadata, created_at, updated_at
+                FROM feature_flags
+                WHERE environment = ?1 OR environment IS NULL
+                ORDER BY key, environment DESC NULLS LAST
+                "#,
+            )
+            .bind(env)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, key, name, description, status, rollout_percentage, environment, metadata, created_at, updated_at
+                FROM feature_flags
+                ORDER BY key, environment DESC NULLS LAST
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let id: i64 = r.get("id");
+                let key: String = r.get("key");
+                let name: String = r.get("name");
+                let description: Option<String> = r.get("description");
+                let status: String = r.get("status");
+                let rollout_percentage: i32 = r.get("rollout_percentage");
+                let environment: Option<String> = r.get("environment");
+                let metadata: Option<String> = r.get("metadata");
+                let created_at: String = r.get("created_at");
+                let updated_at: String = r.get("updated_at");
+
+                crate::FeatureFlag {
+                    id: Some(id),
+                    key,
+                    name,
+                    description,
+                    status: status.parse().unwrap_or(FlagStatus::Disabled),
+                    rollout_percentage,
+                    environment,
+                    metadata,
+                    created_at: Some(created_at),
+                    updated_at: Some(updated_at),
+                }
+            })
+            .collect())
+    }
+
+    /// Update a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_feature_flag(
+        &self,
+        key: &str,
+        environment: Option<&str>,
+        update: crate::UpdateFeatureFlag,
+    ) -> Result<crate::FeatureFlag> {
+        // Validate rollout percentage if provided
+        if let Some(percentage) = update.rollout_percentage {
+            if !(0..=100).contains(&percentage) {
+                return Err(crate::Error::Other(
+                    "Rollout percentage must be between 0 and 100".to_string(),
+                ));
+            }
+        }
+
+        // Check if flag exists
+        self.get_feature_flag(key, environment).await?;
+
+        // Build update query dynamically
+        if let Some(status) = &update.status {
+            let status_str = status.to_string();
+            sqlx::query(
+                r#"
+                UPDATE feature_flags
+                SET status = ?1, updated_at = datetime('now')
+                WHERE key = ?2 AND (environment = ?3 OR (?3 IS NULL AND environment IS NULL))
+                "#,
+            )
+            .bind(&status_str)
+            .bind(key)
+            .bind(environment)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        if let Some(percentage) = update.rollout_percentage {
+            sqlx::query(
+                r#"
+                UPDATE feature_flags
+                SET rollout_percentage = ?1, updated_at = datetime('now')
+                WHERE key = ?2 AND (environment = ?3 OR (?3 IS NULL AND environment IS NULL))
+                "#,
+            )
+            .bind(percentage)
+            .bind(key)
+            .bind(environment)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        if let Some(metadata) = &update.metadata {
+            sqlx::query(
+                r#"
+                UPDATE feature_flags
+                SET metadata = ?1, updated_at = datetime('now')
+                WHERE key = ?2 AND (environment = ?3 OR (?3 IS NULL AND environment IS NULL))
+                "#,
+            )
+            .bind(metadata)
+            .bind(key)
+            .bind(environment)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        self.get_feature_flag(key, environment).await
+    }
+
+    /// Enable a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn enable_feature_flag(&self, key: &str, environment: Option<&str>) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        self.update_feature_flag(
+            key,
+            environment,
+            crate::UpdateFeatureFlag {
+                status: Some(FlagStatus::Enabled),
+                rollout_percentage: None,
+                metadata: None,
+            },
+        )
+        .await
+    }
+
+    /// Disable a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn disable_feature_flag(&self, key: &str, environment: Option<&str>) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        self.update_feature_flag(
+            key,
+            environment,
+            crate::UpdateFeatureFlag {
+                status: Some(FlagStatus::Disabled),
+                rollout_percentage: None,
+                metadata: None,
+            },
+        )
+        .await
+    }
+
+    /// Delete a feature flag
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_feature_flag(&self, key: &str, environment: Option<&str>) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM feature_flags
+            WHERE key = ?1 AND (environment = ?2 OR (?2 IS NULL AND environment IS NULL))
+            "#,
+        )
+        .bind(key)
+        .bind(environment)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(crate::Error::Other(format!(
+                "Feature flag '{}' not found{}",
+                key,
+                environment
+                    .map(|e| format!(" for environment '{}'", e))
+                    .unwrap_or_default()
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Set rollout percentage for gradual rollout
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn set_feature_flag_rollout(
+        &self,
+        key: &str,
+        environment: Option<&str>,
+        percentage: i32,
+    ) -> Result<crate::FeatureFlag> {
+        use crate::FlagStatus;
+        self.update_feature_flag(
+            key,
+            environment,
+            crate::UpdateFeatureFlag {
+                status: Some(FlagStatus::Conditional),
+                rollout_percentage: Some(percentage),
+                metadata: None,
+            },
+        )
+        .await
+    }
+
     // ==================== Token Tracking Operations ====================
 
     /// Record token usage for a session turn
@@ -1766,6 +3482,216 @@ impl Database {
         Ok(row.into())
     }
 
+    // ==================== Schedule Operations ====================
+
+    /// Insert a new schedule
+    #[tracing::instrument(skip(self, schedule), level = "debug", fields(name = %schedule.name))]
+    pub async fn insert_schedule(&self, schedule: &Schedule) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO schedules (name, cron_expression, agent_type, task, enabled, last_run, next_run, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&schedule.name)
+        .bind(&schedule.cron_expression)
+        .bind(&schedule.agent_type)
+        .bind(&schedule.task)
+        .bind(schedule.enabled)
+        .bind(schedule.last_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.next_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get a schedule by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_schedule(&self, id: i64) -> Result<Option<Schedule>> {
+        let row = sqlx::query_as::<_, ScheduleRow>("SELECT * FROM schedules WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get a schedule by name
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_schedule_by_name(&self, name: &str) -> Result<Option<Schedule>> {
+        let row = sqlx::query_as::<_, ScheduleRow>("SELECT * FROM schedules WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List all schedules with optional enabled filter
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_schedules(&self, enabled_only: bool) -> Result<Vec<Schedule>> {
+        let rows = if enabled_only {
+            sqlx::query_as::<_, ScheduleRow>(
+                "SELECT * FROM schedules WHERE enabled = 1 ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ScheduleRow>("SELECT * FROM schedules ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update a schedule
+    #[tracing::instrument(skip(self, schedule), level = "debug", fields(id = schedule.id))]
+    pub async fn update_schedule(&self, schedule: &Schedule) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE schedules SET
+                name = ?, cron_expression = ?, agent_type = ?, task = ?,
+                enabled = ?, last_run = ?, next_run = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&schedule.name)
+        .bind(&schedule.cron_expression)
+        .bind(&schedule.agent_type)
+        .bind(&schedule.task)
+        .bind(schedule.enabled)
+        .bind(schedule.last_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.next_run.map(|dt| dt.to_rfc3339()))
+        .bind(schedule.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a schedule
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn delete_schedule(&self, id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM schedules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Get schedules that are due for execution
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_due_schedules(&self) -> Result<Vec<Schedule>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT * FROM schedules WHERE enabled = 1 AND next_run <= ? ORDER BY next_run ASC",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Try to acquire a lock for schedule execution
+    ///
+    /// Returns true if lock was acquired, false if schedule is already locked.
+    /// Locks expire after 5 minutes to prevent deadlocks.
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn try_lock_schedule(&self, schedule_id: i64) -> Result<bool> {
+        let now = chrono::Utc::now();
+        let lock_expiry = now - chrono::Duration::minutes(5);
+
+        // Try to acquire lock using UPDATE with WHERE clause
+        // This will only update if the schedule is not locked or lock has expired
+        let result = sqlx::query(
+            r#"
+            UPDATE schedules
+            SET locked_at = ?
+            WHERE id = ?
+            AND (locked_at IS NULL OR locked_at < ?)
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(schedule_id)
+        .bind(lock_expiry.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release a schedule lock
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn unlock_schedule(&self, schedule_id: i64) -> Result<()> {
+        sqlx::query("UPDATE schedules SET locked_at = NULL WHERE id = ?")
+            .bind(schedule_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Insert a schedule run record
+    #[tracing::instrument(skip(self, run), level = "debug", fields(schedule_id = run.schedule_id))]
+    pub async fn insert_schedule_run(&self, run: &ScheduleRun) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO schedule_runs (schedule_id, agent_id, started_at, completed_at, status, error_message)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.schedule_id)
+        .bind(&run.agent_id)
+        .bind(run.started_at.to_rfc3339())
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.status.as_str())
+        .bind(&run.error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Update a schedule run
+    #[tracing::instrument(skip(self, run), level = "debug", fields(id = run.id))]
+    pub async fn update_schedule_run(&self, run: &ScheduleRun) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE schedule_runs SET
+                agent_id = ?, completed_at = ?, status = ?, error_message = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&run.agent_id)
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.status.as_str())
+        .bind(&run.error_message)
+        .bind(run.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get schedule runs for a schedule
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_schedule_runs(&self, schedule_id: i64, limit: i64) -> Result<Vec<ScheduleRun>> {
+        let rows = sqlx::query_as::<_, ScheduleRunRow>(
+            "SELECT * FROM schedule_runs WHERE schedule_id = ? ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(schedule_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
     // ==================== Webhook Event Operations ====================
 
     /// Insert a new webhook event (idempotent by delivery_id)
@@ -1963,6 +3889,388 @@ impl Database {
         .await?;
 
         rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // ==================== Pipeline Operations ====================
+
+    /// Insert a new pipeline
+    pub async fn insert_pipeline(&self, pipeline: &crate::Pipeline) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pipelines (name, definition, enabled, created_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(&pipeline.name)
+        .bind(&pipeline.definition)
+        .bind(pipeline.enabled as i32)
+        .bind(pipeline.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get pipeline by ID
+    pub async fn get_pipeline(&self, id: i64) -> Result<Option<crate::Pipeline>> {
+        let row = sqlx::query_as::<_, PipelineRow>("SELECT * FROM pipelines WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get pipeline by name
+    pub async fn get_pipeline_by_name(&self, name: &str) -> Result<Option<crate::Pipeline>> {
+        let row = sqlx::query_as::<_, PipelineRow>("SELECT * FROM pipelines WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update pipeline
+    pub async fn update_pipeline(&self, pipeline: &crate::Pipeline) -> Result<()> {
+        let id = pipeline
+            .id
+            .ok_or_else(|| crate::Error::Other("Cannot update pipeline without ID".to_string()))?;
+
+        sqlx::query(
+            r#"
+            UPDATE pipelines SET
+                name = ?,
+                definition = ?,
+                enabled = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&pipeline.name)
+        .bind(&pipeline.definition)
+        .bind(pipeline.enabled as i32)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all pipelines
+    pub async fn list_pipelines(&self) -> Result<Vec<crate::Pipeline>> {
+        let rows = sqlx::query_as::<_, PipelineRow>("SELECT * FROM pipelines ORDER BY name ASC")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List enabled pipelines
+    pub async fn list_enabled_pipelines(&self) -> Result<Vec<crate::Pipeline>> {
+        let rows = sqlx::query_as::<_, PipelineRow>(
+            "SELECT * FROM pipelines WHERE enabled = 1 ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Delete pipeline
+    pub async fn delete_pipeline(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM pipelines WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    // ==================== Pipeline Run Operations ====================
+
+    /// Insert a new pipeline run
+    pub async fn insert_pipeline_run(&self, run: &crate::PipelineRun) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pipeline_runs (
+                pipeline_id, status, trigger_event, started_at, completed_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.pipeline_id)
+        .bind(run.status.as_str())
+        .bind(&run.trigger_event)
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get pipeline run by ID
+    pub async fn get_pipeline_run(&self, id: i64) -> Result<Option<crate::PipelineRun>> {
+        let row = sqlx::query_as::<_, PipelineRunRow>("SELECT * FROM pipeline_runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update pipeline run
+    pub async fn update_pipeline_run(&self, run: &crate::PipelineRun) -> Result<()> {
+        let id = run
+            .id
+            .ok_or_else(|| crate::Error::Other("Cannot update pipeline run without ID".to_string()))?;
+
+        sqlx::query(
+            r#"
+            UPDATE pipeline_runs SET
+                status = ?,
+                started_at = ?,
+                completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(run.status.as_str())
+        .bind(run.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(run.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List pipeline runs for a pipeline
+    pub async fn list_pipeline_runs(&self, pipeline_id: i64) -> Result<Vec<crate::PipelineRun>> {
+        let rows = sqlx::query_as::<_, PipelineRunRow>(
+            "SELECT * FROM pipeline_runs WHERE pipeline_id = ? ORDER BY created_at DESC",
+        )
+        .bind(pipeline_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List pipeline runs by status
+    pub async fn list_pipeline_runs_by_status(
+        &self,
+        status: crate::PipelineRunStatus,
+    ) -> Result<Vec<crate::PipelineRun>> {
+        let rows = sqlx::query_as::<_, PipelineRunRow>(
+            "SELECT * FROM pipeline_runs WHERE status = ? ORDER BY created_at DESC",
+        )
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // ==================== Pipeline Stage Operations ====================
+
+    /// Insert a new pipeline stage
+    pub async fn insert_pipeline_stage(&self, stage: &crate::PipelineStage) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pipeline_stages (
+                run_id, stage_name, status, agent_id, started_at, completed_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(stage.run_id)
+        .bind(&stage.stage_name)
+        .bind(stage.status.as_str())
+        .bind(&stage.agent_id)
+        .bind(stage.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(stage.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(stage.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get pipeline stage by ID
+    pub async fn get_pipeline_stage(&self, id: i64) -> Result<Option<crate::PipelineStage>> {
+        let row =
+            sqlx::query_as::<_, PipelineStageRow>("SELECT * FROM pipeline_stages WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get pipeline stage by name within a run
+    pub async fn get_pipeline_stage_by_name(
+        &self,
+        run_id: i64,
+        stage_name: &str,
+    ) -> Result<Option<crate::PipelineStage>> {
+        let row = sqlx::query_as::<_, PipelineStageRow>(
+            "SELECT * FROM pipeline_stages WHERE run_id = ? AND stage_name = ?",
+        )
+        .bind(run_id)
+        .bind(stage_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update pipeline stage
+    pub async fn update_pipeline_stage(&self, stage: &crate::PipelineStage) -> Result<()> {
+        let id = stage.id.ok_or_else(|| {
+            crate::Error::Other("Cannot update pipeline stage without ID".to_string())
+        })?;
+
+        sqlx::query(
+            r#"
+            UPDATE pipeline_stages SET
+                status = ?,
+                agent_id = ?,
+                started_at = ?,
+                completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(stage.status.as_str())
+        .bind(&stage.agent_id)
+        .bind(stage.started_at.map(|dt| dt.to_rfc3339()))
+        .bind(stage.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List pipeline stages for a run
+    pub async fn list_pipeline_stages(&self, run_id: i64) -> Result<Vec<crate::PipelineStage>> {
+        let rows = sqlx::query_as::<_, PipelineStageRow>(
+            "SELECT * FROM pipeline_stages WHERE run_id = ? ORDER BY created_at ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List pipeline stages by status within a run
+    pub async fn list_pipeline_stages_by_status(
+        &self,
+        run_id: i64,
+        status: crate::PipelineStageStatus,
+    ) -> Result<Vec<crate::PipelineStage>> {
+        let rows = sqlx::query_as::<_, PipelineStageRow>(
+            "SELECT * FROM pipeline_stages WHERE run_id = ? AND status = ? ORDER BY created_at ASC",
+        )
+        .bind(run_id)
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // Rollback event operations
+
+    /// Insert a rollback event
+    pub async fn insert_rollback_event(&self, event: &crate::RollbackEvent) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO rollback_events
+                (run_id, failed_stage_name, rollback_to_stage, trigger_type, status,
+                 error_message, started_at, completed_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(event.run_id)
+        .bind(&event.failed_stage_name)
+        .bind(&event.rollback_to_stage)
+        .bind(event.trigger_type.as_str())
+        .bind(event.status.as_str())
+        .bind(&event.error_message)
+        .bind(event.started_at.map(|t| t.to_rfc3339()))
+        .bind(event.completed_at.map(|t| t.to_rfc3339()))
+        .bind(event.created_at.map(|t| t.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get a rollback event by ID
+    pub async fn get_rollback_event(&self, id: i64) -> Result<Option<crate::RollbackEvent>> {
+        let row = sqlx::query_as::<_, RollbackEventRow>(
+            "SELECT * FROM rollback_events WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update a rollback event
+    pub async fn update_rollback_event(&self, event: &crate::RollbackEvent) -> Result<()> {
+        let id = event.id.ok_or_else(|| {
+            crate::Error::Other("Cannot update rollback event without an ID".to_string())
+        })?;
+
+        sqlx::query(
+            r#"
+            UPDATE rollback_events
+            SET status = ?, error_message = ?, started_at = ?, completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(event.status.as_str())
+        .bind(&event.error_message)
+        .bind(event.started_at.map(|t| t.to_rfc3339()))
+        .bind(event.completed_at.map(|t| t.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all rollback events for a pipeline run
+    pub async fn list_rollback_events(&self, run_id: i64) -> Result<Vec<crate::RollbackEvent>> {
+        let rows = sqlx::query_as::<_, RollbackEventRow>(
+            "SELECT * FROM rollback_events WHERE run_id = ? ORDER BY created_at ASC",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Count rollback events for a specific stage in a run (for loop prevention)
+    pub async fn count_rollback_events_for_stage(
+        &self,
+        run_id: i64,
+        stage_name: &str,
+    ) -> Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM rollback_events WHERE run_id = ? AND rollback_to_stage = ?",
+        )
+        .bind(run_id)
+        .bind(stage_name)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(result)
     }
 }
 
@@ -2607,6 +4915,49 @@ impl TryFrom<PatternRow> for LearningPattern {
 }
 
 #[derive(sqlx::FromRow)]
+struct ScheduleRow {
+    id: i64,
+    name: String,
+    cron_expression: String,
+    agent_type: String,
+    task: String,
+    enabled: bool,
+    last_run: Option<String>,
+    next_run: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ScheduleRow> for Schedule {
+    type Error = crate::Error;
+
+    fn try_from(row: ScheduleRow) -> Result<Self> {
+        Ok(Schedule {
+            id: row.id,
+            name: row.name,
+            cron_expression: row.cron_expression,
+            agent_type: row.agent_type,
+            task: row.task,
+            enabled: row.enabled,
+            last_run: row
+                .last_run
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            next_run: row
+                .next_run
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct WebhookEventRow {
     id: i64,
     delivery_id: String,
@@ -2657,6 +5008,626 @@ impl TryFrom<WebhookEventRow> for WebhookEvent {
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
             updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ScheduleRunRow {
+    id: i64,
+    schedule_id: i64,
+    agent_id: Option<String>,
+    started_at: String,
+    completed_at: Option<String>,
+    status: String,
+    error_message: Option<String>,
+}
+
+impl TryFrom<ScheduleRunRow> for ScheduleRun {
+    type Error = crate::Error;
+
+    fn try_from(row: ScheduleRunRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(ScheduleRun {
+            id: row.id,
+            schedule_id: row.schedule_id,
+            agent_id: row.agent_id,
+            started_at: chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            status: ScheduleRunStatus::from_str(&row.status)?,
+            error_message: row.error_message,
+        })
+    }
+}
+
+// ==================== Pipeline Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct PipelineRow {
+    id: i64,
+    name: String,
+    definition: String,
+    enabled: i32,
+    created_at: String,
+}
+
+impl TryFrom<PipelineRow> for crate::Pipeline {
+    type Error = crate::Error;
+
+    fn try_from(row: PipelineRow) -> Result<Self> {
+        Ok(crate::Pipeline {
+            id: Some(row.id),
+            name: row.name,
+            definition: row.definition,
+            enabled: row.enabled != 0,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PipelineRunRow {
+    id: i64,
+    pipeline_id: i64,
+    status: String,
+    trigger_event: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<PipelineRunRow> for crate::PipelineRun {
+    type Error = crate::Error;
+
+    fn try_from(row: PipelineRunRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(crate::PipelineRun {
+            id: Some(row.id),
+            pipeline_id: row.pipeline_id,
+            status: crate::PipelineRunStatus::from_str(&row.status)?,
+            trigger_event: row.trigger_event,
+            started_at: row
+                .started_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PipelineStageRow {
+    id: i64,
+    run_id: i64,
+    stage_name: String,
+    status: String,
+    agent_id: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<PipelineStageRow> for crate::PipelineStage {
+    type Error = crate::Error;
+
+    fn try_from(row: PipelineStageRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(crate::PipelineStage {
+            id: Some(row.id),
+            run_id: row.run_id,
+            stage_name: row.stage_name,
+            status: crate::PipelineStageStatus::from_str(&row.status)?,
+            agent_id: row.agent_id,
+            started_at: row
+                .started_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RollbackEventRow {
+    id: i64,
+    run_id: i64,
+    failed_stage_name: String,
+    rollback_to_stage: String,
+    trigger_type: String,
+    status: String,
+    error_message: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    created_at: Option<String>,
+}
+
+impl TryFrom<RollbackEventRow> for crate::RollbackEvent {
+    type Error = crate::Error;
+
+    fn try_from(row: RollbackEventRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(crate::RollbackEvent {
+            id: Some(row.id),
+            run_id: row.run_id,
+            failed_stage_name: row.failed_stage_name,
+            rollback_to_stage: row.rollback_to_stage,
+            trigger_type: crate::RollbackTriggerType::from_str(&row.trigger_type)?,
+            status: crate::RollbackStatus::from_str(&row.status)?,
+            error_message: row.error_message,
+            started_at: row
+                .started_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            completed_at: row
+                .completed_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: row
+                .created_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+        })
+    }
+}
+
+impl Database {
+    // Approval Operations
+
+    /// Create a new approval request
+    pub async fn create_approval_request(
+        &self,
+        request: ApprovalRequest,
+    ) -> Result<ApprovalRequest> {
+        let mut request = request;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO approval_requests
+            (stage_id, run_id, status, required_approvers, required_count,
+             approval_count, rejection_count, timeout_seconds, timeout_action,
+             timeout_at, resolved_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(request.stage_id)
+        .bind(request.run_id)
+        .bind(request.status.as_str())
+        .bind(&request.required_approvers)
+        .bind(request.required_count)
+        .bind(request.approval_count)
+        .bind(request.rejection_count)
+        .bind(request.timeout_seconds)
+        .bind(&request.timeout_action)
+        .bind(request.timeout_at.map(|t| t.to_rfc3339()))
+        .bind(request.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(request.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        request.id = Some(result.last_insert_rowid());
+        Ok(request)
+    }
+
+    /// Get an approval request by ID
+    pub async fn get_approval_request(&self, id: i64) -> Result<Option<ApprovalRequest>> {
+        let row = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get approval request by stage ID
+    pub async fn get_approval_request_by_stage(
+        &self,
+        stage_id: i64,
+    ) -> Result<Option<ApprovalRequest>> {
+        let row = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE stage_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(stage_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update an approval request
+    pub async fn update_approval_request(&self, request: &ApprovalRequest) -> Result<()> {
+        let id = request
+            .id
+            .ok_or_else(|| crate::Error::Other("Approval request ID is required".to_string()))?;
+
+        sqlx::query(
+            r#"
+            UPDATE approval_requests
+            SET status = ?, approval_count = ?, rejection_count = ?,
+                required_approvers = ?, resolved_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(request.status.as_str())
+        .bind(request.approval_count)
+        .bind(request.rejection_count)
+        .bind(&request.required_approvers)
+        .bind(request.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List all pending approval requests
+    pub async fn list_pending_approvals(&self) -> Result<Vec<ApprovalRequest>> {
+        let rows = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List approval requests that have timed out
+    pub async fn list_timed_out_approvals(&self) -> Result<Vec<ApprovalRequest>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = sqlx::query_as::<_, ApprovalRequestRow>(
+            r#"
+            SELECT id, stage_id, run_id, status, required_approvers, required_count,
+                   approval_count, rejection_count, timeout_seconds, timeout_action,
+                   timeout_at, resolved_at, created_at
+            FROM approval_requests
+            WHERE status = 'pending'
+              AND timeout_at IS NOT NULL
+              AND timeout_at < ?
+            ORDER BY timeout_at ASC
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Create an approval decision
+    pub async fn create_approval_decision(
+        &self,
+        decision: ApprovalDecision,
+    ) -> Result<ApprovalDecision> {
+        let mut decision = decision;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO approval_decisions
+            (approval_id, approver, decision, comment, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(decision.approval_id)
+        .bind(&decision.approver)
+        .bind(decision.decision as i32)
+        .bind(&decision.comment)
+        .bind(decision.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        decision.id = Some(result.last_insert_rowid());
+        Ok(decision)
+    }
+
+    /// Get all decisions for an approval request
+    pub async fn get_approval_decisions(&self, approval_id: i64) -> Result<Vec<ApprovalDecision>> {
+        let rows = sqlx::query_as::<_, ApprovalDecisionRow>(
+            r#"
+            SELECT id, approval_id, approver, decision, comment, created_at
+            FROM approval_decisions
+            WHERE approval_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(approval_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+}
+
+// Database row types for approval
+
+#[derive(sqlx::FromRow)]
+struct ApprovalRequestRow {
+    id: i64,
+    stage_id: i64,
+    run_id: i64,
+    status: String,
+    required_approvers: String,
+    required_count: i32,
+    approval_count: i32,
+    rejection_count: i32,
+    timeout_seconds: Option<i64>,
+    timeout_action: Option<String>,
+    timeout_at: Option<String>,
+    resolved_at: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ApprovalRequestRow> for ApprovalRequest {
+    type Error = crate::Error;
+
+    fn try_from(row: ApprovalRequestRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(Self {
+            id: Some(row.id),
+            stage_id: row.stage_id,
+            run_id: row.run_id,
+            status: ApprovalStatus::from_str(&row.status)?,
+            required_approvers: row.required_approvers,
+            required_count: row.required_count,
+            approval_count: row.approval_count,
+            rejection_count: row.rejection_count,
+            timeout_seconds: row.timeout_seconds,
+            timeout_action: row.timeout_action,
+            timeout_at: row
+                .timeout_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            resolved_at: row
+                .resolved_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(Into::into),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ApprovalDecisionRow {
+    id: i64,
+    approval_id: i64,
+    approver: String,
+    decision: i32,
+    comment: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<ApprovalDecisionRow> for ApprovalDecision {
+    type Error = crate::Error;
+
+    fn try_from(row: ApprovalDecisionRow) -> Result<Self> {
+        Ok(Self {
+            id: Some(row.id),
+            approval_id: row.approval_id,
+            approver: row.approver,
+            decision: row.decision != 0,
+            comment: row.comment,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+// ==================== Success Pattern Row Struct ====================
+
+#[derive(sqlx::FromRow)]
+struct SuccessPatternRow {
+    id: i64,
+    pattern_type: String,
+    agent_type: Option<String>,
+    task_type: Option<String>,
+    pattern_signature: String,
+    pattern_data: String,
+    occurrence_count: i64,
+    avg_completion_time_ms: Option<i64>,
+    avg_token_usage: Option<i64>,
+    success_rate: f64,
+    first_seen_at: String,
+    last_seen_at: String,
+}
+
+impl TryFrom<SuccessPatternRow> for SuccessPattern {
+    type Error = crate::Error;
+
+    fn try_from(row: SuccessPatternRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(SuccessPattern {
+            id: row.id,
+            pattern_type: SuccessPatternType::from_str(&row.pattern_type)?,
+            agent_type: row
+                .agent_type
+                .map(|s| AgentType::from_str(&s))
+                .transpose()?,
+            task_type: row.task_type,
+            pattern_signature: row.pattern_signature,
+            pattern_data: serde_json::from_str(&row.pattern_data)
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
+            occurrence_count: row.occurrence_count,
+            avg_completion_time_ms: row.avg_completion_time_ms,
+            avg_token_usage: row.avg_token_usage,
+            success_rate: row.success_rate,
+            first_seen_at: chrono::DateTime::parse_from_rfc3339(&row.first_seen_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            last_seen_at: chrono::DateTime::parse_from_rfc3339(&row.last_seen_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+// ==================== Feedback Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct FeedbackRow {
+    id: i64,
+    agent_id: String,
+    message_id: Option<i64>,
+    rating: String,
+    comment: Option<String>,
+    source: String,
+    created_by: String,
+    created_at: String,
+}
+
+impl TryFrom<FeedbackRow> for Feedback {
+    type Error = crate::Error;
+
+    fn try_from(row: FeedbackRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        Ok(Feedback {
+            id: row.id,
+            agent_id: Uuid::parse_str(&row.agent_id)
+                .map_err(|e| crate::Error::Other(e.to_string()))?,
+            message_id: row.message_id,
+            rating: FeedbackRating::from_str(&row.rating)?,
+            comment: row.comment,
+            source: FeedbackSource::from_str(&row.source)?,
+            created_by: row.created_by,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct FeedbackStatsRow {
+    #[allow(dead_code)]
+    total: i64,
+    positive: i64,
+    negative: i64,
+    neutral: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct FeedbackStatsByTypeRow {
+    agent_type: String,
+    #[allow(dead_code)]
+    total: i64,
+    positive: i64,
+    negative: i64,
+    neutral: i64,
+}
+
+// ==================== Environment Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct EnvironmentRow {
+    id: i64,
+    name: String,
+    #[sqlx(rename = "type")]
+    env_type: String,
+    url: Option<String>,
+    provider: Option<String>,
+    config: String,
+    secrets: String,
+    requires_approval: i64,
+    created_at: String,
+}
+
+impl TryFrom<EnvironmentRow> for Environment {
+    type Error = crate::Error;
+
+    fn try_from(row: EnvironmentRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        let secrets_manager = SecretsManager::new(&get_encryption_key());
+
+        // Deserialize config
+        let config: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&row.config)
+                .map_err(|e| crate::Error::Other(e.to_string()))?;
+
+        // Decrypt secrets
+        let secrets = secrets_manager
+            .decrypt_secrets(&row.secrets)
+            .unwrap_or_default();
+
+        Ok(Environment {
+            id: row.id,
+            name: row.name,
+            env_type: EnvironmentType::from_str(&row.env_type)?,
+            url: row.url,
+            provider: row.provider,
+            config,
+            secrets,
+            requires_approval: row.requires_approval != 0,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
                 .map_err(|e| crate::Error::Other(e.to_string()))?
                 .into(),
         })

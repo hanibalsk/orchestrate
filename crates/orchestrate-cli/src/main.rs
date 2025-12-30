@@ -4,12 +4,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_claude::{AgentLoop, ClaudeCliClient, ClaudeClient};
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CustomInstruction, Database, Epic, EpicStatus,
-    LearningEngine, PatternStatus, ShellState, Story, StoryStatus, Worktree,
+    Agent, AgentState, AgentType, CreateEnvironment, CreateFeatureFlag, CustomInstruction, Database,
+    DeploymentRollback, Epic, EpicStatus, EnvironmentType, FlagStatus,
+    LearningEngine, PatternStatus, PreDeployValidator, RollbackRequest, Schedule, ScheduleRun,
+    ShellState, Story, StoryStatus, ValidationStatus, Worktree,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use uuid::Uuid;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
@@ -106,11 +109,6 @@ enum Commands {
         #[command(subcommand)]
         action: StoryAction,
     },
-    /// Test generation and management
-    Test {
-        #[command(subcommand)]
-        action: TestAction,
-    },
     /// Start web interface
     Web {
         #[arg(short, long, default_value = "8080")]
@@ -146,10 +144,50 @@ enum Commands {
         #[command(subcommand)]
         action: TokensAction,
     },
+    /// Schedule management
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Webhook server management
     Webhook {
         #[command(subcommand)]
         action: WebhookAction,
+    },
+    /// Pipeline management
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
+    /// Approval management
+    Approval {
+        #[command(subcommand)]
+        action: ApprovalAction,
+    },
+    /// Feedback collection
+    Feedback {
+        #[command(subcommand)]
+        action: FeedbackAction,
+    },
+    /// Environment management
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
+    },
+    /// Deployment management
+    Deploy {
+        #[command(subcommand)]
+        action: DeployAction,
+    },
+    /// Feature flags management
+    Flags {
+        #[command(subcommand)]
+        action: FlagsAction,
+    },
+    /// Release management
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
     },
 }
 
@@ -400,6 +438,36 @@ enum LearnAction {
         /// Instruction ID or name
         id_or_name: String,
     },
+    /// List success patterns
+    Successes {
+        /// Filter by pattern type (tool_sequence, prompt_structure, context_size, model_choice, timing)
+        #[arg(short = 't', long)]
+        pattern_type: Option<String>,
+        /// Filter by agent type
+        #[arg(short = 'a', long)]
+        agent_type: Option<String>,
+        /// Show detailed pattern data
+        #[arg(long)]
+        detailed: bool,
+    },
+    /// Get success recommendations for an agent type
+    Recommend {
+        /// Agent type to get recommendations for
+        #[arg(short = 't', long)]
+        agent_type: String,
+        /// Task type to filter recommendations
+        #[arg(long)]
+        task_type: Option<String>,
+    },
+    /// Cleanup old success patterns
+    CleanupSuccesses {
+        /// Remove patterns older than this many days
+        #[arg(short, long, default_value = "90")]
+        days: i64,
+        /// Skip confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -490,6 +558,70 @@ enum TokensAction {
 }
 
 #[derive(Subcommand)]
+enum ScheduleAction {
+    /// Add a new schedule
+    Add {
+        /// Schedule name
+        #[arg(short, long)]
+        name: String,
+        /// Cron expression
+        #[arg(short, long)]
+        cron: String,
+        /// Agent type
+        #[arg(short, long)]
+        agent: String,
+        /// Task description
+        #[arg(short, long)]
+        task: String,
+    },
+    /// List all schedules
+    List,
+    /// Show schedule details
+    Show {
+        /// Schedule name
+        name: String,
+    },
+    /// Pause a schedule
+    Pause {
+        /// Schedule name
+        name: String,
+    },
+    /// Resume a schedule
+    Resume {
+        /// Schedule name
+        name: String,
+    },
+    /// Delete a schedule
+    Delete {
+        /// Schedule name
+        name: String,
+    },
+    /// Run a schedule immediately
+    RunNow {
+        /// Schedule name
+        name: String,
+    },
+    /// Show schedule execution history
+    History {
+        /// Schedule name
+        name: String,
+        /// Number of runs to show
+        #[arg(short, long, default_value = "10")]
+        limit: i64,
+    },
+    /// Add a schedule from a built-in template
+    AddTemplate {
+        /// Template name (security-scan, dependency-check, code-quality, documentation-check, database-backup)
+        template_name: String,
+        /// Optional custom schedule name (defaults to template name)
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// List available schedule templates
+    ListTemplates,
+}
+
+#[derive(Subcommand)]
 enum WebhookAction {
     /// Start webhook server
     Start {
@@ -535,126 +667,453 @@ enum SecretAction {
 }
 
 #[derive(Subcommand)]
-enum TestAction {
-    /// Generate unit tests for a file
-    Generate {
-        /// Type of tests to generate (unit, integration, e2e, property)
-        #[arg(short = 't', long, default_value = "unit")]
-        test_type: String,
-        /// Target file to generate tests for (for unit/integration tests)
-        #[arg(long, conflicts_with = "story")]
-        target: Option<PathBuf>,
-        /// Story ID to generate E2E tests from (for e2e tests)
-        #[arg(long, conflicts_with = "target")]
-        story: Option<String>,
-        /// Output file path (defaults to language-appropriate location)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        /// Write tests to file (default: print to stdout)
-        #[arg(short, long)]
-        write: bool,
-        /// Platform for E2E tests (playwright, cypress, api, cli)
-        #[arg(long)]
-        platform: Option<String>,
-    },
-    /// Analyze test coverage
-    Coverage {
-        /// Language/framework (rust, typescript, python)
-        #[arg(short, long, default_value = "rust")]
-        language: String,
-        /// Coverage report format (lcov, cobertura)
-        #[arg(short, long)]
-        format: Option<String>,
-        /// Path to existing coverage report (skips running tests)
-        #[arg(short, long)]
-        report: Option<PathBuf>,
-        /// Coverage threshold percentage (0-100)
-        #[arg(short, long)]
-        threshold: Option<f64>,
-        /// Module name to set threshold for
-        #[arg(short, long)]
-        module: Option<String>,
-        /// Show coverage history
-        #[arg(long)]
-        history: bool,
-        /// Limit for history results
-        #[arg(long, default_value = "10")]
-        limit: i64,
-        /// Analyze coverage only for changed files (git diff)
-        #[arg(long)]
-        diff: bool,
-        /// Base branch for diff comparison (default: main)
-        #[arg(long, default_value = "main", requires = "diff")]
-        base: String,
-    },
-    /// Validate test quality
-    Validate {
-        /// Test file to validate
-        #[arg(short, long)]
+enum PipelineAction {
+    /// Create pipeline from YAML file
+    Create {
+        /// Path to YAML file
         file: PathBuf,
-        /// Run mutation testing
-        #[arg(long)]
-        mutation: bool,
-        /// Source file for mutation testing
-        #[arg(long, requires = "mutation")]
-        source: Option<PathBuf>,
-        /// Store report in database
-        #[arg(long)]
-        store: bool,
-        /// Output format (text, json)
-        #[arg(short, long, default_value = "text")]
-        output: String,
     },
-    /// Run tests
+    /// List all pipelines
+    List {
+        /// Show only enabled pipelines
+        #[arg(long)]
+        enabled_only: bool,
+    },
+    /// Show pipeline definition
+    Show {
+        /// Pipeline name
+        name: String,
+    },
+    /// Update pipeline from YAML file
+    Update {
+        /// Pipeline name
+        name: String,
+        /// Path to YAML file
+        file: PathBuf,
+    },
+    /// Delete pipeline
+    Delete {
+        /// Pipeline name
+        name: String,
+    },
+    /// Enable pipeline
+    Enable {
+        /// Pipeline name
+        name: String,
+    },
+    /// Disable pipeline
+    Disable {
+        /// Pipeline name
+        name: String,
+    },
+    /// Trigger pipeline manually
     Run {
-        /// Language/framework (rust, typescript, python)
-        #[arg(short, long, default_value = "rust")]
-        language: String,
-        /// Run tests only for changed code
+        /// Pipeline name
+        name: String,
+        /// Dry run - show what would be done without executing
         #[arg(long)]
-        changed: bool,
-        /// Base branch for changed comparison (default: main)
-        #[arg(long, default_value = "main", requires = "changed")]
-        base: String,
-        /// Test pattern to filter tests
-        #[arg(long)]
-        pattern: Option<String>,
-        /// Verbose test output
-        #[arg(short = 'V', long)]
-        verbose_tests: bool,
+        dry_run: bool,
     },
-    /// Generate comprehensive test report
-    Report {
-        /// Output format (text, json, markdown, html)
-        #[arg(short, long, default_value = "text")]
-        format: String,
-        /// Output file path (defaults to stdout)
+    /// Show pipeline run status
+    Status {
+        /// Run ID
+        run_id: i64,
+    },
+    /// Cancel running pipeline
+    Cancel {
+        /// Run ID
+        run_id: i64,
+    },
+    /// Show pipeline run history
+    History {
+        /// Pipeline name
+        name: String,
+        /// Number of runs to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Initialize pipeline from template
+    Init {
+        /// Template name (ci, cd, release, security)
+        template: Option<String>,
+        /// Output file path
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Include coverage metrics
+        /// List available templates
         #[arg(long)]
-        include_coverage: bool,
-        /// Include test quality metrics
-        #[arg(long)]
-        include_quality: bool,
-    },
-    /// Analyze PR changes and suggest tests
-    AnalyzePr {
-        /// PR number to analyze
+        list: bool,
+        /// Force overwrite existing file
         #[arg(short, long)]
-        pr: Option<i32>,
-        /// Base reference (e.g., main)
-        #[arg(long, default_value = "main")]
-        base: String,
-        /// Head reference (e.g., feature-branch). If not provided, uses current branch
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalAction {
+    /// List approval requests
+    List {
+        /// Show only pending approvals
         #[arg(long)]
-        head: Option<String>,
-        /// Post results as PR comment
+        pending: bool,
+    },
+    /// Approve a request
+    Approve {
+        /// Approval request ID
+        id: i64,
+        /// Optional comment
+        #[arg(short, long)]
+        comment: Option<String>,
+    },
+    /// Reject a request
+    Reject {
+        /// Approval request ID
+        id: i64,
+        /// Reason for rejection
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+    /// Delegate approval to another user
+    Delegate {
+        /// Approval request ID
+        id: i64,
+        /// User to delegate to
         #[arg(long)]
-        comment: bool,
-        /// Output format (text, json, markdown)
-        #[arg(short, long, default_value = "text")]
-        output: String,
+        to: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FeedbackAction {
+    /// Add feedback for an agent
+    Add {
+        /// Agent ID (UUID)
+        agent_id: String,
+        /// Rating (positive, negative, neutral, +, -, pos, neg)
+        #[arg(short, long)]
+        rating: String,
+        /// Optional comment
+        #[arg(short, long)]
+        comment: Option<String>,
+        /// Optional message ID for specific output feedback
+        #[arg(short, long)]
+        message_id: Option<i64>,
+    },
+    /// List feedback
+    List {
+        /// Filter by agent ID
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Filter by rating (positive, negative, neutral)
+        #[arg(short, long)]
+        rating: Option<String>,
+        /// Filter by source (cli, web, slack, api, automated)
+        #[arg(short, long)]
+        source: Option<String>,
+        /// Maximum number of results
+        #[arg(long, default_value = "50")]
+        limit: i64,
+    },
+    /// Show feedback statistics
+    Stats {
+        /// Show stats for specific agent
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Group stats by agent type
+        #[arg(long)]
+        by_type: bool,
+    },
+    /// Delete feedback
+    Delete {
+        /// Feedback ID
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnvAction {
+    /// List all environments
+    List {
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Create a new environment
+    Create {
+        /// Environment name (e.g., staging, production)
+        name: String,
+        /// Environment type (dev, staging, production)
+        #[arg(short, long)]
+        env_type: String,
+        /// Environment URL
+        #[arg(short, long)]
+        url: Option<String>,
+        /// Deployment provider (aws, k8s, etc.)
+        #[arg(short, long)]
+        provider: Option<String>,
+        /// Configuration as JSON
+        #[arg(short, long)]
+        config: Option<String>,
+        /// Secrets as JSON (will be encrypted)
+        #[arg(short, long)]
+        secrets: Option<String>,
+        /// Require approval for deployments
+        #[arg(long)]
+        requires_approval: bool,
+    },
+    /// Show environment details
+    Show {
+        /// Environment name
+        name: String,
+        /// Include secrets in output
+        #[arg(long)]
+        show_secrets: bool,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Delete an environment
+    Delete {
+        /// Environment name
+        name: String,
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployAction {
+    /// Deploy a version to an environment
+    #[command(name = "deploy", visible_alias = "run")]
+    Deploy {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Version to deploy
+        #[arg(long)]
+        version: String,
+        /// Deployment strategy (rolling, blue-green, canary, recreate)
+        #[arg(long)]
+        strategy: Option<String>,
+        /// Deployment provider (override environment default)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Timeout in seconds
+        #[arg(long)]
+        timeout: Option<u32>,
+        /// Skip pre-deployment validation
+        #[arg(long)]
+        skip_validation: bool,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Show current deployment status for an environment
+    Status {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Show deployment history for an environment
+    History {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Maximum number of deployments to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Show differences between current and target deployment
+    Diff {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Target version to compare against
+        #[arg(long)]
+        version: String,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Validate environment is ready for deployment
+    Validate {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Version to validate (optional)
+        #[arg(long)]
+        version: Option<String>,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Rollback deployment to a previous version
+    Rollback {
+        /// Environment name (e.g., staging, production)
+        #[arg(short, long)]
+        env: String,
+        /// Specific version to rollback to (defaults to previous successful)
+        #[arg(long)]
+        version: Option<String>,
+        /// Skip pre-deployment validation
+        #[arg(long)]
+        skip_validation: bool,
+        /// Force rollback even if current deployment is successful
+        #[arg(long)]
+        force: bool,
+        /// Output format (table, json)
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseAction {
+    /// Prepare a new release (bump version, generate changelog)
+    Prepare {
+        /// Version bump type (major, minor, patch)
+        #[arg(short, long)]
+        r#type: String,
+        /// Path to workspace Cargo.toml
+        #[arg(long, default_value = "./Cargo.toml")]
+        cargo_toml: PathBuf,
+        /// Path to CHANGELOG.md
+        #[arg(long, default_value = "./CHANGELOG.md")]
+        changelog: PathBuf,
+        /// Also bump frontend package.json if it exists
+        #[arg(long)]
+        bump_frontend: bool,
+    },
+    /// Create and tag a release
+    Create {
+        /// Version to release (e.g., 1.2.3)
+        #[arg(short, long)]
+        version: String,
+        /// Release message (defaults to changelog entry)
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Push tag to remote
+        #[arg(long)]
+        push: bool,
+    },
+    /// Publish a release (create GitHub release, upload assets)
+    Publish {
+        /// Version to publish (e.g., 1.2.3)
+        #[arg(long)]
+        version: String,
+        /// Path to repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        repo_path: PathBuf,
+        /// GitHub token (or use GITHUB_TOKEN env var)
+        #[arg(long, env = "GITHUB_TOKEN")]
+        token: Option<String>,
+        /// Make release a pre-release
+        #[arg(long)]
+        prerelease: bool,
+        /// Make release a draft
+        #[arg(long)]
+        draft: bool,
+    },
+    /// Generate release notes between two tags
+    Notes {
+        /// Starting tag (e.g., v1.0.0)
+        #[arg(short, long)]
+        from: String,
+        /// Ending tag (e.g., v1.1.0, or HEAD for unreleased)
+        #[arg(short, long)]
+        to: String,
+        /// Path to repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        repo_path: PathBuf,
+        /// Output format (markdown, json)
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlagsAction {
+    /// List feature flags
+    List {
+        /// Filter by environment
+        #[arg(short, long)]
+        environment: Option<String>,
+        /// Output format (table, json)
+        #[arg(short = 'f', long, default_value = "table")]
+        format: String,
+    },
+    /// Create a new feature flag
+    Create {
+        /// Flag key (unique identifier)
+        #[arg(short, long)]
+        key: String,
+        /// Human-readable name
+        #[arg(short, long)]
+        name: String,
+        /// Description
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Initial status (enabled, disabled, conditional)
+        #[arg(short, long, default_value = "disabled")]
+        status: String,
+        /// Rollout percentage (0-100)
+        #[arg(short, long, default_value = "100")]
+        rollout: i32,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Get feature flag details
+    Show {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+        /// Output format (table, json)
+        #[arg(short = 'f', long, default_value = "table")]
+        format: String,
+    },
+    /// Enable a feature flag
+    Enable {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Disable a feature flag
+    Disable {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Set rollout percentage for gradual rollout
+    Rollout {
+        /// Flag key
+        key: String,
+        /// Rollout percentage (0-100)
+        #[arg(short, long)]
+        percentage: i32,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
+    },
+    /// Delete a feature flag
+    Delete {
+        /// Flag key
+        key: String,
+        /// Environment (omit for global)
+        #[arg(short, long)]
+        environment: Option<String>,
     },
 }
 
@@ -1425,6 +1884,128 @@ async fn main() -> Result<()> {
                     instruction.name, instruction.id
                 );
             }
+            LearnAction::Successes {
+                pattern_type,
+                agent_type,
+                detailed,
+            } => {
+                use orchestrate_core::SuccessPatternType;
+
+                let type_filter = pattern_type
+                    .as_ref()
+                    .map(|t| SuccessPatternType::from_str(t))
+                    .transpose()?;
+
+                let patterns = db.list_success_patterns(type_filter, 100).await?;
+
+                // Filter by agent type if specified
+                let patterns: Vec<_> = if let Some(ref at) = agent_type {
+                    let agent_type_filter = parse_agent_type(at)?;
+                    patterns
+                        .into_iter()
+                        .filter(|p| p.agent_type == Some(agent_type_filter))
+                        .collect()
+                } else {
+                    patterns
+                };
+
+                if patterns.is_empty() {
+                    println!("No success patterns found");
+                    return Ok(());
+                }
+
+                println!("Success Patterns");
+                println!("{}", "=".repeat(80));
+                println!(
+                    "{:<6} {:<18} {:<15} {:<10} {:<8} {:<8} {:<12}",
+                    "ID", "TYPE", "AGENT_TYPE", "TASK", "COUNT", "RATE", "AVG_TIME"
+                );
+                println!("{}", "-".repeat(80));
+
+                for pattern in &patterns {
+                    let task_type = pattern
+                        .task_type
+                        .as_ref()
+                        .map(|s| if s.len() > 10 { &s[..10] } else { s })
+                        .unwrap_or("-");
+                    let agent_type_str = pattern
+                        .agent_type
+                        .map(|t| t.as_str().to_string())
+                        .unwrap_or_else(|| "global".to_string());
+                    let avg_time = pattern
+                        .avg_completion_time_ms
+                        .map(|t| format!("{}ms", t))
+                        .unwrap_or_else(|| "-".to_string());
+
+                    println!(
+                        "{:<6} {:<18} {:<15} {:<10} {:<8} {:<8.2} {:<12}",
+                        pattern.id,
+                        pattern.pattern_type.as_str(),
+                        agent_type_str,
+                        task_type,
+                        pattern.occurrence_count,
+                        pattern.success_rate,
+                        avg_time
+                    );
+
+                    if detailed {
+                        println!("  Data: {}", serde_json::to_string(&pattern.pattern_data)?);
+                    }
+                }
+            }
+            LearnAction::Recommend {
+                agent_type,
+                task_type,
+            } => {
+                let agent_type_parsed = parse_agent_type(&agent_type)?;
+                let engine = LearningEngine::new();
+                let recommendations = engine
+                    .get_success_recommendations(&db, agent_type_parsed, task_type.as_deref())
+                    .await?;
+
+                println!("Success Recommendations for {}", agent_type);
+                println!("{}", "=".repeat(60));
+
+                if let Some(msg_count) = recommendations.recommended_message_count {
+                    println!("Recommended message count: {}", msg_count);
+                }
+                if let Some(time) = recommendations.expected_completion_time_ms {
+                    let seconds = time / 1000;
+                    if seconds > 60 {
+                        println!("Expected completion time: {}m {}s", seconds / 60, seconds % 60);
+                    } else {
+                        println!("Expected completion time: {}s", seconds);
+                    }
+                }
+
+                if !recommendations.successful_prompt_features.is_empty() {
+                    println!("\nSuccessful prompt features:");
+                    for feature in &recommendations.successful_prompt_features {
+                        println!("  - {}", feature);
+                    }
+                }
+
+                if !recommendations.recommended_tool_sequences.is_empty() {
+                    println!("\nCommon tool sequences:");
+                    for (i, seq) in recommendations.recommended_tool_sequences.iter().take(5).enumerate() {
+                        println!("  {}. {}", i + 1, seq.join(" → "));
+                    }
+                }
+            }
+            LearnAction::CleanupSuccesses { days, force } => {
+                if !force {
+                    println!(
+                        "This will delete success patterns older than {} days with < 5 occurrences.",
+                        days
+                    );
+                    println!("Use --force to skip this confirmation.");
+                    // In a real CLI we'd prompt for confirmation here
+                    return Ok(());
+                }
+
+                let deleted = db.cleanup_old_success_patterns(days).await?;
+                println!("Deleted {} old success patterns", deleted);
+            }
         },
 
         Commands::History { action } => match action {
@@ -1877,6 +2458,264 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Schedule { action } => match action {
+            ScheduleAction::Add {
+                name,
+                cron,
+                agent,
+                task,
+            } => {
+                // Create and validate schedule
+                let mut schedule = Schedule::new(name.clone(), cron.clone(), agent.clone(), task.clone());
+
+                // Validate cron expression
+                if let Err(e) = schedule.validate_cron() {
+                    anyhow::bail!("Invalid cron expression: {}", e);
+                }
+
+                // Check if schedule with this name already exists
+                if db.get_schedule_by_name(&name).await?.is_some() {
+                    anyhow::bail!("Schedule '{}' already exists", name);
+                }
+
+                // Calculate next run
+                schedule.update_next_run()?;
+
+                // Insert into database
+                let id = db.insert_schedule(&schedule).await?;
+
+                println!("Schedule '{}' added successfully (ID: {})", name, id);
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+            }
+
+            ScheduleAction::List => {
+                let schedules = db.list_schedules(false).await?;
+
+                if schedules.is_empty() {
+                    println!("No schedules found");
+                    return Ok(());
+                }
+
+                println!("{:<20} {:<15} {:<20} {:<10} {:<25}", "NAME", "CRON", "AGENT", "STATUS", "NEXT RUN");
+                println!("{}", "-".repeat(100));
+
+                for schedule in schedules {
+                    let status = if schedule.enabled { "enabled" } else { "disabled" };
+                    let next_run = schedule.next_run
+                        .map(|nr| nr.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "-".to_string());
+
+                    println!(
+                        "{:<20} {:<15} {:<20} {:<10} {:<25}",
+                        schedule.name,
+                        schedule.cron_expression,
+                        schedule.agent_type,
+                        status,
+                        next_run
+                    );
+                }
+            }
+
+            ScheduleAction::Show { name } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                println!("Schedule: {}", schedule.name);
+                println!("Cron: {}", schedule.cron_expression);
+                println!("Agent: {}", schedule.agent_type);
+                println!("Task: {}", schedule.task);
+                println!("Enabled: {}", schedule.enabled);
+                println!("Created: {}", schedule.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+
+                if let Some(last_run) = schedule.last_run {
+                    println!("Last run: {}", last_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+
+                // Show recent runs
+                let runs = db.get_schedule_runs(schedule.id, 5).await?;
+                if !runs.is_empty() {
+                    println!("\nRecent executions:");
+                    for run in runs {
+                        let status = format!("{:?}", run.status);
+                        let duration = run.completed_at
+                            .map(|c| format!("{:.1}s", c.signed_duration_since(run.started_at).num_milliseconds() as f64 / 1000.0))
+                            .unwrap_or_else(|| "-".to_string());
+                        println!("  {} - {} ({})",
+                            run.started_at.format("%Y-%m-%d %H:%M:%S"),
+                            status,
+                            duration
+                        );
+                    }
+                }
+            }
+
+            ScheduleAction::Pause { name } => {
+                let mut schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                schedule.enabled = false;
+                db.update_schedule(&schedule).await?;
+
+                println!("Schedule '{}' paused", name);
+            }
+
+            ScheduleAction::Resume { name } => {
+                let mut schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                schedule.enabled = true;
+                // Recalculate next run when resuming
+                schedule.update_next_run()?;
+                db.update_schedule(&schedule).await?;
+
+                println!("Schedule '{}' resumed", name);
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+            }
+
+            ScheduleAction::Delete { name } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                let deleted = db.delete_schedule(schedule.id).await?;
+
+                if deleted {
+                    println!("Schedule '{}' deleted", name);
+                } else {
+                    println!("Failed to delete schedule '{}'", name);
+                }
+            }
+
+            ScheduleAction::RunNow { name } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                // Create a schedule run record
+                let mut run = ScheduleRun::new(schedule.id);
+                let run_id = db.insert_schedule_run(&run).await?;
+
+                // Spawn the agent
+                let agent_type = parse_agent_type(&schedule.agent_type)?;
+                let agent = Agent::new(agent_type, schedule.task.clone());
+                db.insert_agent(&agent).await?;
+
+                // Update run record with agent ID
+                run.mark_completed(agent.id.to_string());
+                db.update_schedule_run(&run).await?;
+
+                println!("Triggered schedule '{}' (run ID: {}, agent ID: {})", name, run_id, agent.id);
+            }
+
+            ScheduleAction::History { name, limit } => {
+                let schedule = db.get_schedule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Schedule not found: {}", name))?;
+
+                let runs = db.get_schedule_runs(schedule.id, limit).await?;
+
+                if runs.is_empty() {
+                    println!("No execution history for schedule '{}'", name);
+                    return Ok(());
+                }
+
+                println!("Execution history for '{}' (last {} runs)", name, limit);
+                println!("{:<20} {:<15} {:<38} {:<10}", "STARTED", "STATUS", "AGENT", "DURATION");
+                println!("{}", "-".repeat(90));
+
+                for run in runs {
+                    let status = format!("{:?}", run.status);
+                    let agent_id = run.agent_id.as_deref().unwrap_or("-");
+                    let duration = run.completed_at
+                        .map(|c| format!("{:.1}s", c.signed_duration_since(run.started_at).num_milliseconds() as f64 / 1000.0))
+                        .unwrap_or_else(|| "-".to_string());
+
+                    println!(
+                        "{:<20} {:<15} {:<38} {:<10}",
+                        run.started_at.format("%Y-%m-%d %H:%M:%S"),
+                        status,
+                        agent_id,
+                        duration
+                    );
+
+                    if let Some(error) = &run.error_message {
+                        println!("  Error: {}", error);
+                    }
+                }
+            }
+
+            ScheduleAction::AddTemplate { template_name, name } => {
+                // Get the template
+                let template = orchestrate_core::schedule_template::get_template(&template_name)
+                    .ok_or_else(|| anyhow::anyhow!("Template '{}' not found. Use 'orchestrate schedule list-templates' to see available templates", template_name))?;
+
+                // Use custom name if provided, otherwise use template name
+                let schedule_name = name.as_ref().unwrap_or(&template.name).clone();
+
+                // Check if schedule with this name already exists
+                if db.get_schedule_by_name(&schedule_name).await?.is_some() {
+                    anyhow::bail!("Schedule '{}' already exists", schedule_name);
+                }
+
+                // Create schedule from template
+                let mut schedule = Schedule::new(
+                    schedule_name.clone(),
+                    template.cron.clone(),
+                    template.agent.clone(),
+                    template.task.clone(),
+                );
+
+                // Calculate next run
+                schedule.update_next_run()?;
+
+                // Insert into database
+                let id = db.insert_schedule(&schedule).await?;
+
+                println!("Schedule '{}' created from template '{}'", schedule_name, template_name);
+                println!("Description: {}", template.description);
+                println!("Cron: {}", template.cron);
+                println!("Agent: {}", template.agent);
+                if let Some(next_run) = schedule.next_run {
+                    println!("Next run: {}", next_run.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+                println!("Schedule ID: {}", id);
+            }
+
+            ScheduleAction::ListTemplates => {
+                use orchestrate_core::schedule_template;
+
+                let templates = schedule_template::get_templates();
+
+                if templates.is_empty() {
+                    println!("No templates available");
+                    return Ok(());
+                }
+
+                println!("Available schedule templates:\n");
+
+                // Sort by name for consistent output
+                let mut template_names: Vec<String> = templates.keys().cloned().collect();
+                template_names.sort();
+
+                for name in template_names {
+                    let template = &templates[&name];
+                    println!("Template: {}", template.name);
+                    println!("  Description: {}", template.description);
+                    println!("  Schedule: {}", template.cron);
+                    println!("  Agent: {}", template.agent);
+                    println!("  Task: {}", template.task);
+                    println!();
+                }
+
+                println!("To add a template, use: orchestrate schedule add-template <template-name>");
+            }
+        },
+
         Commands::Webhook { action } => match action {
             WebhookAction::Start { port, secret } => {
                 handle_webhook_start(db, port, secret).await?;
@@ -1903,94 +2742,241 @@ async fn main() -> Result<()> {
             },
         },
 
-        Commands::Test { action } => match action {
-            TestAction::Generate {
-                test_type,
-                target,
-                story,
-                output,
-                write,
-                platform,
-            } => {
-                handle_test_generate(
-                    &db,
-                    &test_type,
-                    target.as_deref(),
-                    story.as_deref(),
-                    output.as_deref(),
-                    write,
-                    platform.as_deref(),
-                )
-                .await?;
+        Commands::Pipeline { action } => match action {
+            PipelineAction::Create { file } => {
+                handle_pipeline_create(&db, &file).await?;
             }
-            TestAction::Coverage {
-                language,
-                format,
-                report,
-                threshold,
-                module,
-                history,
-                limit,
-                diff,
-                base,
-            } => {
-                handle_test_coverage(
-                    &db,
-                    &language,
-                    format.as_deref(),
-                    report.as_deref(),
-                    threshold,
-                    module.as_deref(),
-                    history,
-                    limit,
-                    diff,
-                    &base,
-                )
-                .await?;
+            PipelineAction::List { enabled_only } => {
+                handle_pipeline_list(&db, enabled_only).await?;
             }
-            TestAction::Validate {
-                file,
-                mutation,
-                source,
-                store,
-                output,
-            } => {
-                handle_test_validate(&db, &file, mutation, source.as_deref(), store, &output)
-                    .await?;
+            PipelineAction::Show { name } => {
+                handle_pipeline_show(&db, &name).await?;
             }
-            TestAction::Run {
-                language,
-                changed,
-                base,
-                pattern,
-                verbose_tests,
-            } => {
-                handle_test_run(&db, &language, changed, &base, pattern.as_deref(), verbose_tests)
-                    .await?;
+            PipelineAction::Update { name, file } => {
+                handle_pipeline_update(&db, &name, &file).await?;
             }
-            TestAction::Report {
-                format,
-                output,
-                include_coverage,
-                include_quality,
-            } => {
-                handle_test_report(
-                    &db,
-                    &format,
-                    output.as_deref(),
-                    include_coverage,
-                    include_quality,
-                )
-                .await?;
+            PipelineAction::Delete { name } => {
+                handle_pipeline_delete(&db, &name).await?;
             }
-            TestAction::AnalyzePr {
-                pr,
-                base,
-                head,
+            PipelineAction::Enable { name } => {
+                handle_pipeline_enable(&db, &name).await?;
+            }
+            PipelineAction::Disable { name } => {
+                handle_pipeline_disable(&db, &name).await?;
+            }
+            PipelineAction::Run { name, dry_run } => {
+                handle_pipeline_run(&db, &name, dry_run).await?;
+            }
+            PipelineAction::Status { run_id } => {
+                handle_pipeline_status(&db, run_id).await?;
+            }
+            PipelineAction::Cancel { run_id } => {
+                handle_pipeline_cancel(&db, run_id).await?;
+            }
+            PipelineAction::History { name, limit } => {
+                handle_pipeline_history(&db, &name, limit).await?;
+            }
+            PipelineAction::Init { template, output, list, force } => {
+                handle_pipeline_init(template.as_deref(), output.as_ref(), list, force)?;
+            }
+        },
+
+        Commands::Approval { action } => match action {
+            ApprovalAction::List { pending } => {
+                handle_approval_list(&db, pending).await?;
+            }
+            ApprovalAction::Approve { id, comment } => {
+                handle_approval_approve(&db, id, comment.as_deref()).await?;
+            }
+            ApprovalAction::Reject { id, reason } => {
+                handle_approval_reject(&db, id, reason.as_deref()).await?;
+            }
+            ApprovalAction::Delegate { id, to } => {
+                handle_approval_delegate(&db, id, &to).await?;
+            }
+        },
+        Commands::Feedback { action } => match action {
+            FeedbackAction::Add {
+                agent_id,
+                rating,
                 comment,
-                output,
+                message_id,
             } => {
-                handle_test_analyze_pr(&db, pr, &base, head.as_deref(), comment, &output).await?;
+                handle_feedback_add(&db, &agent_id, &rating, comment.as_deref(), message_id)
+                    .await?;
+            }
+            FeedbackAction::List {
+                agent,
+                rating,
+                source,
+                limit,
+            } => {
+                handle_feedback_list(&db, agent.as_deref(), rating.as_deref(), source.as_deref(), limit)
+                    .await?;
+            }
+            FeedbackAction::Stats { agent, by_type } => {
+                handle_feedback_stats(&db, agent.as_deref(), by_type).await?;
+            }
+            FeedbackAction::Delete { id } => {
+                handle_feedback_delete(&db, id).await?;
+            }
+        },
+        Commands::Env { action } => match action {
+            EnvAction::List { format } => {
+                handle_env_list(&db, &format).await?;
+            }
+            EnvAction::Create {
+                name,
+                env_type,
+                url,
+                provider,
+                config,
+                secrets,
+                requires_approval,
+            } => {
+                handle_env_create(
+                    &db,
+                    &name,
+                    &env_type,
+                    url.as_deref(),
+                    provider.as_deref(),
+                    config.as_deref(),
+                    secrets.as_deref(),
+                    requires_approval,
+                )
+                .await?;
+            }
+            EnvAction::Show {
+                name,
+                show_secrets,
+                format,
+            } => {
+                handle_env_show(&db, &name, show_secrets, &format).await?;
+            }
+            EnvAction::Delete { name, yes } => {
+                handle_env_delete(&db, &name, yes).await?;
+            }
+        },
+        Commands::Deploy { action } => match action {
+            DeployAction::Deploy {
+                env,
+                version,
+                strategy,
+                provider,
+                timeout,
+                skip_validation,
+                format,
+            } => {
+                handle_deploy_deploy(
+                    &db,
+                    &env,
+                    &version,
+                    strategy.as_deref(),
+                    provider.as_deref(),
+                    timeout,
+                    skip_validation,
+                    &format,
+                )
+                .await?;
+            }
+            DeployAction::Status { env, format } => {
+                handle_deploy_status(&db, &env, &format).await?;
+            }
+            DeployAction::History { env, limit, format } => {
+                handle_deploy_history(&db, &env, limit, &format).await?;
+            }
+            DeployAction::Diff { env, version, format } => {
+                handle_deploy_diff(&db, &env, &version, &format).await?;
+            }
+            DeployAction::Validate {
+                env,
+                version,
+                format,
+            } => {
+                handle_deploy_validate(&db, &env, version.as_deref(), &format).await?;
+            }
+            DeployAction::Rollback {
+                env,
+                version,
+                skip_validation,
+                force,
+                format,
+            } => {
+                handle_deploy_rollback(
+                    &db,
+                    &env,
+                    version.as_deref(),
+                    skip_validation,
+                    force,
+                    &format,
+                )
+                .await?;
+            }
+        },
+
+        Commands::Flags { action } => match action {
+            FlagsAction::List { environment, format } => {
+                handle_flags_list(&db, environment.as_deref(), &format).await?;
+            }
+            FlagsAction::Create {
+                key,
+                name,
+                description,
+                status,
+                rollout,
+                environment,
+            } => {
+                handle_flags_create(&db, &key, &name, description.as_deref(), &status, rollout, environment.as_deref()).await?;
+            }
+            FlagsAction::Show { key, environment, format } => {
+                handle_flags_show(&db, &key, environment.as_deref(), &format).await?;
+            }
+            FlagsAction::Enable { key, environment } => {
+                handle_flags_enable(&db, &key, environment.as_deref()).await?;
+            }
+            FlagsAction::Disable { key, environment } => {
+                handle_flags_disable(&db, &key, environment.as_deref()).await?;
+            }
+            FlagsAction::Rollout { key, percentage, environment } => {
+                handle_flags_rollout(&db, &key, percentage, environment.as_deref()).await?;
+            }
+            FlagsAction::Delete { key, environment } => {
+                handle_flags_delete(&db, &key, environment.as_deref()).await?;
+            }
+        },
+
+        Commands::Release { action } => match action {
+            ReleaseAction::Prepare {
+                r#type,
+                cargo_toml,
+                changelog,
+                bump_frontend,
+            } => {
+                handle_release_prepare(&db, &r#type, &cargo_toml, &changelog, bump_frontend).await?;
+            }
+            ReleaseAction::Create {
+                version,
+                message,
+                push,
+            } => {
+                handle_release_create(&db, &version, message.as_deref(), push).await?;
+            }
+            ReleaseAction::Publish {
+                version,
+                repo_path,
+                token,
+                prerelease,
+                draft,
+            } => {
+                handle_release_publish(&db, &version, &repo_path, token.as_deref(), prerelease, draft).await?;
+            }
+            ReleaseAction::Notes {
+                from,
+                to,
+                repo_path,
+                format,
+            } => {
+                handle_release_notes(&db, &from, &to, &repo_path, &format).await?;
             }
         },
     }
@@ -3208,1215 +4194,1732 @@ fn generate_test_payload(event_type: &str) -> String {
     }
 }
 
-/// Handle test generation command
-async fn handle_test_generate(
-    db: &Database,
-    test_type: &str,
-    target: Option<&std::path::Path>,
-    story_id: Option<&str>,
-    output: Option<&std::path::Path>,
-    write: bool,
-    platform: Option<&str>,
-) -> Result<()> {
-    use orchestrate_core::{E2ETestPlatform, TestGenerationService};
+// ==================== Pipeline Command Handlers ====================
 
-    // Validate test type
-    if test_type != "unit" && test_type != "integration" && test_type != "e2e" {
-        anyhow::bail!(
-            "Supported test types: 'unit', 'integration', 'e2e'. Got: {}",
-            test_type
+async fn handle_pipeline_create(db: &Database, file: &PathBuf) -> Result<()> {
+    use orchestrate_core::Pipeline;
+    use std::fs;
+
+    // Read YAML file
+    let yaml = fs::read_to_string(file)?;
+
+    // Try to parse pipeline name from YAML (simple approach - look for "name:" line)
+    let name = yaml
+        .lines()
+        .find(|line| line.trim_start().starts_with("name:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .ok_or_else(|| anyhow::anyhow!("Pipeline YAML must contain 'name' field"))?;
+
+    // Create pipeline (validation will happen when the executor parses it)
+    let pipeline = Pipeline::new(name.clone(), yaml);
+    db.insert_pipeline(&pipeline).await?;
+
+    println!("Pipeline created: {}", name);
+    println!("  File: {:?}", file);
+    println!("  Note: Pipeline definition will be validated on first run");
+
+    Ok(())
+}
+
+async fn handle_pipeline_list(db: &Database, enabled_only: bool) -> Result<()> {
+    let pipelines = if enabled_only {
+        db.list_enabled_pipelines().await?
+    } else {
+        db.list_pipelines().await?
+    };
+
+    if pipelines.is_empty() {
+        println!("No pipelines found");
+        return Ok(());
+    }
+
+    println!("{:<30} {:<10} {:<20}", "NAME", "ENABLED", "CREATED");
+    println!("{}", "-".repeat(70));
+
+    for pipeline in pipelines {
+        let enabled_str = if pipeline.enabled { "yes" } else { "no" };
+        let created = pipeline.created_at.format("%Y-%m-%d %H:%M:%S");
+        println!("{:<30} {:<10} {:<20}", pipeline.name, enabled_str, created);
+    }
+
+    Ok(())
+}
+
+async fn handle_pipeline_show(db: &Database, name: &str) -> Result<()> {
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    println!("Pipeline: {}", pipeline.name);
+    println!("Enabled: {}", if pipeline.enabled { "yes" } else { "no" });
+    println!("Created: {}", pipeline.created_at.format("%Y-%m-%d %H:%M:%S"));
+    println!("\nDefinition:");
+    println!("{}", pipeline.definition);
+
+    Ok(())
+}
+
+async fn handle_pipeline_update(db: &Database, name: &str, file: &PathBuf) -> Result<()> {
+    use std::fs;
+
+    // Get existing pipeline
+    let mut pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    // Read new YAML file
+    let yaml = fs::read_to_string(file)?;
+
+    // Update pipeline (validation will happen when the executor parses it)
+    pipeline.definition = yaml;
+    db.update_pipeline(&pipeline).await?;
+
+    println!("Pipeline updated: {}", name);
+    println!("  Note: Pipeline definition will be validated on first run");
+
+    Ok(())
+}
+
+async fn handle_pipeline_delete(db: &Database, name: &str) -> Result<()> {
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    db.delete_pipeline(pipeline.id.unwrap()).await?;
+    println!("Pipeline deleted: {}", name);
+
+    Ok(())
+}
+
+async fn handle_pipeline_enable(db: &Database, name: &str) -> Result<()> {
+    let mut pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    pipeline.enabled = true;
+    db.update_pipeline(&pipeline).await?;
+    println!("Pipeline enabled: {}", name);
+
+    Ok(())
+}
+
+async fn handle_pipeline_disable(db: &Database, name: &str) -> Result<()> {
+    let mut pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    pipeline.enabled = false;
+    db.update_pipeline(&pipeline).await?;
+    println!("Pipeline disabled: {}", name);
+
+    Ok(())
+}
+
+async fn handle_pipeline_run(db: &Database, name: &str, dry_run: bool) -> Result<()> {
+    use orchestrate_core::PipelineRun;
+
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    if dry_run {
+        println!("Dry run: Would trigger pipeline '{}'", name);
+        println!("Pipeline definition:");
+        println!("{}", pipeline.definition);
+        return Ok(());
+    }
+
+    // Create pipeline run
+    let run = PipelineRun::new(pipeline.id.unwrap(), Some("manual".to_string()));
+    let run_id = db.insert_pipeline_run(&run).await?;
+
+    println!("Pipeline run started: {}", run_id);
+    println!("  Pipeline: {}", name);
+    println!("  Trigger: manual");
+    println!("\nNote: Pipeline execution requires the daemon to be running.");
+    println!("Use 'orchestrate pipeline status {}' to check progress", run_id);
+
+    Ok(())
+}
+
+async fn handle_pipeline_status(db: &Database, run_id: i64) -> Result<()> {
+    use orchestrate_core::PipelineRunStatus;
+
+    let run = db
+        .get_pipeline_run(run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline run not found: {}", run_id))?;
+
+    let pipeline = db.get_pipeline(run.pipeline_id).await?.ok_or_else(|| {
+        anyhow::anyhow!("Pipeline not found for run {}", run_id)
+    })?;
+
+    println!("Pipeline Run: {}", run_id);
+    println!("  Pipeline: {}", pipeline.name);
+    println!("  Status: {:?}", run.status);
+    println!("  Trigger: {}", run.trigger_event.as_deref().unwrap_or("unknown"));
+
+    if let Some(started) = run.started_at {
+        println!("  Started: {}", started.format("%Y-%m-%d %H:%M:%S"));
+    }
+
+    if let Some(completed) = run.completed_at {
+        println!("  Completed: {}", completed.format("%Y-%m-%d %H:%M:%S"));
+        if let Some(started) = run.started_at {
+            let duration = completed - started;
+            println!("  Duration: {}s", duration.num_seconds());
+        }
+    }
+
+    // Show stages
+    let stages = db.list_pipeline_stages(run_id).await?;
+    if !stages.is_empty() {
+        println!("\nStages:");
+        for stage in stages {
+            let status_str = format!("{:?}", stage.status);
+            let agent_str = stage.agent_id.as_deref().unwrap_or("N/A");
+            println!("  - {}: {} (agent: {})", stage.stage_name, status_str, agent_str);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_pipeline_cancel(db: &Database, run_id: i64) -> Result<()> {
+    let mut run = db
+        .get_pipeline_run(run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline run not found: {}", run_id))?;
+
+    run.mark_cancelled();
+    db.update_pipeline_run(&run).await?;
+
+    println!("Pipeline run cancelled: {}", run_id);
+
+    Ok(())
+}
+
+async fn handle_pipeline_history(db: &Database, name: &str, limit: usize) -> Result<()> {
+    let pipeline = db
+        .get_pipeline_by_name(name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Pipeline not found: {}", name))?;
+
+    let mut runs = db.list_pipeline_runs(pipeline.id.unwrap()).await?;
+
+    // Sort by created_at descending (newest first)
+    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    // Limit results
+    let runs: Vec<_> = runs.into_iter().take(limit).collect();
+
+    if runs.is_empty() {
+        println!("No runs found for pipeline: {}", name);
+        return Ok(());
+    }
+
+    println!("Pipeline: {}", name);
+    println!("\n{:<10} {:<15} {:<20} {:<20} {:<10}", "RUN ID", "STATUS", "STARTED", "COMPLETED", "DURATION");
+    println!("{}", "-".repeat(90));
+
+    for run in runs {
+        let status = format!("{:?}", run.status);
+        let started = run
+            .started_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let completed = run
+            .completed_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        let duration = if let (Some(start), Some(end)) = (run.started_at, run.completed_at) {
+            format!("{}s", (end - start).num_seconds())
+        } else {
+            "-".to_string()
+        };
+
+        println!(
+            "{:<10} {:<15} {:<20} {:<20} {:<10}",
+            run.id.unwrap_or(0),
+            status,
+            started,
+            completed,
+            duration
         );
     }
 
-    // Create test generation service
-    let service = TestGenerationService::new();
+    Ok(())
+}
 
-    if test_type == "e2e" {
-        // E2E test generation from story
-        let story_id = story_id.ok_or_else(|| {
-            anyhow::anyhow!("Story ID required for E2E test generation. Use --story <story-id>")
-        })?;
+fn handle_pipeline_init(
+    template: Option<&str>,
+    output: Option<&PathBuf>,
+    list: bool,
+    force: bool,
+) -> Result<()> {
+    use orchestrate_core::pipeline_template;
+    use std::fs;
 
-        println!("╔══════════════════════════════════════════════════════════════╗");
-        println!("║              E2E Test Generation from Story                  ║");
-        println!("╠══════════════════════════════════════════════════════════════╣");
-        println!("║  Story ID: {:<50} ║", story_id);
-        println!("╚══════════════════════════════════════════════════════════════╝");
+    // Handle --list flag
+    if list {
+        println!("Available pipeline templates:");
         println!();
 
-        // Fetch story from database
-        info!("Fetching story: {}", story_id);
-        let story = db
-            .get_story(story_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Story not found: {}", story_id))?;
+        let templates = pipeline_template::get_templates();
+        let mut names: Vec<_> = templates.keys().collect();
+        names.sort();
 
-        // Parse platform if provided
-        let e2e_platform = if let Some(p) = platform {
-            Some(match p.to_lowercase().as_str() {
-                "playwright" => E2ETestPlatform::Playwright,
-                "cypress" => E2ETestPlatform::Cypress,
-                "api" => E2ETestPlatform::Api,
-                "cli" => E2ETestPlatform::Cli,
-                _ => anyhow::bail!("Unknown E2E platform: {}. Use: playwright, cypress, api, cli", p),
-            })
-        } else {
-            None
-        };
-
-        // Generate E2E tests
-        info!("Generating E2E tests for story: {}", story.title);
-        let result = service.generate_e2e_tests_from_story(&story, e2e_platform).await?;
-
-        println!("📊 Generation Results:");
-        println!("   Story:     {}", result.story_title);
-        println!("   Platform:  {:?}", result.platform);
-        println!("   Criteria:  {}", result.acceptance_criteria.len());
-        println!("   Tests:     {}", result.test_cases.len());
-        println!();
-
-        // Display acceptance criteria
-        println!("📝 Acceptance Criteria:");
-        for (i, criterion) in result.acceptance_criteria.iter().enumerate() {
-            let checkbox = if criterion.checked { "☑" } else { "☐" };
-            println!("   {}. {} {}", i + 1, checkbox, criterion.description);
+        for name in names {
+            let template = &templates[name];
+            println!("  {} - {}", name, template.description);
         }
-        println!();
 
-        // Format test output
-        let test_code = service.format_e2e_test_output(&result)?;
+        return Ok(());
+    }
 
-        // Determine output location
-        let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
+    // Template name is required if not listing
+    let template_name = template
+        .ok_or_else(|| anyhow::anyhow!("Template name required. Use --list to see available templates"))?;
 
-        if write {
-            // Write to file
-            if let Some(parent) = output_path.parent() {
-                if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
-                    info!("Creating directory: {}", parent.display());
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-            }
+    // Get template
+    let template = pipeline_template::get_template(template_name)
+        .ok_or_else(|| anyhow::anyhow!("Template not found: {}. Use --list to see available templates", template_name))?;
 
-            tokio::fs::write(output_path, &test_code).await?;
-            println!("✅ E2E tests written to: {}", output_path.display());
-        } else {
-            // Print to stdout
-            println!("Generated E2E Test Code:");
-            println!("═══════════════════════════════════════════════════════════════");
-            println!("{}", test_code);
-            println!("═══════════════════════════════════════════════════════════════");
-            println!();
-            println!("💡 Tip: Add --write to save tests to file");
+    // Determine output file
+    let output_file = if let Some(path) = output {
+        path.clone()
+    } else {
+        // Default: <template-name>-pipeline.yaml
+        PathBuf::from(format!("{}-pipeline.yaml", template_name))
+    };
+
+    // Check if file exists
+    if output_file.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "File already exists: {}. Use --force to overwrite",
+            output_file.display()
+        ));
+    }
+
+    // Write template to file
+    fs::write(&output_file, &template.yaml)?;
+
+    println!("Pipeline template '{}' initialized successfully!", template_name);
+    println!("  File: {}", output_file.display());
+    println!("  Description: {}", template.description);
+    println!();
+    println!("Next steps:");
+    println!("  1. Review and customize the pipeline definition");
+    println!("  2. Create the pipeline: orchestrate pipeline create {}", output_file.display());
+
+    Ok(())
+}
+
+// ==================== Approval Command Handlers ====================
+
+async fn handle_approval_list(db: &Database, pending_only: bool) -> Result<()> {
+    use orchestrate_core::ApprovalStatus;
+
+    let approvals = if pending_only {
+        db.list_pending_approvals().await?
+    } else {
+        // For now, just list pending. In the future, add a list_all_approvals method
+        db.list_pending_approvals().await?
+    };
+
+    if approvals.is_empty() {
+        println!("No approval requests found");
+        return Ok(());
+    }
+
+    println!("{:<10} {:<10} {:<15} {:<30} {:<20}", "ID", "RUN ID", "STATUS", "APPROVERS", "CREATED");
+    println!("{}", "-".repeat(95));
+
+    for approval in approvals {
+        let status = format!("{:?}", approval.status);
+        let approvers = &approval.required_approvers;
+        let created = approval.created_at.format("%Y-%m-%d %H:%M:%S");
+
+        println!(
+            "{:<10} {:<10} {:<15} {:<30} {:<20}",
+            approval.id.unwrap_or(0),
+            approval.run_id,
+            status,
+            approvers,
+            created
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_approval_approve(db: &Database, id: i64, comment: Option<&str>) -> Result<()> {
+    use orchestrate_core::ApprovalDecision;
+
+    // Get approval request
+    let mut approval = db
+        .get_approval_request(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Approval request not found: {}", id))?;
+
+    // Get current user (for now, use a placeholder)
+    let approver = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    // Create decision
+    let decision = ApprovalDecision::new(id, approver.clone(), true, comment.map(String::from));
+    db.create_approval_decision(decision).await?;
+
+    // Update approval count
+    approval.approval_count += 1;
+
+    // Check if quorum reached
+    if approval.has_approval_quorum() {
+        approval.mark_approved();
+        println!("Approval request {} APPROVED by {}", id, approver);
+        println!("  Quorum reached: {}/{}", approval.approval_count, approval.required_count);
+    } else {
+        println!("Approval recorded from {}", approver);
+        println!("  Progress: {}/{}", approval.approval_count, approval.required_count);
+    }
+
+    db.update_approval_request(&approval).await?;
+
+    Ok(())
+}
+
+async fn handle_approval_reject(db: &Database, id: i64, reason: Option<&str>) -> Result<()> {
+    use orchestrate_core::ApprovalDecision;
+
+    // Get approval request
+    let mut approval = db
+        .get_approval_request(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Approval request not found: {}", id))?;
+
+    // Get current user
+    let approver = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    // Create decision
+    let decision = ApprovalDecision::new(id, approver.clone(), false, reason.map(String::from));
+    db.create_approval_decision(decision).await?;
+
+    // Update rejection count
+    approval.rejection_count += 1;
+
+    // Check if rejection quorum reached
+    if approval.has_rejection_quorum() {
+        approval.mark_rejected();
+        println!("Approval request {} REJECTED by {}", id, approver);
+        if let Some(r) = reason {
+            println!("  Reason: {}", r);
         }
     } else {
-        // Unit or integration test generation
-        let target = target.ok_or_else(|| {
-            anyhow::anyhow!("Target file required for {} test generation. Use --target <file>", test_type)
-        })?;
+        println!("Rejection recorded from {}", approver);
+        println!("  Rejections: {}", approval.rejection_count);
+    }
 
-        // Check if target file exists
-        if !target.exists() {
-            anyhow::bail!("Target file does not exist: {}", target.display());
+    db.update_approval_request(&approval).await?;
+
+    Ok(())
+}
+
+async fn handle_approval_delegate(db: &Database, id: i64, to: &str) -> Result<()> {
+    // Get approval request
+    let mut approval = db
+        .get_approval_request(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Approval request not found: {}", id))?;
+
+    // Update approvers list
+    approval.required_approvers = to.to_string();
+    approval.mark_delegated();
+
+    db.update_approval_request(&approval).await?;
+
+    println!("Approval request {} delegated to {}", id, to);
+
+    Ok(())
+}
+
+// ==================== Feedback Handlers ====================
+
+async fn handle_feedback_add(
+    db: &Database,
+    agent_id: &str,
+    rating: &str,
+    comment: Option<&str>,
+    message_id: Option<i64>,
+) -> Result<()> {
+    use orchestrate_core::{Feedback, FeedbackRating, FeedbackSource};
+    use std::str::FromStr;
+
+    // Parse agent ID
+    let agent_uuid = Uuid::parse_str(agent_id)
+        .map_err(|e| anyhow::anyhow!("Invalid agent ID '{}': {}", agent_id, e))?;
+
+    // Verify agent exists
+    if db.get_agent(agent_uuid).await?.is_none() {
+        anyhow::bail!("Agent not found: {}", agent_id);
+    }
+
+    // Parse rating
+    let feedback_rating = FeedbackRating::from_str(rating)
+        .map_err(|_| anyhow::anyhow!("Invalid rating '{}'. Use: positive, negative, neutral, +, -, pos, neg", rating))?;
+
+    // Get current user
+    let created_by = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    // Build feedback
+    let mut feedback = Feedback::new(agent_uuid, feedback_rating, created_by)
+        .with_source(FeedbackSource::Cli);
+
+    if let Some(msg_id) = message_id {
+        feedback = feedback.with_message_id(msg_id);
+    }
+
+    if let Some(c) = comment {
+        feedback = feedback.with_comment(c);
+    }
+
+    // Insert feedback
+    let id = db.insert_feedback(&feedback).await?;
+
+    println!("Feedback added successfully (ID: {})", id);
+    println!("  Agent: {}", agent_id);
+    println!("  Rating: {}", feedback_rating);
+    if let Some(c) = comment {
+        println!("  Comment: {}", c);
+    }
+
+    Ok(())
+}
+
+async fn handle_feedback_list(
+    db: &Database,
+    agent: Option<&str>,
+    rating: Option<&str>,
+    source: Option<&str>,
+    limit: i64,
+) -> Result<()> {
+    use orchestrate_core::{FeedbackRating, FeedbackSource};
+    use std::str::FromStr;
+
+    let feedbacks = if let Some(agent_id) = agent {
+        let agent_uuid = Uuid::parse_str(agent_id)
+            .map_err(|e| anyhow::anyhow!("Invalid agent ID '{}': {}", agent_id, e))?;
+        db.list_feedback_for_agent(agent_uuid, limit).await?
+    } else {
+        let rating_filter = rating
+            .map(|r| FeedbackRating::from_str(r))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Invalid rating filter"))?;
+        let source_filter = source
+            .map(|s| FeedbackSource::from_str(s))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Invalid source filter"))?;
+        db.list_feedback(rating_filter, source_filter, limit).await?
+    };
+
+    if feedbacks.is_empty() {
+        println!("No feedback found");
+        return Ok(());
+    }
+
+    println!("Feedback ({} entries):", feedbacks.len());
+    println!("{:-<80}", "");
+
+    for fb in feedbacks {
+        let rating_symbol = match fb.rating {
+            orchestrate_core::FeedbackRating::Positive => "+",
+            orchestrate_core::FeedbackRating::Negative => "-",
+            orchestrate_core::FeedbackRating::Neutral => "0",
+        };
+        println!(
+            "[{}] ID: {} | Agent: {} | {} | by {} | {}",
+            rating_symbol,
+            fb.id,
+            &fb.agent_id.to_string()[..8],
+            fb.source,
+            fb.created_by,
+            fb.created_at.format("%Y-%m-%d %H:%M")
+        );
+        if let Some(comment) = &fb.comment {
+            println!("    Comment: {}", comment);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_feedback_stats(
+    db: &Database,
+    agent: Option<&str>,
+    by_type: bool,
+) -> Result<()> {
+    if let Some(agent_id) = agent {
+        let agent_uuid = Uuid::parse_str(agent_id)
+            .map_err(|e| anyhow::anyhow!("Invalid agent ID '{}': {}", agent_id, e))?;
+        let stats = db.get_feedback_stats_for_agent(agent_uuid).await?;
+
+        println!("Feedback Stats for Agent {}", agent_id);
+        println!("{:-<50}", "");
+        print_feedback_stats(&stats);
+    } else if by_type {
+        let stats_by_type = db.get_feedback_stats_by_agent_type().await?;
+
+        if stats_by_type.is_empty() {
+            println!("No feedback statistics available");
+            return Ok(());
         }
 
-        println!("╔══════════════════════════════════════════════════════════════╗");
-        println!("║                   Test Generation                            ║");
-        println!("╠══════════════════════════════════════════════════════════════╣");
-        println!("║  Type:     {:<50} ║", test_type);
-        println!("║  Target:   {:<50} ║", target.display().to_string());
-        println!("╚══════════════════════════════════════════════════════════════╝");
-        println!();
+        println!("Feedback Stats by Agent Type");
+        println!("{:-<60}", "");
 
-        if test_type == "unit" {
-            // Generate unit tests
-            info!("Analyzing source file: {}", target.display());
-            let result = service.generate_tests(target).await?;
+        for (agent_type, stats) in stats_by_type {
+            println!("\n{}", agent_type.as_str());
+            print_feedback_stats(&stats);
+        }
+    } else {
+        let stats = db.get_feedback_stats().await?;
 
-            println!("📊 Analysis Results:");
-            println!("   Language:  {:?}", result.language);
-            println!("   Functions: {}", result.functions.len());
-            println!("   Test Cases: {}", result.test_cases.len());
-            println!();
+        println!("Overall Feedback Stats");
+        println!("{:-<50}", "");
+        print_feedback_stats(&stats);
+    }
 
-            if result.functions.is_empty() {
-                warn!("No testable functions found in {}", target.display());
-                return Ok(());
-            }
+    Ok(())
+}
 
-            // Display found functions
-            println!("📝 Functions Found:");
-            for func in &result.functions {
-                let async_marker = if func.is_async { " (async)" } else { "" };
-                println!("   - {}{}", func.name, async_marker);
-            }
-            println!();
+fn print_feedback_stats(stats: &orchestrate_core::FeedbackStats) {
+    println!("  Total: {}", stats.total);
+    println!(
+        "  Positive: {} ({:.1}%)",
+        stats.positive, stats.positive_percentage
+    );
+    println!("  Negative: {}", stats.negative);
+    println!("  Neutral: {}", stats.neutral);
+    println!("  Score: {:.2}", stats.score);
+}
 
-            // Format test output
-            let test_code = service.format_test_output(&result)?;
+async fn handle_feedback_delete(db: &Database, id: i64) -> Result<()> {
+    if db.delete_feedback(id).await? {
+        println!("Feedback {} deleted", id);
+    } else {
+        println!("Feedback {} not found", id);
+    }
+    Ok(())
+}
 
-            // Determine output location
-            let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
+// ==================== Environment Handlers ====================
 
-            if write {
-                // Write to file
-                if let Some(parent) = output_path.parent() {
-                    if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
-                        info!("Creating directory: {}", parent.display());
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                }
+async fn handle_env_list(db: &Database, format: &str) -> Result<()> {
+    let envs = db.list_environments().await?;
 
-                tokio::fs::write(output_path, &test_code).await?;
-                println!("✅ Tests written to: {}", output_path.display());
-            } else {
-                // Print to stdout
-                println!("Generated Test Code:");
-                println!("═══════════════════════════════════════════════════════════════");
-                println!("{}", test_code);
-                println!("═══════════════════════════════════════════════════════════════");
-                println!();
-                println!("💡 Tip: Add --write to save tests to file");
-                println!("   Default location: {}", result.test_file_path.display());
-            }
-        } else {
-            // Generate integration tests
-        info!("Analyzing module: {}", target.display());
-        let result = service.generate_integration_tests(target).await?;
+    if envs.is_empty() {
+        println!("No environments found");
+        return Ok(());
+    }
 
-        println!("📊 Module Analysis:");
-        println!("   Module:     {}", result.module.name);
-        println!("   Interfaces: {}", result.module.public_interfaces.len());
-        println!("   Dependencies: {}", result.module.dependencies.len());
-        println!("   Test Cases: {}", result.test_cases.len());
-        println!("   Fixtures:   {}", result.fixtures.len());
-        println!();
-
-        // Display public interfaces
-        if !result.module.public_interfaces.is_empty() {
-            println!("📝 Public Interfaces:");
-            for interface in &result.module.public_interfaces {
-                let async_marker = if interface.is_async { " (async)" } else { "" };
-                println!("   - {} ({:?}){}",
-                    interface.name,
-                    interface.interface_type,
-                    async_marker
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&envs)?);
+        }
+        _ => {
+            // Table format
+            println!("{:<20} {:<15} {:<40} {:<10}", "NAME", "TYPE", "URL", "APPROVAL");
+            println!("{:-<90}", "");
+            for env in envs {
+                println!(
+                    "{:<20} {:<15} {:<40} {:<10}",
+                    env.name,
+                    env.env_type.to_string(),
+                    env.url.as_deref().unwrap_or("-"),
+                    if env.requires_approval { "required" } else { "-" }
                 );
             }
-            println!();
-        }
-
-        // Display dependencies
-        if !result.module.dependencies.is_empty() {
-            println!("📦 Dependencies:");
-            for dep in &result.module.dependencies {
-                println!("   - {}", dep);
-            }
-            println!();
-        }
-
-        // Determine output location
-        let output_path: &std::path::Path = output.unwrap_or(result.test_file_path.as_path());
-
-        // Build complete test code with fixtures
-        let mut test_code = String::new();
-        test_code.push_str("// Test Fixtures\n\n");
-        for fixture in &result.fixtures {
-            test_code.push_str(&fixture.setup_code);
-            test_code.push_str("\n\n");
-            test_code.push_str(&fixture.teardown_code);
-            test_code.push_str("\n\n");
-        }
-
-        test_code.push_str("// Integration Tests\n\n");
-        for test_case in &result.test_cases {
-            test_code.push_str(&test_case.code);
-            test_code.push_str("\n\n");
-        }
-
-        if write {
-            // Write to file
-            if let Some(parent) = output_path.parent() {
-                if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
-                    info!("Creating directory: {}", parent.display());
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-            }
-
-            tokio::fs::write(output_path, &test_code).await?;
-            println!("✅ Integration tests written to: {}", output_path.display());
-        } else {
-            // Print to stdout
-            println!("Generated Integration Test Code:");
-            println!("═══════════════════════════════════════════════════════════════");
-            println!("{}", test_code);
-            println!("═══════════════════════════════════════════════════════════════");
-            println!();
-            println!("💡 Tip: Add --write to save tests to file");
-            println!("   Default location: {}", result.test_file_path.display());
-            }
         }
     }
 
     Ok(())
 }
 
-async fn handle_test_coverage(
+async fn handle_env_create(
     db: &Database,
-    language: &str,
-    format: Option<&str>,
-    report_path: Option<&std::path::Path>,
-    threshold: Option<f64>,
-    module_name: Option<&str>,
-    show_history: bool,
-    limit: i64,
-    diff_mode: bool,
-    base_branch: &str,
+    name: &str,
+    env_type: &str,
+    url: Option<&str>,
+    provider: Option<&str>,
+    config_json: Option<&str>,
+    secrets_json: Option<&str>,
+    requires_approval: bool,
 ) -> Result<()> {
-    use orchestrate_core::{CoverageFormat, CoverageService};
+    use std::str::FromStr;
 
-    let service = CoverageService::new(db.clone());
+    // Parse environment type
+    let env_type = EnvironmentType::from_str(env_type)?;
 
-    // If setting a threshold for a module
-    if let (Some(module), Some(threshold_val)) = (module_name, threshold) {
-        service.set_module_threshold(module, threshold_val).await?;
-        println!("✅ Set coverage threshold for '{}' to {}%", module, threshold_val);
-        return Ok(());
-    }
-
-    // If showing history
-    if show_history {
-        if let Some(module) = module_name {
-            println!("╔══════════════════════════════════════════════════════════════╗");
-            println!("║           Coverage History for {}                    ", module);
-            println!("╚══════════════════════════════════════════════════════════════╝");
-            println!();
-
-            let history = service.get_coverage_history(module, limit).await?;
-
-            if history.is_empty() {
-                println!("No coverage history found for module: {}", module);
-            } else {
-                for (i, report) in history.iter().enumerate() {
-                    let module_coverage = report.modules.iter()
-                        .find(|m| m.module_name == module)
-                        .unwrap();
-
-                    let meets_threshold = if module_coverage.meets_threshold() { "✅" } else { "⚠️" };
-                    println!("{}. {} - {:.2}% {} (threshold: {:.0}%)",
-                        i + 1,
-                        report.timestamp.format("%Y-%m-%d %H:%M:%S"),
-                        module_coverage.coverage_percent,
-                        meets_threshold,
-                        module_coverage.threshold
-                    );
-                }
-            }
-        } else {
-            anyhow::bail!("Module name required for coverage history. Use --module <name>");
-        }
-        return Ok(());
-    }
-
-    // If diff mode, analyze coverage only for changed files
-    if diff_mode {
-        println!("🔍 Analyzing coverage for changed files (diff from {})", base_branch);
-        println!();
-
-        // Get changed files
-        use std::process::Command;
-        let output = Command::new("git")
-            .args(&["diff", "--name-only", base_branch])
-            .output()?;
-
-        if !output.status.success() {
-            anyhow::bail!("Failed to get git diff. Make sure you're in a git repository.");
-        }
-
-        let changed_files: Vec<String> = String::from_utf8(output.stdout)?
-            .lines()
-            .map(|s| s.to_string())
-            .filter(|f| f.ends_with(".rs") || f.ends_with(".ts") || f.ends_with(".tsx") || f.ends_with(".py"))
-            .collect();
-
-        if changed_files.is_empty() {
-            println!("No changed code files found in diff from {}", base_branch);
-            return Ok(());
-        }
-
-        println!("Changed files: {}", changed_files.len());
-        for file in &changed_files {
-            println!("  - {}", file);
-        }
-        println!();
-
-        // Run tests with coverage
-        println!("🧪 Running tests with coverage instrumentation...");
-        let project_root = std::env::current_dir()?;
-        let report_path = service.run_tests_with_coverage(&project_root, language).await?;
-
-        println!("📊 Parsing coverage report: {}", report_path.display());
-        let format = match language {
-            "rust" => CoverageFormat::Lcov,
-            "typescript" => CoverageFormat::Lcov,
-            "python" => CoverageFormat::Cobertura,
-            _ => anyhow::bail!("Unsupported language: {}. Use: rust, typescript, python", language),
-        };
-
-        let full_report = service.parse_coverage_report(&report_path, format).await?;
-
-        // Filter to only changed files
-        println!();
-        println!("╔══════════════════════════════════════════════════════════════╗");
-        println!("║            Coverage for Changed Files                       ║");
-        println!("╚══════════════════════════════════════════════════════════════╝");
-        println!();
-
-        let mut total_lines = 0;
-        let mut covered_lines = 0;
-
-        for module in &full_report.modules {
-            for file_coverage in &module.files {
-                // Check if this file is in the changed files
-                if changed_files.iter().any(|cf| file_coverage.file_path.ends_with(cf)) {
-                    total_lines += file_coverage.lines_total;
-                    covered_lines += file_coverage.lines_covered;
-
-                    let status = if file_coverage.coverage_percent >= module.threshold { "✅" } else { "⚠️" };
-                    println!("  {} {}: {:.1}% ({}/{} lines)",
-                        status,
-                        file_coverage.file_path,
-                        file_coverage.coverage_percent,
-                        file_coverage.lines_covered,
-                        file_coverage.lines_total
-                    );
-                }
-            }
-        }
-
-        println!();
-        let overall_percent = if total_lines > 0 {
-            (covered_lines as f64 / total_lines as f64) * 100.0
-        } else {
-            0.0
-        };
-        println!("  Overall (changed files): {:.1}% ({}/{} lines)", overall_percent, covered_lines, total_lines);
-        println!();
-
-        if let Some(threshold_val) = threshold {
-            if overall_percent < threshold_val {
-                println!("⚠️  Coverage ({:.1}%) is below threshold ({:.1}%)", overall_percent, threshold_val);
-                std::process::exit(1);
-            } else {
-                println!("✅ Coverage meets threshold of {:.1}%", threshold_val);
-            }
-        }
-
-        return Ok(());
-    }
-
-    // Parse or run coverage
-    let coverage_report = if let Some(report_path) = report_path {
-        // Parse existing coverage report
-        let format = format.unwrap_or("lcov");
-        let coverage_format = match format {
-            "lcov" => CoverageFormat::Lcov,
-            "cobertura" => CoverageFormat::Cobertura,
-            _ => anyhow::bail!("Unsupported coverage format: {}. Use: lcov, cobertura", format),
-        };
-
-        println!("📊 Parsing coverage report: {}", report_path.display());
-        service.parse_coverage_report(report_path, coverage_format).await?
+    // Parse config JSON
+    let config = if let Some(json) = config_json {
+        serde_json::from_str(json)?
     } else {
-        // Run tests with coverage
-        println!("🧪 Running tests with coverage instrumentation...");
-        let project_root = std::env::current_dir()?;
-        let report_path = service.run_tests_with_coverage(&project_root, language).await?;
-
-        println!("📊 Parsing coverage report: {}", report_path.display());
-        let format = match language {
-            "rust" => CoverageFormat::Lcov,
-            "typescript" => CoverageFormat::Lcov,
-            "python" => CoverageFormat::Cobertura,
-            _ => anyhow::bail!("Unsupported language: {}. Use: rust, typescript, python", language),
-        };
-
-        service.parse_coverage_report(&report_path, format).await?
+        std::collections::HashMap::new()
     };
 
-    // Store coverage report
-    let report_id = service.store_coverage(&coverage_report).await?;
-    info!("Stored coverage report with ID: {}", report_id);
+    // Parse secrets JSON
+    let secrets = if let Some(json) = secrets_json {
+        serde_json::from_str(json)?
+    } else {
+        std::collections::HashMap::new()
+    };
 
-    // Display coverage report
-    println!();
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                  Coverage Report                             ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
-    println!();
+    let create_env = CreateEnvironment {
+        name: name.to_string(),
+        env_type,
+        url: url.map(String::from),
+        provider: provider.map(String::from),
+        config,
+        secrets,
+        requires_approval,
+    };
 
-    for module in &coverage_report.modules {
-        let meets_threshold = if module.meets_threshold() { "" } else { " ⚠️" };
-        println!("  {}: {:.1}% (target: {:.0}%){}",
-            module.module_name,
-            module.coverage_percent,
-            module.threshold,
-            meets_threshold
-        );
+    let env = db.create_environment(create_env).await?;
 
-        // Show low-coverage files
-        let low_coverage_files: Vec<_> = module.files.iter()
-            .filter(|f| f.coverage_percent < module.threshold)
-            .collect();
+    println!("Environment '{}' created successfully", env.name);
+    println!("  ID: {}", env.id);
+    println!("  Type: {}", env.env_type);
+    if let Some(url) = &env.url {
+        println!("  URL: {}", url);
+    }
+    if let Some(provider) = &env.provider {
+        println!("  Provider: {}", provider);
+    }
+    println!("  Requires approval: {}", env.requires_approval);
+    println!("  Config keys: {}", env.config.len());
+    println!("  Secrets: {} (encrypted)", env.secrets.len());
 
-        if !low_coverage_files.is_empty() {
-            for file in low_coverage_files {
-                println!("    - {}: {:.1}% ⚠️", file.file_path, file.coverage_percent);
+    Ok(())
+}
+
+async fn handle_env_show(
+    db: &Database,
+    name: &str,
+    show_secrets: bool,
+    format: &str,
+) -> Result<()> {
+    let env = db.get_environment_by_name(name).await?;
+
+    match format {
+        "json" => {
+            if show_secrets {
+                println!("{}", serde_json::to_string_pretty(&env)?);
+            } else {
+                // Create a version without secrets
+                let mut env_no_secrets = env.clone();
+                env_no_secrets.secrets = std::collections::HashMap::new();
+                println!("{}", serde_json::to_string_pretty(&env_no_secrets)?);
             }
         }
-    }
+        _ => {
+            // Table format
+            println!("Environment: {}", env.name);
+            println!("{:-<60}", "");
+            println!("  ID: {}", env.id);
+            println!("  Type: {}", env.env_type);
+            if let Some(url) = &env.url {
+                println!("  URL: {}", url);
+            }
+            if let Some(provider) = &env.provider {
+                println!("  Provider: {}", provider);
+            }
+            println!("  Requires approval: {}", env.requires_approval);
+            println!("  Created: {}", env.created_at.format("%Y-%m-%d %H:%M:%S"));
 
-    println!();
-    println!("  Overall: {:.1}%", coverage_report.overall_percent);
-    println!();
+            if !env.config.is_empty() {
+                println!("\n  Configuration:");
+                for (key, value) in &env.config {
+                    println!("    {}: {}", key, value);
+                }
+            }
 
-    // Identify untested files
-    let untested = service.find_untested_files(&coverage_report).await;
-    if !untested.is_empty() {
-        println!("⚠️  Files Below Threshold:");
-        for file in untested.iter().take(10) {
-            println!("   - {} ({:.1}%)", file.file_path, file.coverage_percent);
+            if !env.secrets.is_empty() {
+                println!("\n  Secrets:");
+                for key in env.secrets.keys() {
+                    if show_secrets {
+                        println!("    {}: {}", key, env.secrets.get(key).unwrap());
+                    } else {
+                        println!("    {}: ********", key);
+                    }
+                }
+            }
         }
-        if untested.len() > 10 {
-            println!("   ... and {} more", untested.len() - 10);
-        }
-        println!();
     }
 
     Ok(())
 }
 
-async fn handle_test_run(
-    _db: &Database,
-    language: &str,
-    changed_only: bool,
-    base_branch: &str,
-    pattern: Option<&str>,
-    verbose: bool,
-) -> Result<()> {
-    use std::process::Command;
+async fn handle_env_delete(db: &Database, name: &str, yes: bool) -> Result<()> {
+    // Check if environment exists
+    let _ = db.get_environment_by_name(name).await?;
 
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                    Running Tests                             ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
-    println!();
-
-    // If running tests for changed code only
-    if changed_only {
-        println!("🔍 Finding tests for changed code (diff from {})", base_branch);
-        println!();
-
-        // Get changed files
-        let output = Command::new("git")
-            .args(&["diff", "--name-only", base_branch])
-            .output()?;
-
-        if !output.status.success() {
-            anyhow::bail!("Failed to get git diff. Make sure you're in a git repository.");
-        }
-
-        let changed_files: Vec<String> = String::from_utf8(output.stdout)?
-            .lines()
-            .map(|s| s.to_string())
-            .filter(|f| f.ends_with(".rs") || f.ends_with(".ts") || f.ends_with(".tsx") || f.ends_with(".py"))
-            .collect();
-
-        if changed_files.is_empty() {
-            println!("No changed code files found in diff from {}", base_branch);
+    if !yes {
+        println!("Are you sure you want to delete environment '{}'? [y/N]", name);
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled");
             return Ok(());
         }
-
-        println!("Changed files: {}", changed_files.len());
-        for file in &changed_files {
-            println!("  - {}", file);
-        }
-        println!();
     }
 
-    // Build test command based on language
-    let mut cmd = match language {
-        "rust" => {
-            let mut c = Command::new("cargo");
-            c.arg("test");
-            if let Some(pat) = pattern {
-                c.arg(pat);
-            }
-            if verbose {
-                c.arg("--");
-                c.arg("--nocapture");
-            }
-            c
-        }
-        "typescript" => {
-            let mut c = Command::new("npm");
-            c.arg("test");
-            if let Some(pat) = pattern {
-                c.arg("--");
-                c.arg(pat);
-            }
-            c
-        }
-        "python" => {
-            let mut c = Command::new("pytest");
-            if verbose {
-                c.arg("-v");
-            }
-            if let Some(pat) = pattern {
-                c.arg("-k");
-                c.arg(pat);
-            }
-            c
-        }
-        _ => anyhow::bail!("Unsupported language: {}. Use: rust, typescript, python", language),
-    };
-
-    println!("🧪 Running {} tests...", language);
-    if let Some(pat) = pattern {
-        println!("   Pattern: {}", pat);
-    }
-    println!();
-
-    // Run the tests
-    let status = cmd.status()?;
-
-    println!();
-    if status.success() {
-        println!("✅ All tests passed!");
+    if db.delete_environment(name).await? {
+        println!("Environment '{}' deleted", name);
     } else {
-        println!("❌ Some tests failed");
+        println!("Environment '{}' not found", name);
+    }
+
+    Ok(())
+}
+
+async fn handle_deploy_validate(
+    db: &Database,
+    env: &str,
+    version: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let validator = PreDeployValidator::with_db(Arc::new(db.clone()));
+    let validation = validator.validate(env, version).await?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&validation)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Pre-Deployment Validation for '{}'", env);
+    if let Some(v) = &validation.version {
+        println!("Version: {}", v);
+    }
+    println!("Validated at: {}", validation.validated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!();
+
+    println!("Overall Status: {}", match validation.overall_status {
+        ValidationStatus::Passed => "PASSED",
+        ValidationStatus::Failed => "FAILED",
+        ValidationStatus::Warning => "WARNING",
+        ValidationStatus::Skipped => "SKIPPED",
+    });
+    println!();
+
+    println!("Validation Checks:");
+    println!("{:<30} {:<10} {}", "Check", "Status", "Message");
+    println!("{}", "-".repeat(80));
+
+    for check in &validation.checks {
+        let status_symbol = match check.status {
+            ValidationStatus::Passed => "✓ PASS",
+            ValidationStatus::Failed => "✗ FAIL",
+            ValidationStatus::Warning => "⚠ WARN",
+            ValidationStatus::Skipped => "- SKIP",
+        };
+        println!("{:<30} {:<10} {}", check.name, status_symbol, check.message);
+    }
+
+    println!();
+
+    if !validation.is_valid() {
+        println!("Validation FAILED. The following checks failed:");
+        for check in validation.failed_checks() {
+            println!("  - {}: {}", check.name, check.message);
+        }
         std::process::exit(1);
     }
 
+    println!("All checks passed. Environment is ready for deployment.");
     Ok(())
 }
 
-async fn handle_test_report(
+async fn handle_deploy_rollback(
     db: &Database,
+    env: &str,
+    version: Option<&str>,
+    skip_validation: bool,
+    force: bool,
     format: &str,
-    output_path: Option<&std::path::Path>,
-    include_coverage: bool,
-    include_quality: bool,
 ) -> Result<()> {
-    use orchestrate_core::CoverageService;
-    use serde_json::json;
+    let rollback_service = DeploymentRollback::new(Arc::new(db.clone()));
 
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                  Generating Test Report                     ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
-    println!();
-
-    // Collect test metrics
-    let mut report_data = json!({
-        "generated_at": chrono::Utc::now().to_rfc3339(),
-        "sections": {}
-    });
-
-    // Add coverage metrics if requested
-    if include_coverage {
-        println!("📊 Collecting coverage metrics...");
-        let coverage_service = CoverageService::new(db.clone());
-
-        // Get latest coverage report
-        match coverage_service.get_latest_coverage().await {
-            Ok(Some(latest)) => {
-                report_data["sections"]["coverage"] = json!({
-                    "overall_percent": latest.overall_percent,
-                    "timestamp": latest.timestamp,
-                    "modules": latest.modules.iter().map(|m| json!({
-                        "name": m.module_name,
-                        "coverage": m.coverage_percent,
-                        "threshold": m.threshold,
-                        "meets_threshold": m.meets_threshold(),
-                    })).collect::<Vec<_>>()
-                });
-            }
-            _ => {
-                report_data["sections"]["coverage"] = json!({
-                    "error": "No coverage data available"
-                });
-            }
-        }
-    }
-
-    // Add quality metrics if requested
-    if include_quality {
-        println!("🔍 Collecting quality metrics...");
-        // For now, we'll add a placeholder. This would integrate with test validation results
-        report_data["sections"]["quality"] = json!({
-            "note": "Quality metrics feature coming soon"
-        });
-    }
-
-    // Generate report in requested format
-    let report_content = match format {
-        "json" => {
-            serde_json::to_string_pretty(&report_data)?
-        }
-        "markdown" => {
-            generate_markdown_report(&report_data)
-        }
-        "html" => {
-            generate_html_report(&report_data)
-        }
-        "text" => {
-            generate_text_report(&report_data)
-        }
-        _ => anyhow::bail!("Unsupported format: {}. Use: text, json, markdown, html", format),
+    let request = RollbackRequest {
+        environment: env.to_string(),
+        target_version: version.map(|v| v.to_string()),
+        skip_validation,
+        force,
     };
 
-    // Output report
-    if let Some(path) = output_path {
-        tokio::fs::write(path, &report_content).await?;
-        println!();
-        println!("✅ Test report written to: {}", path.display());
+    println!("Initiating rollback for environment '{}'...", env);
+    if let Some(v) = version {
+        println!("Target version: {}", v);
     } else {
-        println!();
-        println!("{}", report_content);
+        println!("Target: Previous successful deployment");
     }
-
-    Ok(())
-}
-
-fn generate_text_report(data: &serde_json::Value) -> String {
-    let mut report = String::new();
-
-    report.push_str("═══════════════════════════════════════════════════════════════\n");
-    report.push_str("                      TEST REPORT                              \n");
-    report.push_str("═══════════════════════════════════════════════════════════════\n");
-    report.push_str("\n");
-
-    if let Some(generated_at) = data["generated_at"].as_str() {
-        report.push_str(&format!("Generated: {}\n\n", generated_at));
-    }
-
-    // Coverage section
-    if let Some(coverage) = data["sections"]["coverage"].as_object() {
-        if let Some(overall) = coverage["overall_percent"].as_f64() {
-            report.push_str("COVERAGE SUMMARY\n");
-            report.push_str(&format!("Overall: {:.1}%\n\n", overall));
-
-            if let Some(modules) = coverage["modules"].as_array() {
-                report.push_str("Module Breakdown:\n");
-                for module in modules {
-                    let name = module["name"].as_str().unwrap_or("unknown");
-                    let cov = module["coverage"].as_f64().unwrap_or(0.0);
-                    let threshold = module["threshold"].as_f64().unwrap_or(0.0);
-                    let meets = module["meets_threshold"].as_bool().unwrap_or(false);
-                    let status = if meets { "✅" } else { "⚠️" };
-
-                    report.push_str(&format!("  {} {}: {:.1}% (target: {:.0}%)\n",
-                        status, name, cov, threshold));
-                }
-            }
-        } else if let Some(error) = coverage["error"].as_str() {
-            report.push_str(&format!("Coverage: {}\n", error));
-        }
-        report.push_str("\n");
-    }
-
-    // Quality section
-    if let Some(quality) = data["sections"]["quality"].as_object() {
-        if let Some(note) = quality["note"].as_str() {
-            report.push_str("QUALITY METRICS\n");
-            report.push_str(&format!("{}\n\n", note));
-        }
-    }
-
-    report
-}
-
-fn generate_markdown_report(data: &serde_json::Value) -> String {
-    let mut report = String::new();
-
-    report.push_str("# Test Report\n\n");
-
-    if let Some(generated_at) = data["generated_at"].as_str() {
-        report.push_str(&format!("*Generated: {}*\n\n", generated_at));
-    }
-
-    // Coverage section
-    if let Some(coverage) = data["sections"]["coverage"].as_object() {
-        if let Some(overall) = coverage["overall_percent"].as_f64() {
-            report.push_str("## Coverage Summary\n\n");
-            report.push_str(&format!("**Overall:** {:.1}%\n\n", overall));
-
-            if let Some(modules) = coverage["modules"].as_array() {
-                report.push_str("### Module Breakdown\n\n");
-                report.push_str("| Module | Coverage | Threshold | Status |\n");
-                report.push_str("|--------|----------|-----------|--------|\n");
-
-                for module in modules {
-                    let name = module["name"].as_str().unwrap_or("unknown");
-                    let cov = module["coverage"].as_f64().unwrap_or(0.0);
-                    let threshold = module["threshold"].as_f64().unwrap_or(0.0);
-                    let meets = module["meets_threshold"].as_bool().unwrap_or(false);
-                    let status = if meets { "✅" } else { "⚠️" };
-
-                    report.push_str(&format!("| {} | {:.1}% | {:.0}% | {} |\n",
-                        name, cov, threshold, status));
-                }
-            }
-        } else if let Some(error) = coverage["error"].as_str() {
-            report.push_str(&format!("**Coverage:** {}\n", error));
-        }
-        report.push_str("\n");
-    }
-
-    // Quality section
-    if let Some(quality) = data["sections"]["quality"].as_object() {
-        if let Some(note) = quality["note"].as_str() {
-            report.push_str("## Quality Metrics\n\n");
-            report.push_str(&format!("{}\n\n", note));
-        }
-    }
-
-    report
-}
-
-fn generate_html_report(data: &serde_json::Value) -> String {
-    let mut report = String::new();
-
-    report.push_str("<!DOCTYPE html>\n");
-    report.push_str("<html>\n<head>\n");
-    report.push_str("<title>Test Report</title>\n");
-    report.push_str("<style>\n");
-    report.push_str("body { font-family: Arial, sans-serif; margin: 40px; }\n");
-    report.push_str("h1 { color: #333; }\n");
-    report.push_str("table { border-collapse: collapse; width: 100%; margin: 20px 0; }\n");
-    report.push_str("th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }\n");
-    report.push_str("th { background-color: #4CAF50; color: white; }\n");
-    report.push_str(".good { color: green; }\n");
-    report.push_str(".warning { color: orange; }\n");
-    report.push_str("</style>\n");
-    report.push_str("</head>\n<body>\n");
-
-    report.push_str("<h1>Test Report</h1>\n");
-
-    if let Some(generated_at) = data["generated_at"].as_str() {
-        report.push_str(&format!("<p><em>Generated: {}</em></p>\n", generated_at));
-    }
-
-    // Coverage section
-    if let Some(coverage) = data["sections"]["coverage"].as_object() {
-        if let Some(overall) = coverage["overall_percent"].as_f64() {
-            report.push_str("<h2>Coverage Summary</h2>\n");
-            report.push_str(&format!("<p><strong>Overall:</strong> {:.1}%</p>\n", overall));
-
-            if let Some(modules) = coverage["modules"].as_array() {
-                report.push_str("<h3>Module Breakdown</h3>\n");
-                report.push_str("<table>\n");
-                report.push_str("<tr><th>Module</th><th>Coverage</th><th>Threshold</th><th>Status</th></tr>\n");
-
-                for module in modules {
-                    let name = module["name"].as_str().unwrap_or("unknown");
-                    let cov = module["coverage"].as_f64().unwrap_or(0.0);
-                    let threshold = module["threshold"].as_f64().unwrap_or(0.0);
-                    let meets = module["meets_threshold"].as_bool().unwrap_or(false);
-                    let status = if meets { "✅" } else { "⚠️" };
-                    let class = if meets { "good" } else { "warning" };
-
-                    report.push_str(&format!("<tr><td>{}</td><td>{:.1}%</td><td>{:.0}%</td><td class=\"{}\">{}</td></tr>\n",
-                        name, cov, threshold, class, status));
-                }
-                report.push_str("</table>\n");
-            }
-        } else if let Some(error) = coverage["error"].as_str() {
-            report.push_str(&format!("<p><strong>Coverage:</strong> {}</p>\n", error));
-        }
-    }
-
-    // Quality section
-    if let Some(quality) = data["sections"]["quality"].as_object() {
-        if let Some(note) = quality["note"].as_str() {
-            report.push_str("<h2>Quality Metrics</h2>\n");
-            report.push_str(&format!("<p>{}</p>\n", note));
-        }
-    }
-
-    report.push_str("</body>\n</html>\n");
-    report
-}
-
-async fn handle_test_validate(
-    db: &Database,
-    file: &std::path::Path,
-    run_mutation: bool,
-    source_file: Option<&std::path::Path>,
-    store_report: bool,
-    output_format: &str,
-) -> Result<()> {
-    use orchestrate_core::TestQualityService;
-
-    let service = TestQualityService::new(db.clone());
-
-    println!("🔍 Validating test file: {}", file.display());
     println!();
 
-    // Validate test file
-    let mut report = service.validate_test_file(file).await?;
+    let rollback_event = rollback_service.rollback(request).await?;
 
-    // Run mutation testing if requested
-    if run_mutation {
-        if let Some(source) = source_file {
-            println!("🧬 Running mutation testing...");
-            match service.run_mutation_testing(file, source).await {
-                Ok(mutation_result) => {
-                    report.set_mutation_result(mutation_result);
-                    println!("✅ Mutation testing complete");
-                }
-                Err(e) => {
-                    warn!("Mutation testing failed: {}", e);
-                    println!("⚠️  Mutation testing failed: {}", e);
-                }
-            }
-        } else {
-            println!("⚠️  Mutation testing requires --source <file>");
-        }
-    }
-
-    // Store report if requested
-    if store_report {
-        let report_id = service.store_quality_report(&report).await?;
-        println!("💾 Stored quality report with ID: {}", report_id);
-    }
-
-    // Output report
-    match output_format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        "text" | _ => {
-            print_quality_report(&report);
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle test analyze-pr command
-async fn handle_test_analyze_pr(
-    _db: &Database,
-    pr_number: Option<i32>,
-    base: &str,
-    head: Option<&str>,
-    post_comment: bool,
-    output_format: &str,
-) -> Result<()> {
-    use orchestrate_core::ChangeTestAnalyzer;
-    use std::process::Command;
-
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║           PR Test Coverage Analysis                          ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
-    println!();
-
-    // Get current working directory as repo path
-    let repo_path = std::env::current_dir()?;
-
-    // Determine head reference
-    let head_ref = if let Some(h) = head {
-        h.to_string()
-    } else if let Some(_pr) = pr_number {
-        // If PR number is provided, fetch from GitHub
-        anyhow::bail!("Fetching head ref from PR number not yet implemented. Please specify --head")
-    } else {
-        // Get current branch
-        let output = Command::new("git")
-            .args(["branch", "--show-current"])
-            .output()?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Failed to get current branch: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        String::from_utf8(output.stdout)?.trim().to_string()
-    };
-
-    println!("  Base:  {}", base);
-    println!("  Head:  {}", head_ref);
-    println!();
-
-    // Get git diff
-    println!("📊 Analyzing changes...");
-    let diff_output = Command::new("git")
-        .args(["diff", base, &head_ref])
-        .output()?;
-
-    if !diff_output.status.success() {
-        anyhow::bail!(
-            "Failed to get git diff: {}",
-            String::from_utf8_lossy(&diff_output.stderr)
-        );
-    }
-
-    let diff_content = String::from_utf8(diff_output.stdout)?;
-
-    if diff_content.trim().is_empty() {
-        println!("ℹ️  No changes detected between {} and {}", base, head_ref);
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&rollback_event)?);
         return Ok(());
     }
 
-    // Analyze diff
-    let analyzer = ChangeTestAnalyzer::new(repo_path);
-    let result = analyzer.analyze_diff(&diff_content, base, &head_ref).await?;
-
-    println!("✅ Analysis complete");
+    // Table format
+    println!("Rollback completed successfully!");
     println!();
+    println!("Rollback Details:");
+    println!("  ID: {}", rollback_event.id);
+    println!("  Type: {}", rollback_event.rollback_type);
+    println!("  Target Version: {}", rollback_event.target_version);
+    println!("  Status: {}", rollback_event.status);
+    println!(
+        "  Started At: {}",
+        rollback_event.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    if let Some(completed_at) = rollback_event.completed_at {
+        println!(
+            "  Completed At: {}",
+            completed_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        let duration = (completed_at - rollback_event.started_at).num_seconds();
+        println!("  Duration: {}s", duration);
+    }
+    println!(
+        "  Notification Sent: {}",
+        if rollback_event.notification_sent {
+            "Yes"
+        } else {
+            "No"
+        }
+    );
 
-    // Output results
-    match output_format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        "markdown" => {
-            let comment = analyzer.format_pr_comment(&result);
-            println!("{}", comment);
-        }
-        "text" | _ => {
-            print_change_analysis(&result);
-        }
+    if let Some(error) = &rollback_event.error_message {
+        println!("  Error: {}", error);
     }
 
-    // Post as PR comment if requested
-    if post_comment {
-        if let Some(pr) = pr_number {
-            println!();
-            println!("💬 Posting comment to PR #{}...", pr);
+    println!();
+    println!("Environment '{}' has been rolled back to version '{}'", env, rollback_event.target_version);
 
-            let comment = analyzer.format_pr_comment(&result);
+    Ok(())
+}
 
-            let output = Command::new("gh")
-                .args([
-                    "pr",
-                    "comment",
-                    &pr.to_string(),
-                    "--body",
-                    &comment,
-                ])
-                .output()?;
+async fn handle_deploy_deploy(
+    db: &Database,
+    env: &str,
+    version: &str,
+    strategy: Option<&str>,
+    provider: Option<&str>,
+    timeout: Option<u32>,
+    skip_validation: bool,
+    format: &str,
+) -> Result<()> {
+    use orchestrate_core::{BatchSize, BlueGreenEnvironment, DeploymentExecutor, DeploymentProvider, DeploymentRequest, DeploymentStrategy};
 
-            if !output.status.success() {
-                anyhow::bail!(
-                    "Failed to post PR comment: {}",
-                    String::from_utf8_lossy(&output.stderr)
+    println!("Deploying version {} to environment '{}'...", version, env);
+    println!();
+
+    // Parse strategy if provided
+    let deployment_strategy = if let Some(strat) = strategy {
+        match strat.to_lowercase().as_str() {
+            "rolling" => Some(DeploymentStrategy::rolling(BatchSize::Count(5), 30)), // Default batch size 5, 30s delay
+            "blue-green" | "bluegreen" => Some(DeploymentStrategy::blue_green(BlueGreenEnvironment::Blue)), // Start with blue
+            "canary" => Some(DeploymentStrategy::canary(vec![10, 50, 100])), // Default traffic steps
+            "recreate" => Some(DeploymentStrategy::recreate()),
+            _ => return Err(anyhow::anyhow!("Invalid deployment strategy: {}. Valid options: rolling, blue-green, canary, recreate", strat)),
+        }
+    } else {
+        None
+    };
+
+    // Parse provider if provided
+    let deployment_provider = if let Some(prov) = provider {
+        let provider_type = match prov.to_lowercase().as_str() {
+            "docker" => DeploymentProvider::Docker,
+            "aws-ecs" => DeploymentProvider::AwsEcs,
+            "aws-lambda" => DeploymentProvider::AwsLambda,
+            "kubernetes" | "k8s" => DeploymentProvider::Kubernetes,
+            "vercel" => DeploymentProvider::Vercel,
+            "netlify" => DeploymentProvider::Netlify,
+            "railway" => DeploymentProvider::Railway,
+            _ => return Err(anyhow::anyhow!("Invalid deployment provider: {}. Valid options: docker, aws-ecs, aws-lambda, kubernetes, vercel, netlify, railway", prov)),
+        };
+        Some(provider_type)
+    } else {
+        None
+    };
+
+    let executor = DeploymentExecutor::new(Arc::new(db.clone()));
+    let request = DeploymentRequest {
+        environment: env.to_string(),
+        version: version.to_string(),
+        provider: deployment_provider,
+        strategy: deployment_strategy,
+        timeout_seconds: timeout,
+        skip_validation,
+    };
+
+    let deployment = executor.deploy(request).await?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&deployment)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment initiated successfully!");
+    println!();
+    println!("Deployment Details:");
+    println!("  ID: {}", deployment.id);
+    println!("  Environment: {}", deployment.environment_name);
+    println!("  Version: {}", deployment.version);
+    println!("  Provider: {}", deployment.provider);
+    println!("  Status: {}", deployment.status);
+    if let Some(strategy) = &deployment.strategy {
+        println!("  Strategy: {:?}", strategy);
+    }
+    println!(
+        "  Started At: {}",
+        deployment.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    use orchestrate_core::DeploymentStatus;
+    match deployment.status {
+        DeploymentStatus::Completed | DeploymentStatus::Failed | DeploymentStatus::RolledBack | DeploymentStatus::TimedOut => {
+            if let Some(completed_at) = deployment.completed_at {
+                println!(
+                    "  Completed At: {}",
+                    completed_at.format("%Y-%m-%d %H:%M:%S UTC")
                 );
+                if let Some(duration) = deployment.duration() {
+                    println!("  Duration: {}s", duration.num_seconds());
+                }
             }
-
-            println!("✅ Comment posted successfully");
-        } else {
-            println!("⚠️  Cannot post comment: --pr number required");
+        }
+        _ => {
+            println!();
+            println!("Deployment is in progress. Use 'orchestrate deploy status --env {}' to check status.", env);
         }
     }
 
     Ok(())
 }
 
-fn print_change_analysis(result: &orchestrate_core::ChangeAnalysisResult) {
-    println!("═══════════════════════════════════════════════════════════════");
-    println!("  Test Coverage Analysis Results");
-    println!("═══════════════════════════════════════════════════════════════");
+async fn handle_deploy_status(db: &Database, env: &str, format: &str) -> Result<()> {
+    // Get the current/latest deployment for this environment
+    let deployments = db.list_deployments(env, Some(1)).await?;
+
+    if deployments.is_empty() {
+        println!("No active deployment found for environment '{}'", env);
+        return Ok(());
+    }
+
+    let deployment = &deployments[0];
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&deployment)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment Status for '{}'", env);
     println!();
-
-    println!("  Coverage: {:.1}% of changed functions have tests", result.coverage_percentage);
-    println!("  Changed functions: {}", result.changed_functions.len());
-    println!("  Functions with tests: {}", result.coverage.iter().filter(|c| c.has_tests).count());
-    println!("  Functions without tests: {}", result.suggestions.len());
-    println!();
-
-    if result.suggestions.is_empty() {
-        println!("✅ All changed functions have test coverage!");
-        return;
+    println!("  ID: {}", deployment.id);
+    println!("  Version: {}", deployment.version);
+    println!("  Provider: {}", deployment.provider);
+    println!("  Status: {}", deployment.status);
+    if let Some(strategy) = &deployment.strategy {
+        println!("  Strategy: {:?}", strategy);
     }
-
-    // Group suggestions by priority
-    let high: Vec<_> = result.suggestions.iter()
-        .filter(|s| matches!(s.priority, orchestrate_core::Priority::High))
-        .collect();
-    let medium: Vec<_> = result.suggestions.iter()
-        .filter(|s| matches!(s.priority, orchestrate_core::Priority::Medium))
-        .collect();
-    let low: Vec<_> = result.suggestions.iter()
-        .filter(|s| matches!(s.priority, orchestrate_core::Priority::Low))
-        .collect();
-
-    if !high.is_empty() {
-        println!("🔴 High Priority ({} functions)", high.len());
-        println!("───────────────────────────────────────────────────────────────");
-        for suggestion in high {
-            print_suggestion(suggestion);
-        }
-        println!();
-    }
-
-    if !medium.is_empty() {
-        println!("🟡 Medium Priority ({} functions)", medium.len());
-        println!("───────────────────────────────────────────────────────────────");
-        for suggestion in medium {
-            print_suggestion(suggestion);
-        }
-        println!();
-    }
-
-    if !low.is_empty() {
-        println!("🟢 Low Priority ({} functions)", low.len());
-        println!("───────────────────────────────────────────────────────────────");
-        for suggestion in low {
-            print_suggestion(suggestion);
-        }
-        println!();
-    }
-
-    println!("═══════════════════════════════════════════════════════════════");
-}
-
-fn print_suggestion(suggestion: &orchestrate_core::TestSuggestion) {
-    println!("  📝 {} ({}:{})",
-        suggestion.function.name,
-        suggestion.function.file_path.display(),
-        suggestion.function.line_number
+    println!(
+        "  Started At: {}",
+        deployment.started_at.format("%Y-%m-%d %H:%M:%S UTC")
     );
-    println!("     {}", suggestion.reason);
-    println!("     Suggested tests:");
-    for test in &suggestion.suggested_tests {
-        println!("       • {}", test);
+
+    if let Some(completed_at) = deployment.completed_at {
+        println!(
+            "  Completed At: {}",
+            completed_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        if let Some(duration) = deployment.duration() {
+            println!("  Duration: {}s", duration.num_seconds());
+        }
     }
-    println!();
+
+    use orchestrate_core::DeploymentStatus;
+    match deployment.status {
+        DeploymentStatus::Completed => {
+            println!();
+            println!("Deployment is healthy and running.");
+        }
+        DeploymentStatus::Pending | DeploymentStatus::Validating | DeploymentStatus::InProgress => {
+            println!();
+            println!("Deployment is in progress...");
+        }
+        DeploymentStatus::Failed | DeploymentStatus::RolledBack | DeploymentStatus::TimedOut => {
+            println!();
+            println!("Deployment has failed or been cancelled.");
+            if let Some(error) = &deployment.error_message {
+                println!("  Error: {}", error);
+            }
+        }
+    }
+
+    Ok(())
 }
 
-fn print_quality_report(report: &orchestrate_core::TestQualityReport) {
-    use orchestrate_core::TestIssueType;
+async fn handle_deploy_history(
+    db: &Database,
+    env: &str,
+    limit: usize,
+    format: &str,
+) -> Result<()> {
+    let deployments = db
+        .list_deployments(env, Some(limit as i64))
+        .await?;
 
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║              Test Quality Validation Report                  ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    if deployments.is_empty() {
+        println!("No deployment history found for environment '{}'", env);
+        return Ok(());
+    }
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&deployments)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment History for '{}' (showing {} most recent)", env, deployments.len());
     println!();
-    println!("  File: {}", report.file_path);
+    println!("{:<6} {:<12} {:<20} {:<15} {:<20} {:<10}", "ID", "Version", "Started At", "Status", "Duration", "Provider");
+    println!("{}", "-".repeat(95));
+
+    for deployment in &deployments {
+        let started = deployment.started_at.format("%Y-%m-%d %H:%M:%S");
+        let duration = if let Some(dur) = deployment.duration() {
+            format!("{}s", dur.num_seconds())
+        } else {
+            "In progress".to_string()
+        };
+
+        println!(
+            "{:<6} {:<12} {:<20} {:<15} {:<20} {:<10}",
+            deployment.id,
+            deployment.version,
+            started,
+            format!("{}", deployment.status),
+            duration,
+            deployment.provider
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_deploy_diff(
+    db: &Database,
+    env: &str,
+    target_version: &str,
+    format: &str,
+) -> Result<()> {
+    // Get current deployment
+    let deployments = db.list_deployments(env, Some(1)).await?;
+
+    if format == "json" {
+        let diff = if let Some(current) = deployments.first() {
+            serde_json::json!({
+                "environment": env,
+                "current_version": current.version,
+                "target_version": target_version,
+                "current_deployment_id": current.id,
+                "is_new_deployment": false
+            })
+        } else {
+            serde_json::json!({
+                "environment": env,
+                "current_version": null,
+                "target_version": target_version,
+                "is_new_deployment": true
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+        return Ok(());
+    }
+
+    // Table format
+    println!("Deployment Diff for '{}'", env);
     println!();
 
-    // Quality score with visual indicator
-    let score_indicator = if report.quality_score >= 90.0 {
-        "✅"
-    } else if report.quality_score >= 70.0 {
-        "⚠️"
+    if let Some(current) = deployments.first() {
+        println!("Current Deployment:");
+        println!("  Version: {}", current.version);
+        println!("  Status: {}", current.status);
+        println!("  Provider: {}", current.provider);
+        if let Some(strategy) = &current.strategy {
+            println!("  Strategy: {:?}", strategy);
+        }
+        println!(
+            "  Deployed At: {}",
+            current.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        println!();
+        println!("Target Deployment:");
+        println!("  Version: {}", target_version);
+        println!();
+
+        if current.version == target_version {
+            println!("No changes - target version is already deployed.");
+        } else {
+            println!("Changes:");
+            println!("  Version: {} -> {}", current.version, target_version);
+            println!();
+            println!("This will deploy a new version to the environment.");
+        }
     } else {
-        "❌"
+        println!("No current deployment found.");
+        println!();
+        println!("Target Deployment:");
+        println!("  Version: {}", target_version);
+        println!();
+        println!("This will be a new deployment to the environment.");
+    }
+
+    Ok(())
+}
+
+// ==================== Release Management Handlers ====================
+
+async fn handle_release_prepare(
+    db: &Database,
+    bump_type_str: &str,
+    cargo_toml: &PathBuf,
+    changelog_path: &PathBuf,
+    bump_frontend: bool,
+) -> Result<()> {
+    use orchestrate_core::{BumpType, ReleaseManager};
+    use std::str::FromStr;
+
+    // Parse bump type
+    let bump_type = BumpType::from_str(bump_type_str)?;
+
+    let manager = ReleaseManager::new(db.clone());
+
+    println!("Preparing {} release...", bump_type);
+    println!();
+
+    // Prepare release
+    let preparation = manager.prepare_release(bump_type.clone(), cargo_toml).await?;
+
+    println!("New version: {}", preparation.new_version);
+    println!("Release branch: {}", preparation.branch_name);
+    println!();
+
+    // Show changelog preview
+    println!("Changelog preview:");
+    println!("{}", preparation.changelog.to_markdown());
+
+    // Ask for confirmation
+    print!("Proceed with version bump? [y/N]: ");
+    use std::io::{self, Write};
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    if !input.trim().eq_ignore_ascii_case("y") {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // Create release branch
+    println!("\nCreating release branch...");
+    manager.create_release_branch(&preparation.branch_name).await?;
+    println!("✓ Created branch: {}", preparation.branch_name);
+
+    // Bump version in Cargo.toml
+    println!("\nBumping version in Cargo.toml...");
+    manager.bump_version(cargo_toml, &preparation.new_version).await?;
+    println!("✓ Updated Cargo.toml: {}", preparation.new_version);
+
+    // Bump frontend package.json if requested
+    if bump_frontend {
+        let package_json = PathBuf::from("frontend/package.json");
+        if package_json.exists() {
+            println!("\nBumping version in package.json...");
+            manager.bump_package_json_version(&package_json, &preparation.new_version).await?;
+            println!("✓ Updated package.json: {}", preparation.new_version);
+        }
+    }
+
+    // Update CHANGELOG.md
+    println!("\nUpdating CHANGELOG.md...");
+    manager.update_changelog_file(changelog_path, &preparation.changelog).await?;
+    println!("✓ Updated CHANGELOG.md");
+
+    println!("\n{}", "=".repeat(60));
+    println!("Release preparation complete!");
+    println!("{}", "=".repeat(60));
+    println!();
+    println!("Next steps:");
+    println!("  1. Review the changes");
+    println!("  2. Commit the version bump:");
+    println!("     git add -A");
+    println!("     git commit -m \"chore: Bump version to {}\"", preparation.new_version);
+    println!("  3. Create the release:");
+    println!("     orchestrate release create --version {}", preparation.new_version);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_release_create(
+    db: &Database,
+    version_str: &str,
+    message: Option<&str>,
+    push: bool,
+) -> Result<()> {
+    use orchestrate_core::{ReleaseManager, Version};
+
+    let manager = ReleaseManager::new(db.clone());
+
+    // Parse version
+    let version = Version::parse(version_str)?;
+
+    println!("Creating release for version {}...", version);
+    println!();
+
+    // Get release message (use provided or default)
+    let release_message = message
+        .map(String::from)
+        .unwrap_or_else(|| format!("Release version {}", version));
+
+    // Create git tag
+    println!("Creating git tag...");
+    manager.create_release_tag(&version, &release_message).await?;
+    println!("✓ Created tag: v{}", version);
+
+    // Push tag if requested
+    if push {
+        println!("\nPushing tag to remote...");
+        manager.push_tag(&version).await?;
+        println!("✓ Pushed tag to origin");
+    }
+
+    println!("\n{}", "=".repeat(60));
+    println!("Release created successfully!");
+    println!("{}", "=".repeat(60));
+    println!();
+    println!("Version: {}", version);
+    println!("Tag: v{}", version);
+
+    if !push {
+        println!();
+        println!("To push the tag to remote, run:");
+        println!("  git push origin v{}", version);
+    }
+
+    println!();
+    println!("To create a GitHub release, use the GitHub CLI:");
+    println!("  gh release create v{} --title \"Release {}\" --notes-file CHANGELOG.md", version, version);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_release_publish(
+    _db: &Database,
+    version: &str,
+    repo_path: &PathBuf,
+    token: Option<&str>,
+    prerelease: bool,
+    draft: bool,
+) -> Result<()> {
+    use std::process::Command;
+
+    println!("Publishing release {}...", version);
+    println!();
+
+    // Check if gh CLI is available
+    let gh_check = Command::new("gh").arg("--version").output();
+    if gh_check.is_err() {
+        return Err(anyhow::anyhow!(
+            "GitHub CLI (gh) is not installed. Please install it from https://cli.github.com/"
+        ));
+    }
+
+    // Change to repo directory
+    std::env::set_current_dir(repo_path)?;
+
+    // Verify tag exists
+    let tag = format!("v{}", version);
+    let tag_check = Command::new("git")
+        .args(&["tag", "-l", &tag])
+        .output()?;
+
+    if tag_check.stdout.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Tag {} does not exist. Create it first with 'orchestrate release create'",
+            tag
+        ));
+    }
+
+    // Build gh release create command
+    let mut cmd = Command::new("gh");
+    cmd.args(&["release", "create", &tag]);
+    cmd.args(&["--title", &format!("Release {}", version)]);
+
+    // Check if CHANGELOG.md has an entry for this version
+    let changelog_path = repo_path.join("CHANGELOG.md");
+    if changelog_path.exists() {
+        cmd.args(&["--notes-file", "CHANGELOG.md"]);
+    } else {
+        cmd.args(&["--notes", &format!("Release version {}", version)]);
+    }
+
+    if prerelease {
+        cmd.arg("--prerelease");
+    }
+
+    if draft {
+        cmd.arg("--draft");
+    }
+
+    // Set GitHub token if provided
+    if let Some(t) = token {
+        cmd.env("GITHUB_TOKEN", t);
+    }
+
+    println!("Creating GitHub release...");
+    let output = cmd.output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Failed to create GitHub release: {}", stderr));
+    }
+
+    println!("✓ GitHub release created successfully!");
+    println!();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{}", stdout);
+
+    Ok(())
+}
+
+async fn handle_release_notes(
+    _db: &Database,
+    from_tag: &str,
+    to_tag: &str,
+    repo_path: &PathBuf,
+    format: &str,
+) -> Result<()> {
+    use orchestrate_core::{ReleaseManager, Version};
+    use std::process::Command;
+
+    println!("Generating release notes from {} to {}...", from_tag, to_tag);
+    println!();
+
+    // Change to repo directory
+    std::env::set_current_dir(repo_path)?;
+
+    // Get commits between tags
+    let git_output = Command::new("git")
+        .args(&[
+            "log",
+            &format!("{}..{}", from_tag, to_tag),
+            "--pretty=format:%H|%s|%b",
+            "--no-merges",
+        ])
+        .output()?;
+
+    if !git_output.status.success() {
+        return Err(anyhow::anyhow!("Failed to get git log"));
+    }
+
+    let log_output = String::from_utf8_lossy(&git_output.stdout);
+    let commits: Vec<_> = log_output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let parts: Vec<&str> = line.splitn(3, '|').collect();
+            let hash = parts.get(0).unwrap_or(&"").to_string();
+            let subject = parts.get(1).unwrap_or(&"").to_string();
+            let body = parts.get(2).unwrap_or(&"").to_string();
+
+            // Combine subject and body for the message
+            let message = if body.is_empty() {
+                subject
+            } else {
+                format!("{}\n\n{}", subject, body)
+            };
+
+            orchestrate_core::Commit {
+                hash: hash.clone(),
+                message,
+                author: "Unknown".to_string(),
+                date: chrono::Utc::now(), // We could parse this from git too
+            }
+        })
+        .collect();
+
+    if commits.is_empty() {
+        println!("No commits found between {} and {}", from_tag, to_tag);
+        return Ok(());
+    }
+
+    // Parse version if to_tag looks like a version
+    let to_version = if to_tag.starts_with('v') {
+        Version::parse(&to_tag[1..]).ok()
+    } else {
+        Version::parse(to_tag).ok()
     };
-    println!("  Quality Score: {:.1}% {}", report.quality_score, score_indicator);
+
+    // Create release manager
+    let manager = ReleaseManager::new(_db.clone());
+
+    // Generate changelog - we need a version for this
+    let version = to_version.unwrap_or_else(|| Version::parse("0.0.0").unwrap());
+    let changelog = manager.generate_changelog(&commits, &version);
+
+    if format == "json" {
+        // Convert changelog to JSON manually since it doesn't implement Serialize
+        let json = serde_json::json!({
+            "version": version.to_string(),
+            "entries": changelog.entries.iter().map(|entry| {
+                serde_json::json!({
+                    "type": format!("{:?}", entry.commit_type),
+                    "description": entry.description,
+                    "pr_number": entry.pr_number,
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        return Ok(());
+    }
+
+    // Markdown format
+    println!("{}", "=".repeat(60));
+    println!("Release Notes: {} → {}", from_tag, to_tag);
+    println!("{}", "=".repeat(60));
     println!();
 
-    // Issues by category
-    if !report.issues.is_empty() {
-        println!("  Issues Found: {}", report.issues.len());
-        println!();
+    println!("## [{}]", version);
+    println!();
 
-        // Group issues by type
-        let mut weak_assertions = Vec::new();
-        let mut always_passes = Vec::new();
-        let mut implementation_focused = Vec::new();
-        let mut mutation_survived = Vec::new();
-        let mut improper_setup = Vec::new();
+    let mut has_added = false;
+    let mut has_changed = false;
+    let mut has_fixed = false;
+    let mut has_other = false;
 
-        for issue in &report.issues {
-            match issue.issue_type {
-                TestIssueType::WeakAssertion => weak_assertions.push(issue),
-                TestIssueType::AlwaysPasses => always_passes.push(issue),
-                TestIssueType::ImplementationFocused => implementation_focused.push(issue),
-                TestIssueType::MutationSurvived => mutation_survived.push(issue),
-                TestIssueType::ImproperSetup => improper_setup.push(issue),
+    for entry in &changelog.entries {
+        match entry.commit_type {
+            orchestrate_core::CommitType::Feature => {
+                if !has_added {
+                    println!("### Added");
+                    println!();
+                    has_added = true;
+                }
+                println!("- {}", entry.description);
             }
-        }
-
-        if !weak_assertions.is_empty() {
-            println!("  ❌ Weak Assertions ({}):", weak_assertions.len());
-            for issue in weak_assertions {
-                print_issue(issue);
+            orchestrate_core::CommitType::Fix => {
+                if !has_fixed {
+                    if has_added {
+                        println!();
+                    }
+                    println!("### Fixed");
+                    println!();
+                    has_fixed = true;
+                }
+                println!("- {}", entry.description);
             }
-            println!();
-        }
-
-        if !always_passes.is_empty() {
-            println!("  ❌ Always Passes ({}):", always_passes.len());
-            for issue in always_passes {
-                print_issue(issue);
+            orchestrate_core::CommitType::Change => {
+                if !has_changed {
+                    if has_added || has_fixed {
+                        println!();
+                    }
+                    println!("### Changed");
+                    println!();
+                    has_changed = true;
+                }
+                println!("- {}", entry.description);
             }
-            println!();
-        }
-
-        if !implementation_focused.is_empty() {
-            println!("  ⚠️  Implementation-Focused ({}):", implementation_focused.len());
-            for issue in implementation_focused {
-                print_issue(issue);
+            _ => {
+                if !has_other {
+                    if has_added || has_fixed || has_changed {
+                        println!();
+                    }
+                    println!("### Other Changes");
+                    println!();
+                    has_other = true;
+                }
+                println!("- {}", entry.description);
             }
-            println!();
-        }
-
-        if !mutation_survived.is_empty() {
-            println!("  ❌ Mutations Survived ({}):", mutation_survived.len());
-            for issue in mutation_survived {
-                print_issue(issue);
-            }
-            println!();
-        }
-
-        if !improper_setup.is_empty() {
-            println!("  ⚠️  Improper Setup ({}):", improper_setup.len());
-            for issue in improper_setup {
-                print_issue(issue);
-            }
-            println!();
-        }
-    } else {
-        println!("  ✅ No issues found");
-        println!();
-    }
-
-    // Mutation testing results
-    if let Some(ref mutation) = report.mutation_result {
-        println!("  Mutation Testing:");
-        println!("    Total mutations:     {}", mutation.total_mutations);
-        println!("    Mutations caught:    {} ✅", mutation.mutations_caught);
-        println!("    Mutations survived:  {} ❌", mutation.mutations_survived);
-        println!("    Mutation score:      {:.1}%", mutation.mutation_score);
-        println!();
-
-        if !mutation.survived_mutations.is_empty() {
-            println!("  Survived Mutations:");
-            for (i, detail) in mutation.survived_mutations.iter().enumerate().take(5) {
-                println!("    {}. {}:{}", i + 1, detail.file_path, detail.line_number);
-                println!("       Original: {}", detail.original);
-                println!("       Mutated:  {}", detail.mutated);
-            }
-            if mutation.survived_mutations.len() > 5 {
-                println!("    ... and {} more", mutation.survived_mutations.len() - 5);
-            }
-            println!();
         }
     }
 
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("Total commits: {}", commits.len());
+
+    Ok(())
 }
 
-fn print_issue(issue: &orchestrate_core::TestQualityIssue) {
-    if let Some(line) = issue.line_number {
-        println!("     • {} (line {})", issue.test_name, line);
-    } else {
-        println!("     • {}", issue.test_name);
+// ==================== Feature Flags Handlers ====================
+
+async fn handle_flags_list(db: &Database, environment: Option<&str>, format: &str) -> Result<()> {
+    let flags = db.list_feature_flags(environment).await?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&flags)?);
+        }
+        _ => {
+            // Table format
+            if flags.is_empty() {
+                println!("No feature flags found");
+                return Ok(());
+            }
+
+            println!("\nFeature Flags{}:\n",
+                environment.map(|e| format!(" (Environment: {})", e)).unwrap_or_default());
+            println!("{:<20} {:<30} {:<12} {:<10} {:<15}",
+                "KEY", "NAME", "STATUS", "ROLLOUT %", "ENVIRONMENT");
+            println!("{}", "-".repeat(90));
+
+            for flag in flags {
+                println!("{:<20} {:<30} {:<12} {:<10} {:<15}",
+                    flag.key,
+                    flag.name.chars().take(28).collect::<String>(),
+                    flag.status.to_string(),
+                    flag.rollout_percentage,
+                    flag.environment.as_deref().unwrap_or("global"));
+            }
+            println!();
+        }
     }
-    println!("       {}", issue.description);
-    if let Some(ref suggestion) = issue.suggestion {
-        println!("       💡 {}", suggestion);
-    }
+
+    Ok(())
 }
+
+async fn handle_flags_create(
+    db: &Database,
+    key: &str,
+    name: &str,
+    description: Option<&str>,
+    status: &str,
+    rollout: i32,
+    environment: Option<&str>,
+) -> Result<()> {
+    let flag_status: FlagStatus = status.parse()?;
+
+    let flag = CreateFeatureFlag {
+        key: key.to_string(),
+        name: name.to_string(),
+        description: description.map(|s| s.to_string()),
+        status: flag_status,
+        rollout_percentage: Some(rollout),
+        environment: environment.map(|s| s.to_string()),
+        metadata: None,
+    };
+
+    let created = db.create_feature_flag(flag).await?;
+
+    println!("\nFeature flag created successfully!");
+    println!("  Key: {}", created.key);
+    println!("  Name: {}", created.name);
+    println!("  Status: {}", created.status);
+    println!("  Rollout: {}%", created.rollout_percentage);
+    println!("  Environment: {}", created.environment.as_deref().unwrap_or("global"));
+    if let Some(desc) = &created.description {
+        println!("  Description: {}", desc);
+    }
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_show(db: &Database, key: &str, environment: Option<&str>, format: &str) -> Result<()> {
+    let flag = db.get_feature_flag(key, environment).await?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&flag)?);
+        }
+        _ => {
+            println!("\nFeature Flag Details:");
+            println!("  Key: {}", flag.key);
+            println!("  Name: {}", flag.name);
+            if let Some(desc) = &flag.description {
+                println!("  Description: {}", desc);
+            }
+            println!("  Status: {}", flag.status);
+            println!("  Rollout: {}%", flag.rollout_percentage);
+            println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+            if let Some(metadata) = &flag.metadata {
+                println!("  Metadata: {}", metadata);
+            }
+            println!("  Created: {}", flag.created_at.as_deref().unwrap_or("unknown"));
+            println!("  Updated: {}", flag.updated_at.as_deref().unwrap_or("unknown"));
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_flags_enable(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
+    let flag = db.enable_feature_flag(key, environment).await?;
+
+    println!("\nFeature flag '{}' enabled successfully!", key);
+    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+    println!("  Status: {}", flag.status);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_disable(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
+    let flag = db.disable_feature_flag(key, environment).await?;
+
+    println!("\nFeature flag '{}' disabled successfully!", key);
+    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+    println!("  Status: {}", flag.status);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_rollout(db: &Database, key: &str, percentage: i32, environment: Option<&str>) -> Result<()> {
+    let flag = db.set_feature_flag_rollout(key, environment, percentage).await?;
+
+    println!("\nFeature flag '{}' rollout updated successfully!", key);
+    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
+    println!("  Status: {}", flag.status);
+    println!("  Rollout: {}%", flag.rollout_percentage);
+    println!();
+
+    Ok(())
+}
+
+async fn handle_flags_delete(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
+    db.delete_feature_flag(key, environment).await?;
+
+    println!("\nFeature flag '{}' deleted successfully!", key);
+    println!("  Environment: {}", environment.unwrap_or("global"));
+    println!();
+
+    Ok(())
+}
+

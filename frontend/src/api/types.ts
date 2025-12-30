@@ -268,3 +268,56 @@ export interface ScheduleRun {
   completed_at: string | null;
   created_at: string;
 }
+
+// Deployment types
+export type DeploymentStatus = 'Pending' | 'InProgress' | 'Completed' | 'Failed' | 'RolledBack';
+
+export interface Environment {
+  id: number;
+  name: string;
+  type: string;
+  url: string | null;
+  config: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Deployment {
+  id: number;
+  environment_id: number;
+  environment_name: string;
+  version: string;
+  provider: string;
+  strategy: string | null;
+  status: string;
+  error_message: string | null;
+  started_at: string;
+  completed_at: string | null;
+  timeout_seconds: number;
+}
+
+export interface CreateDeploymentRequest {
+  environment: string;
+  version: string;
+  provider?: string;
+  strategy?: string;
+  timeout_seconds?: number;
+  skip_validation?: boolean;
+}
+
+export interface Release {
+  id: number;
+  version: string;
+  tag_name: string;
+  changelog: string | null;
+  published: boolean;
+  github_release_url: string | null;
+  created_at: string;
+  published_at: string | null;
+}
+
+export interface CreateReleaseRequest {
+  version: string;
+  tag_name: string;
+  changelog?: string;
+}
