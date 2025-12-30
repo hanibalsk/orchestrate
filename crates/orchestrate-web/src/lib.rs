@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod metrics;
+pub mod monitoring;
 pub mod schedule_executor;
 pub mod event_handlers;
 pub mod ui;

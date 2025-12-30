@@ -47,42 +47,42 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
-    fn unauthorized() -> Self {
+    pub fn unauthorized() -> Self {
         Self {
             error: "Invalid or missing API key".to_string(),
             code: "unauthorized".to_string(),
         }
     }
 
-    fn not_found(entity: &str) -> Self {
+    pub fn not_found(entity: &str) -> Self {
         Self {
             error: format!("{} not found", entity),
             code: "not_found".to_string(),
         }
     }
 
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "bad_request".to_string(),
         }
     }
 
-    fn validation(msg: impl Into<String>) -> Self {
+    pub fn validation(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "validation_error".to_string(),
         }
     }
 
-    fn internal(msg: impl Into<String>) -> Self {
+    pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "internal_error".to_string(),
         }
     }
 
-    fn conflict(msg: impl Into<String>) -> Self {
+    pub fn conflict(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "conflict".to_string(),
@@ -225,8 +225,12 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health_check))
         .route("/metrics", get(metrics_handler));
 
+    // Monitoring routes (protected)
+    let monitoring_router = crate::monitoring::create_monitoring_router();
+
     Router::new()
         .merge(protected_routes)
+        .merge(monitoring_router)
         .merge(public_routes)
         .with_state(state)
 }
