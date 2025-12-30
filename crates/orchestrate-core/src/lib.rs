@@ -29,6 +29,7 @@ pub mod test_generation;
 pub mod deployment;
 pub mod monitoring;
 pub mod slack;
+pub mod security;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -226,4 +227,13 @@ pub use slack::{
     SlackBlock, SlackConnection, SlackContextElement, SlackElement, SlackMessage, SlackOption,
     SlackText, SlashCommand, SlashCommandResponse, TextType, UserMapping,
     ApprovalDecision as SlackApprovalDecision,
+};
+
+// Re-export security types
+pub use security::{
+    DetectedSecret, FixChange, FixStatus, FixType, LicenseCheckResult, LicenseIssue,
+    LicenseIssueType, SarifArtifactLocation, SarifDriver, SarifLocation, SarifMessage,
+    SarifPhysicalLocation, SarifRegion, SarifReport, SarifResult, SarifRun, SarifTool,
+    ScanStatus, ScanSummary, ScanType, SecretType, SecurityException, SecurityFix,
+    SecurityPolicy, SecurityScan, Severity, Vulnerability, VulnerabilityType,
 };
