@@ -26,6 +26,7 @@ pub mod multi_repo;
 pub mod ci_integration;
 pub mod incident;
 pub mod test_generation;
+pub mod deployment;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -196,4 +197,13 @@ pub use test_generation::{
     TestableUnit, TestableUnitType, TestFramework, TestGenerationRequest, TestQualityIssue,
     TestQualityIssueType, TestQualityReport, TestResult, TestResultStatus, TestRun, TestRunStatus,
     TestSuggestion, TestType,
+};
+
+// Re-export deployment types
+pub use deployment::{
+    CanaryMetrics, CanaryStage, CanaryStageStatus, ChangeItem, Deployment, DeploymentChangeType,
+    DeploymentDiff, DeploymentLogEntry, DeploymentLogLevel, DeploymentMetrics, DeploymentProvider,
+    DeploymentStatus, DeploymentStrategy, Environment, EnvironmentType, FeatureFlag,
+    PostDeploymentVerification, PreDeploymentValidation, Release, ReleaseAsset,
+    ReleaseType, ValidationCheck, ValidationCheckType, VerificationCheck, VerificationCheckType,
 };

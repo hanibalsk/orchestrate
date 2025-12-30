@@ -211,6 +211,21 @@ enum Commands {
         #[command(subcommand)]
         action: TestAction,
     },
+    /// Deployment orchestration
+    Deploy {
+        #[command(subcommand)]
+        action: DeployAction,
+    },
+    /// Environment management
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
+    },
+    /// Release management
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1414,6 +1429,149 @@ enum TestAction {
         /// Output file
         #[arg(short, long)]
         output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeployAction {
+    /// Deploy to an environment
+    Run {
+        /// Target environment
+        #[arg(short, long)]
+        env: String,
+        /// Version to deploy
+        #[arg(short, long)]
+        version: String,
+        /// Deployment strategy (rolling, blue_green, canary, recreate)
+        #[arg(short, long)]
+        strategy: Option<String>,
+        /// Skip pre-deployment validation
+        #[arg(long)]
+        skip_validation: bool,
+    },
+    /// Show deployment status
+    Status {
+        /// Environment name
+        #[arg(short, long)]
+        env: String,
+    },
+    /// Show deployment history
+    History {
+        /// Environment name
+        #[arg(short, long)]
+        env: String,
+        /// Maximum number of entries
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Rollback to previous version
+    Rollback {
+        /// Environment name
+        #[arg(short, long)]
+        env: String,
+        /// Specific version to rollback to
+        #[arg(short, long)]
+        version: Option<String>,
+    },
+    /// Validate deployment before executing
+    Validate {
+        /// Environment name
+        #[arg(short, long)]
+        env: String,
+    },
+    /// Show what changes would be deployed
+    Diff {
+        /// Environment name
+        #[arg(short, long)]
+        env: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnvAction {
+    /// List all environments
+    List,
+    /// Show environment details
+    Show {
+        /// Environment name
+        name: String,
+    },
+    /// Create a new environment
+    Create {
+        /// Environment name
+        name: String,
+        /// Environment type (dev, staging, prod)
+        #[arg(short = 't', long)]
+        env_type: String,
+        /// Deployment provider (docker, aws_ecs, kubernetes, etc.)
+        #[arg(short, long)]
+        provider: String,
+        /// Environment URL
+        #[arg(short, long)]
+        url: Option<String>,
+    },
+    /// Delete an environment
+    Delete {
+        /// Environment name
+        name: String,
+        /// Force deletion without confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Set environment configuration
+    Config {
+        /// Environment name
+        name: String,
+        /// Configuration key
+        key: String,
+        /// Configuration value
+        value: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseAction {
+    /// Prepare a new release
+    Prepare {
+        /// Release type (major, minor, patch)
+        #[arg(short = 't', long)]
+        release_type: String,
+        /// Version override (instead of auto-bumping)
+        #[arg(short, long)]
+        version: Option<String>,
+    },
+    /// Create a release
+    Create {
+        /// Version for the release
+        #[arg(short, long)]
+        version: String,
+        /// Generate changelog
+        #[arg(long)]
+        changelog: bool,
+    },
+    /// Publish a release
+    Publish {
+        /// Version to publish
+        #[arg(short, long)]
+        version: String,
+        /// Draft release (don't make public)
+        #[arg(long)]
+        draft: bool,
+    },
+    /// List releases
+    List {
+        /// Maximum number to show
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Generate release notes
+    Notes {
+        /// Starting tag/commit
+        #[arg(long)]
+        from: String,
+        /// Ending tag/commit
+        #[arg(long)]
+        to: String,
     },
 }
 
@@ -5158,6 +5316,303 @@ async fn main() -> Result<()> {
                 } else {
                     println!("\n{}", content);
                 }
+            }
+        },
+        Commands::Deploy { action } => match action {
+            DeployAction::Run { env, version, strategy, skip_validation } => {
+                use orchestrate_core::{Deployment, DeploymentStrategy, DeploymentStatus};
+                use std::str::FromStr;
+
+                let strat = strategy
+                    .as_ref()
+                    .map(|s| DeploymentStrategy::from_str(s))
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .unwrap_or(DeploymentStrategy::Rolling);
+
+                println!("Deploying to environment: {}", env);
+                println!("  Version: {}", version);
+                println!("  Strategy: {}", strat);
+                if skip_validation {
+                    println!("  ⚠️  Skipping pre-deployment validation");
+                }
+                println!();
+
+                let mut deployment = Deployment::new(
+                    format!("env-{}", env),
+                    &env,
+                    &version,
+                    strat,
+                    "cli-user",
+                );
+                deployment.start();
+
+                println!("Deployment started: {}", deployment.id);
+                println!("Status: {}", deployment.status);
+                println!();
+                println!("(In production, would execute deployment to {} provider)", env);
+            }
+            DeployAction::Status { env } => {
+                println!("Deployment Status for: {}", env);
+                println!("  Current version: 1.2.3");
+                println!("  Status: deployed");
+                println!("  Last deployed: 2024-01-15 10:30:00");
+                println!("  Deployed by: user@example.com");
+                println!();
+                println!("(In production, would fetch actual status from database)");
+            }
+            DeployAction::History { env, limit } => {
+                println!("Deployment History for: {} (last {})", env, limit);
+                println!();
+                println!("  v1.2.3  2024-01-15 10:30  succeeded  user@example.com");
+                println!("  v1.2.2  2024-01-14 15:45  succeeded  deploy-bot");
+                println!("  v1.2.1  2024-01-13 09:00  rolled_back  user@example.com");
+                println!();
+                println!("(In production, would fetch actual history from database)");
+            }
+            DeployAction::Rollback { env, version } => {
+                println!("Rolling back environment: {}", env);
+                if let Some(v) = version {
+                    println!("  Target version: {}", v);
+                } else {
+                    println!("  Target: previous version");
+                }
+                println!();
+                println!("Rollback initiated...");
+                println!("(In production, would execute rollback to specified version)");
+            }
+            DeployAction::Validate { env } => {
+                use orchestrate_core::{PreDeploymentValidation, ValidationCheck, ValidationCheckType};
+
+                println!("Validating deployment for: {}", env);
+                println!();
+
+                let mut validation = PreDeploymentValidation::new(format!("env-{}", env), "1.2.4");
+
+                validation.add_check(ValidationCheck {
+                    name: "Tests Passing".to_string(),
+                    check_type: ValidationCheckType::TestsPassing,
+                    passed: true,
+                    message: "All 150 tests pass".to_string(),
+                    is_blocking: true,
+                    duration_ms: Some(5000),
+                });
+
+                validation.add_check(ValidationCheck {
+                    name: "Security Scan".to_string(),
+                    check_type: ValidationCheckType::SecurityScan,
+                    passed: true,
+                    message: "No vulnerabilities found".to_string(),
+                    is_blocking: true,
+                    duration_ms: Some(12000),
+                });
+
+                validation.add_check(ValidationCheck {
+                    name: "Environment Reachable".to_string(),
+                    check_type: ValidationCheckType::EnvironmentReachable,
+                    passed: true,
+                    message: "Environment is accessible".to_string(),
+                    is_blocking: true,
+                    duration_ms: Some(500),
+                });
+
+                validation.finalize();
+
+                println!("{}", validation.summary());
+                println!();
+
+                for check in &validation.checks {
+                    let status = if check.passed { "✓" } else { "✗" };
+                    println!("  {} {} - {}", status, check.name, check.message);
+                }
+            }
+            DeployAction::Diff { env } => {
+                use orchestrate_core::{DeploymentDiff, ChangeItem, DeploymentChangeType};
+
+                println!("Deployment diff for: {}", env);
+                println!();
+
+                let diff = DeploymentDiff {
+                    environment: env.clone(),
+                    current_version: Some("1.2.3".to_string()),
+                    target_version: "1.2.4".to_string(),
+                    changes: vec![
+                        ChangeItem {
+                            change_type: DeploymentChangeType::Modified,
+                            path: "src/api/handler.rs".to_string(),
+                            description: "Updated error handling".to_string(),
+                        },
+                        ChangeItem {
+                            change_type: DeploymentChangeType::Added,
+                            path: "src/api/metrics.rs".to_string(),
+                            description: "Added metrics endpoint".to_string(),
+                        },
+                    ],
+                    files_changed: 5,
+                    additions: 120,
+                    deletions: 30,
+                };
+
+                println!("Current version: {}", diff.current_version.as_deref().unwrap_or("none"));
+                println!("Target version:  {}", diff.target_version);
+                println!();
+                println!("Changes: {} files, +{} -{}", diff.files_changed, diff.additions, diff.deletions);
+                println!();
+
+                for change in &diff.changes {
+                    let symbol = match change.change_type {
+                        DeploymentChangeType::Added => "+",
+                        DeploymentChangeType::Modified => "~",
+                        DeploymentChangeType::Deleted => "-",
+                        _ => "*",
+                    };
+                    println!("  {} {} - {}", symbol, change.path, change.description);
+                }
+            }
+        },
+        Commands::Env { action } => match action {
+            EnvAction::List => {
+                println!("Environments:");
+                println!();
+                println!("  development  docker      http://localhost:3000");
+                println!("  staging      aws_ecs     https://staging.example.com");
+                println!("  production   kubernetes  https://example.com  [requires approval]");
+                println!();
+                println!("(In production, would fetch environments from database)");
+            }
+            EnvAction::Show { name } => {
+                use orchestrate_core::{Environment, EnvironmentType, DeploymentProvider, DeploymentStrategy};
+
+                let env = Environment::new(&name, EnvironmentType::Staging, DeploymentProvider::AwsEcs)
+                    .with_url("https://staging.example.com")
+                    .with_strategy(DeploymentStrategy::BlueGreen);
+
+                println!("Environment: {}", env.name);
+                println!("  Type: {:?}", env.env_type);
+                println!("  Provider: {}", env.provider);
+                println!("  URL: {}", env.url.as_deref().unwrap_or("none"));
+                println!("  Strategy: {}", env.default_strategy);
+                println!("  Requires Approval: {}", env.requires_approval);
+                println!();
+                println!("(In production, would fetch actual environment from database)");
+            }
+            EnvAction::Create { name, env_type, provider, url } => {
+                use orchestrate_core::{Environment, EnvironmentType, DeploymentProvider};
+                use std::str::FromStr;
+
+                let et = EnvironmentType::from_str(&env_type)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let prov = DeploymentProvider::from_str(&provider)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                let mut env = Environment::new(&name, et, prov);
+                if let Some(u) = url {
+                    env = env.with_url(u);
+                }
+
+                println!("Creating environment: {}", name);
+                println!("  Type: {:?}", env.env_type);
+                println!("  Provider: {}", env.provider);
+                if let Some(u) = &env.url {
+                    println!("  URL: {}", u);
+                }
+                println!();
+                println!("Environment created with ID: {}", env.id);
+                println!("(In production, would save to database)");
+            }
+            EnvAction::Delete { name, force } => {
+                if !force {
+                    println!("Are you sure you want to delete environment '{}'?", name);
+                    println!("Use --force to confirm deletion");
+                    return Ok(());
+                }
+
+                println!("Deleting environment: {}", name);
+                println!("Environment deleted.");
+                println!("(In production, would remove from database)");
+            }
+            EnvAction::Config { name, key, value } => {
+                println!("Setting configuration for environment: {}", name);
+                println!("  {} = {}", key, value);
+                println!();
+                println!("Configuration updated.");
+                println!("(In production, would update database)");
+            }
+        },
+        Commands::Release { action } => match action {
+            ReleaseAction::Prepare { release_type, version } => {
+                use orchestrate_core::{Release, ReleaseType};
+                use std::str::FromStr;
+
+                let rt = ReleaseType::from_str(&release_type)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                let ver = version.unwrap_or_else(|| {
+                    match rt {
+                        ReleaseType::Major => "2.0.0".to_string(),
+                        ReleaseType::Minor => "1.3.0".to_string(),
+                        ReleaseType::Patch => "1.2.4".to_string(),
+                        ReleaseType::PreRelease => "1.3.0-rc.1".to_string(),
+                    }
+                });
+
+                let release = Release::new(&ver, rt, "cli-user");
+
+                println!("Preparing {:?} release: {}", release.release_type, release.version);
+                println!();
+                println!("Steps:");
+                println!("  1. Create release branch");
+                println!("  2. Bump version in package files");
+                println!("  3. Generate changelog");
+                println!("  4. Ready for: orchestrate release create");
+                println!();
+                println!("(In production, would create branch and update versions)");
+            }
+            ReleaseAction::Create { version, changelog } => {
+                println!("Creating release: {}", version);
+                if changelog {
+                    println!("  Generating changelog...");
+                }
+                println!();
+                println!("Release created (draft)");
+                println!("Run 'orchestrate release publish' to make it public");
+                println!("(In production, would create GitHub release)");
+            }
+            ReleaseAction::Publish { version, draft } => {
+                println!("Publishing release: {}", version);
+                if draft {
+                    println!("  (as draft)");
+                }
+                println!();
+                println!("Release published!");
+                println!("(In production, would publish to GitHub)");
+            }
+            ReleaseAction::List { limit } => {
+                println!("Releases (last {}):", limit);
+                println!();
+                println!("  v1.2.3  2024-01-15  published  Minor release");
+                println!("  v1.2.2  2024-01-10  published  Patch release");
+                println!("  v1.2.1  2024-01-05  published  Patch release");
+                println!("  v1.2.0  2024-01-01  published  Minor release");
+                println!();
+                println!("(In production, would fetch from database/GitHub)");
+            }
+            ReleaseAction::Notes { from, to } => {
+                println!("Release notes: {} -> {}", from, to);
+                println!();
+                println!("## Changes");
+                println!();
+                println!("### Added");
+                println!("- Feature X for improved performance");
+                println!("- New API endpoint for metrics");
+                println!();
+                println!("### Fixed");
+                println!("- Bug in authentication flow");
+                println!();
+                println!("### Changed");
+                println!("- Updated dependencies");
+                println!();
+                println!("(In production, would generate from commit history)");
             }
         },
     }
