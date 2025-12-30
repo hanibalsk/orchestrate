@@ -1,6 +1,6 @@
 # Orchestrate Use Cases
 
-This document defines all use cases for the Orchestrate multi-agent system, including currently implemented features and planned enhancements for full autonomous development.
+This document defines all use cases for the Orchestrate multi-agent system, including currently implemented features and planned enhancements for fully autonomous development.
 
 ## Table of Contents
 
@@ -18,7 +18,7 @@ This document defines all use cases for the Orchestrate multi-agent system, incl
 ### UC-001: PR Queue Management
 **Status:** ✅ Implemented
 
-One PR at a time workflow to prevent merge conflicts.
+Sequential PR workflow that processes one pull request at a time to prevent merge conflicts.
 
 **Commands:**
 - `orchestrate pr queue` - Show queued work
@@ -28,7 +28,7 @@ One PR at a time workflow to prevent merge conflicts.
 ### UC-002: Isolated Worktree Development
 **Status:** ✅ Implemented
 
-Git worktrees for parallel feature development.
+Uses Git worktrees to enable parallel feature development in isolated environments.
 
 **Commands:**
 - `orchestrate wt create <name>` - Create worktree
@@ -38,7 +38,7 @@ Git worktrees for parallel feature development.
 ### UC-003: BMAD Epic Workflow
 **Status:** ✅ Implemented
 
-9-phase business-model-agent-driven development workflow.
+Nine-phase Business-Model-Agent-Driven (BMAD) development workflow for implementing complete epics.
 
 **Phases:** FindEpic → CreateBranch → DevelopStories → CodeReview → CreatePR → WaitCopilot → FixIssues → MergePR → Done
 
@@ -49,7 +49,7 @@ Git worktrees for parallel feature development.
 ### UC-004: Multi-Agent Coordination
 **Status:** ✅ Implemented
 
-10+ agent types for different development tasks.
+Over 10 specialized agent types for different development tasks, each with specific capabilities and tools.
 
 **Agent Types:**
 - `story-developer` - TDD feature implementation
@@ -63,7 +63,7 @@ Git worktrees for parallel feature development.
 ### UC-005: PR Shepherd Auto-Fixing
 **Status:** ✅ Implemented
 
-Watches PRs, fixes CI failures and review comments automatically.
+Monitors pull requests and automatically fixes CI failures and addresses review comments.
 
 **Commands:**
 - `orchestrate shepherd <pr_number>` - Start watching PR
@@ -71,7 +71,7 @@ Watches PRs, fixes CI failures and review comments automatically.
 ### UC-006: Self-Learning Instructions
 **Status:** ✅ Implemented
 
-Pattern detection from agent failures generates auto-instructions.
+Detects patterns from agent failures and automatically generates instructions to prevent similar issues.
 
 **Commands:**
 - `orchestrate learn analyze` - Process learning patterns
@@ -81,7 +81,7 @@ Pattern detection from agent failures generates auto-instructions.
 ### UC-007: Automated Loop
 **Status:** ✅ Implemented
 
-Full automation with ASCII dashboard.
+Fully automated orchestration with an ASCII dashboard for monitoring progress.
 
 **Commands:**
 - `orchestrate loop` - Run fully automated orchestration
@@ -89,7 +89,7 @@ Full automation with ASCII dashboard.
 ### UC-008: Web Dashboard & REST API
 **Status:** ✅ Implemented
 
-React frontend with real-time WebSocket updates.
+React-based web frontend with real-time WebSocket updates for monitoring and control.
 
 **Commands:**
 - `orchestrate web -p 8080` - Start web server
@@ -97,12 +97,12 @@ React frontend with real-time WebSocket updates.
 ### UC-009: Message History Tracking
 **Status:** ✅ Implemented
 
-Persistent agent conversations in SQLite database.
+Persists all agent conversations in a SQLite database for context continuity and debugging.
 
 ### UC-010: Parallel Agent Execution
 **Status:** ✅ Implemented
 
-Multiple agents working in isolated worktrees.
+Enables multiple agents to work simultaneously in isolated worktrees for parallel development.
 
 **Commands:**
 - `orchestrate parallel <task1> <task2>` - Run parallel agents
@@ -110,10 +110,166 @@ Multiple agents working in isolated worktrees.
 ### UC-011: Token Usage Analytics
 **Status:** ✅ Implemented
 
-Daily aggregation and cost tracking.
+Tracks and aggregates token usage with daily reports and cost analytics.
 
 **Commands:**
 - `orchestrate tokens daily` - View token usage
+
+### UC-020: Autonomous Epic Processing
+**Status:** 🔲 Not Implemented
+**Priority:** Critical
+**Effort:** Large
+
+Fully autonomous workflow where the background-controller orchestrates the complete development lifecycle from epic discovery through PR merge, without human intervention after the initial command.
+
+**Full Development Cycle:**
+1. User issues command: "Work on existing epics"
+2. Controller analyzes system state and discovers all pending epics
+3. Controller creates a prioritized work plan based on dependencies
+4. For each story:
+   - Controller spawns story-developer agent
+   - Agent implements feature using TDD
+   - Controller evaluates completion (acceptance criteria, tests)
+   - If rework is needed, controller continues the agent with specific feedback
+5. Controller triggers code review
+6. Controller creates pull request
+7. Controller monitors CI/CD pipeline and GitHub reviews
+8. Controller handles PR feedback (comments, requested changes, conflicts)
+9. Controller merges PR when approved
+10. Process repeats for next story/epic
+
+**State Machine:**
+
+| State | Description | Transitions |
+|-------|-------------|-------------|
+| IDLE | Waiting for user command | → ANALYZING |
+| ANALYZING | Reading database state, checking pending work | → DISCOVERING, → DONE |
+| DISCOVERING | Finding epics and parsing stories | → PLANNING, → DONE |
+| PLANNING | Creating prioritized work queue | → EXECUTING |
+| EXECUTING | Story-developer agent working | → REVIEWING, → EXECUTING (continue) |
+| REVIEWING | Code-reviewer agent working | → PR_CREATION, → EXECUTING (rework) |
+| PR_CREATION | Creating pull request | → PR_MONITORING |
+| PR_MONITORING | Watching CI/CD and reviews | → PR_FIXING, → PR_MERGING, → BLOCKED |
+| PR_FIXING | Issue-fixer addressing failures/comments | → PR_MONITORING |
+| PR_MERGING | Executing merge strategy | → COMPLETING |
+| COMPLETING | Marking work done, cleanup resources | → DISCOVERING, → DONE |
+| BLOCKED | Cannot proceed, needs intervention | → EXECUTING (after resolution) |
+| DONE | All epics processed | (terminal) |
+
+**Context Optimization:**
+- Controller maintains its own lightweight context (state machine, work queue, agent registry)
+- Child agents summarize their work output before returning to parent
+- Summary format: key decisions, files changed, tests added, blockers encountered
+- Parent receives condensed context, not full conversation history
+- Token-efficient handoffs between agents through structured summaries
+- Session forking for child agents to inherit parent context efficiently
+
+**Model Selection Strategy:**
+- **Opus** (claude-opus-4-5-20251101): Complex architectural decisions, multi-file refactoring, handling ambiguous requirements
+- **Sonnet** (claude-sonnet-4-20250514): Standard feature implementation, code reviews, issue fixing
+- **Sonnet with extended context** (sonnet-1m): Large file analysis, comprehensive codebase exploration
+- **Haiku** (claude-haiku-3-5-20241022): Quick searches, simple edits, status checks
+
+Model selection based on:
+- Task complexity (story points, file count, dependency depth)
+- Agent failure history (escalate model after 2 retries)
+- Code review severity (Opus for CRITICAL issues)
+- Context size requirements
+
+**Stuck Agent Detection:**
+- **Turn limit monitoring**: Alert if agent exceeds 80% of max_turns
+- **Progress tracking**: Detect if no meaningful output in last N turns
+- **CI wait timeout**: Detect stale CI checks (no update > 30 minutes)
+- **PR review delay**: Detect delayed GitHub reviews (asynchronous copilot reviews)
+- **Merge conflict detection**: Monitor for conflicts when multiple branches merge
+- **Rate limit handling**: Detect API rate limits and implement backoff
+- **Token exhaustion**: Monitor approaching context limits
+
+Recovery strategies:
+- Pause and alert for human intervention
+- Switch to different model
+- Spawn specialized fixer agent
+- Fork context and retry with fresh session
+- Escalate to parent controller
+
+**Common Edge Cases:**
+- **Delayed CI reviews**: GitHub Copilot or CI workflows may add comments asynchronously after initial checks pass
+- **Merge conflicts**: When multiple epics/stories merge to main, conflicts may arise
+- **Flaky tests**: Tests that pass/fail intermittently require retry logic
+- **External service downtime**: GitHub, CI services may be temporarily unavailable
+- **Dependency failures**: Story depends on another story that is blocked
+- **Review ping-pong**: Reviewer keeps requesting changes on same issues
+- **Context overflow**: Large files or many changes exceed model context
+
+**Agent Continuation Mechanism:**
+- Completed agents can be resumed with new tasks in the same Claude context
+- Message history is preserved for context continuity
+- Controller generates specific feedback for continuation
+- Enables iterative refinement without losing conversation context
+- Resume uses agent ID to continue from previous transcript
+
+**PR Workflow Integration:**
+- Create PR with structured description (summary, stories, testing)
+- Monitor all CI checks (build, test, lint, security)
+- Parse and address review comments automatically
+- Handle both bot reviews (Copilot) and human reviews
+- Implement squash merge with proper commit message
+- Clean up branches and worktrees after merge
+
+**Evaluation Criteria:**
+- All acceptance criteria marked as met
+- Tests passing (CI status check)
+- No STATUS: BLOCKED signals from agent
+- Code review passed (no CRITICAL/HIGH issues)
+- Build and lint checks passing
+- PR approved and mergeable
+
+**Commands:**
+```bash
+# Start fully autonomous epic processing
+orchestrate epic auto-process
+
+# Process specific epic pattern with concurrency limit
+orchestrate epic auto-process --pattern "epic-001-*" --max-agents 2
+
+# Specify preferred model for complex tasks
+orchestrate epic auto-process --model opus
+
+# Dry run to see the execution plan without making changes
+orchestrate epic auto-process --dry-run
+
+# Check current autonomous processing status
+orchestrate epic auto-status
+orchestrate epic auto-status --detailed
+
+# Pause autonomous processing (can resume later)
+orchestrate epic auto-pause
+
+# Resume paused autonomous processing
+orchestrate epic auto-resume
+
+# Stop autonomous processing
+orchestrate epic auto-stop
+orchestrate epic auto-stop --force  # Force stop even if agents are running
+
+# View stuck agents
+orchestrate epic stuck-agents
+
+# Manually resolve blocked state
+orchestrate epic unblock <epic-id>
+```
+
+**Implementation:**
+- Autonomous session tracking in database
+- Decision engine for spawn/continue/review/merge decisions
+- Agent continuation mechanism in loop_runner
+- Context summarization protocol for agent handoffs
+- Model selection engine based on task complexity
+- Stuck detection with configurable thresholds
+- Work evaluation with quality gates
+- PR lifecycle management (create, monitor, fix, merge)
+- Conflict resolution workflow
+- Review iteration tracking (escalate after 3 failed iterations)
 
 ---
 
@@ -934,6 +1090,7 @@ orchestrate chaos report --experiment <id>
 
 | Use Case | Epic | Status |
 |----------|------|--------|
+| UC-020: Autonomous Epic Processing | [Epic 016](bmad/epics/epic-016-autonomous-processing.md) | 🔲 Not Started |
 | UC-101: GitHub Webhook Triggers | [Epic 002](bmad/epics/epic-002-webhook-triggers.md) | 🔲 Not Started |
 | UC-102: Scheduled Agent Execution | [Epic 003](bmad/epics/epic-003-scheduled-execution.md) | 🔲 Not Started |
 | UC-103, UC-104: Event Pipelines & Approvals | [Epic 004](bmad/epics/epic-004-event-pipelines.md) | 🔲 Not Started |
@@ -954,28 +1111,29 @@ orchestrate chaos report --experiment <id>
 ## Implementation Roadmap
 
 ### Immediate (Next 2 Sprints)
-1. **Epic 002**: GitHub Webhook Triggers (UC-101)
-2. **Epic 005**: Test Generation Agent (UC-203)
-3. **Epic 007**: Monitoring & Alerting - Metrics + Audit (UC-301, UC-306)
+1. **Epic 016**: Autonomous Epic Processing (UC-020)
+2. **Epic 002**: GitHub Webhook Triggers (UC-101)
+3. **Epic 005**: Test Generation Agent (UC-203)
+4. **Epic 007**: Monitoring & Alerting - Metrics + Audit (UC-301, UC-306)
 
 ### Short-Term (1-2 Months)
-4. **Epic 003**: Scheduled Agent Execution (UC-102)
-5. **Epic 004**: Event-Driven Pipelines (UC-103, UC-104)
-6. **Epic 006**: Deployment Orchestrator (UC-205, UC-206)
-7. **Epic 008**: Slack Integration (UC-401)
-8. **Epic 014**: CI/CD Integration (UC-404)
+5. **Epic 003**: Scheduled Agent Execution (UC-102)
+6. **Epic 004**: Event-Driven Pipelines (UC-103, UC-104)
+7. **Epic 006**: Deployment Orchestrator (UC-205, UC-206)
+8. **Epic 008**: Slack Integration (UC-401)
+9. **Epic 014**: CI/CD Integration (UC-404)
 
 ### Medium-Term (3-6 Months)
-9. **Epic 009**: Security Scanner Agent (UC-207)
-10. **Epic 010**: Closed-Loop Learning (UC-501, UC-505)
-11. **Epic 011**: Documentation Generator (UC-204)
-12. **Epic 012**: Requirements Capture Agent (UC-201)
+10. **Epic 009**: Security Scanner Agent (UC-207)
+11. **Epic 010**: Closed-Loop Learning (UC-501, UC-505)
+12. **Epic 011**: Documentation Generator (UC-204)
+13. **Epic 012**: Requirements Capture Agent (UC-201)
 
 ### Long-Term (6+ Months)
-13. **Epic 013**: Multi-Repository Orchestration (UC-506)
-14. **Epic 015**: Autonomous Incident Response (UC-504)
-15. UC-502: Predictive Scaling (future epic)
-16. UC-507, UC-508: NL Commands & Chaos Engineering (future epics)
+14. **Epic 013**: Multi-Repository Orchestration (UC-506)
+15. **Epic 015**: Autonomous Incident Response (UC-504)
+16. UC-502: Predictive Scaling (future epic)
+17. UC-507, UC-508: NL Commands & Chaos Engineering (future epics)
 
 ---
 
