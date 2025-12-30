@@ -149,10 +149,6 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/011_success_patterns.sql"))
             .execute(&self.pool)
             .await?;
-        // Multi-repository orchestration migration
-        sqlx::query(include_str!("../../../migrations/012_multi_repo.sql"))
-            .execute(&self.pool)
-            .await?;
         Ok(())
     }
 
@@ -5462,792 +5458,383 @@ impl From<ModelSelectionConfigRow> for ModelSelectionConfig {
     }
 }
 
-// ==================== Multi-Repository Operations ====================
-
 impl Database {
-    /// Insert a new repository
-    pub async fn insert_repository(&self, repo: &crate::Repository) -> Result<()> {
+    // CI Integration methods
+
+    /// Save a CI run to the database
+    pub async fn save_ci_run(&self, run: &crate::ci_integration::CiRun) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO repositories (name, url, local_path, default_branch, provider, status, last_synced, config)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO ci_runs (id, provider, workflow_name, branch, commit_sha, status, conclusion,
+                                 started_at, completed_at, duration_seconds, url, triggered_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                conclusion = excluded.conclusion,
+                completed_at = excluded.completed_at,
+                duration_seconds = excluded.duration_seconds,
+                updated_at = datetime('now')
             "#,
         )
-        .bind(&repo.name)
-        .bind(&repo.url)
-        .bind(&repo.local_path)
-        .bind(&repo.default_branch)
-        .bind(repo.provider.as_str())
-        .bind(repo.status.as_str())
-        .bind(repo.last_synced.map(|dt| dt.to_rfc3339()))
-        .bind(serde_json::to_string(&repo.config)?)
+        .bind(&run.id)
+        .bind(run.provider.as_str())
+        .bind(&run.workflow_name)
+        .bind(&run.branch)
+        .bind(&run.commit_sha)
+        .bind(run.status.as_str())
+        .bind(run.conclusion.as_ref().map(|c| c.as_str()))
+        .bind(run.started_at.map(|t| t.to_rfc3339()))
+        .bind(run.completed_at.map(|t| t.to_rfc3339()))
+        .bind(run.duration_seconds)
+        .bind(&run.url)
+        .bind(&run.triggered_by)
         .execute(&self.pool)
         .await?;
+
+        // Save jobs
+        for job in &run.jobs {
+            self.save_ci_job(&run.id, job).await?;
+        }
+
         Ok(())
     }
 
-    /// Get repository by name
-    pub async fn get_repository_by_name(&self, name: &str) -> Result<Option<crate::Repository>> {
-        let row = sqlx::query_as::<_, RepositoryRow>("SELECT * FROM repositories WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        row.map(|r| r.try_into()).transpose()
-    }
-
-    /// Update repository
-    pub async fn update_repository(&self, repo: &crate::Repository) -> Result<()> {
+    /// Save a CI job
+    async fn save_ci_job(&self, run_id: &str, job: &crate::ci_integration::CiJob) -> Result<()> {
         sqlx::query(
             r#"
-            UPDATE repositories SET
-                url = ?, local_path = ?, default_branch = ?, provider = ?,
-                status = ?, last_synced = ?, config = ?, updated_at = datetime('now')
-            WHERE name = ?
+            INSERT INTO ci_jobs (id, run_id, name, status, conclusion, started_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                conclusion = excluded.conclusion,
+                completed_at = excluded.completed_at
             "#,
         )
-        .bind(&repo.url)
-        .bind(&repo.local_path)
-        .bind(&repo.default_branch)
-        .bind(repo.provider.as_str())
-        .bind(repo.status.as_str())
-        .bind(repo.last_synced.map(|dt| dt.to_rfc3339()))
-        .bind(serde_json::to_string(&repo.config)?)
-        .bind(&repo.name)
+        .bind(&job.id)
+        .bind(run_id)
+        .bind(&job.name)
+        .bind(job.status.as_str())
+        .bind(job.conclusion.as_ref().map(|c| c.as_str()))
+        .bind(job.started_at.map(|t| t.to_rfc3339()))
+        .bind(job.completed_at.map(|t| t.to_rfc3339()))
         .execute(&self.pool)
         .await?;
-        Ok(())
-    }
 
-    /// List all repositories
-    pub async fn list_repositories(&self) -> Result<Vec<crate::Repository>> {
-        let rows = sqlx::query_as::<_, RepositoryRow>("SELECT * FROM repositories ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?;
-
-        rows.into_iter().map(|r| r.try_into()).collect()
-    }
-
-    /// Delete repository by name
-    pub async fn delete_repository(&self, name: &str) -> Result<()> {
-        sqlx::query("DELETE FROM repositories WHERE name = ?")
-            .bind(name)
+        // Save steps
+        for step in &job.steps {
+            sqlx::query(
+                r#"
+                INSERT INTO ci_steps (job_id, name, status, conclusion, step_number)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&job.id)
+            .bind(&step.name)
+            .bind(step.status.as_str())
+            .bind(step.conclusion.as_ref().map(|c| c.as_str()))
+            .bind(step.number)
             .execute(&self.pool)
             .await?;
-        Ok(())
-    }
-
-    /// Add repository dependency
-    pub async fn add_repository_dependency(&self, repo_name: &str, depends_on: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO repository_dependencies (repo_id, depends_on_id)
-            SELECT r1.id, r2.id FROM repositories r1, repositories r2
-            WHERE r1.name = ? AND r2.name = ?
-            "#,
-        )
-        .bind(repo_name)
-        .bind(depends_on)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Get repository dependencies
-    pub async fn get_repository_dependencies(&self, repo_name: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT r2.name FROM repository_dependencies rd
-            JOIN repositories r1 ON rd.repo_id = r1.id
-            JOIN repositories r2 ON rd.depends_on_id = r2.id
-            WHERE r1.name = ?
-            "#,
-        )
-        .bind(repo_name)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows)
-    }
-
-    /// Remove repository dependency
-    pub async fn remove_repository_dependency(
-        &self,
-        repo_name: &str,
-        depends_on: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            DELETE FROM repository_dependencies
-            WHERE repo_id = (SELECT id FROM repositories WHERE name = ?)
-            AND depends_on_id = (SELECT id FROM repositories WHERE name = ?)
-            "#,
-        )
-        .bind(repo_name)
-        .bind(depends_on)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Get full dependency graph
-    pub async fn get_dependency_graph(&self) -> Result<crate::RepoDependencyGraph> {
-        let repos = self.list_repositories().await?;
-        let mut graph = crate::RepoDependencyGraph::new();
-
-        for repo in repos {
-            let deps = self.get_repository_dependencies(&repo.name).await?;
-            graph.add_repo(&repo.name, deps);
         }
 
-        graph.detect_circular();
-        Ok(graph)
-    }
-
-    /// Insert cross-repository branch
-    pub async fn insert_cross_repo_branch(&self, branch: &crate::CrossRepoBranch) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO cross_repo_branches (name, created_at, updated_at)
-            VALUES (?, ?, ?)
-            "#,
-        )
-        .bind(&branch.name)
-        .bind(branch.created_at.to_rfc3339())
-        .bind(branch.updated_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
         Ok(())
     }
 
-    /// Get cross-repository branch by name
-    pub async fn get_cross_repo_branch(
-        &self,
-        name: &str,
-    ) -> Result<Option<crate::CrossRepoBranch>> {
-        let row = sqlx::query_as::<_, CrossRepoBranchRow>(
-            "SELECT * FROM cross_repo_branches WHERE name = ?",
+    /// Get a CI run by ID
+    pub async fn get_ci_run(&self, run_id: &str) -> Result<Option<crate::ci_integration::CiRun>> {
+        #[derive(sqlx::FromRow)]
+        struct CiRunRow {
+            id: String,
+            provider: String,
+            workflow_name: String,
+            branch: String,
+            commit_sha: Option<String>,
+            status: String,
+            conclusion: Option<String>,
+            started_at: Option<String>,
+            completed_at: Option<String>,
+            duration_seconds: Option<i64>,
+            url: Option<String>,
+            triggered_by: Option<String>,
+        }
+
+        let row = sqlx::query_as::<_, CiRunRow>(
+            "SELECT * FROM ci_runs WHERE id = ?"
         )
-        .bind(name)
+        .bind(run_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some(branch_row) = row {
-            // Fetch status for all repos
-            let status_rows = sqlx::query_as::<_, RepoBranchStatusRow>(
-                r#"
-                SELECT rbs.*, r.name as repo_name
-                FROM repo_branch_status rbs
-                JOIN repositories r ON rbs.repo_id = r.id
-                WHERE rbs.cross_branch_id = ?
-                "#,
-            )
-            .bind(branch_row.id)
-            .fetch_all(&self.pool)
-            .await?;
+        if let Some(row) = row {
+            use std::str::FromStr;
+            let provider = crate::ci_integration::CiProvider::from_str(&row.provider)
+                .map_err(|e| crate::Error::Other(e))?;
 
-            let repos = status_rows
-                .into_iter()
-                .map(|r| r.into())
-                .collect::<Vec<crate::RepoBranchStatus>>();
+            let status = match row.status.as_str() {
+                "queued" => crate::ci_integration::CiRunStatus::Queued,
+                "in_progress" => crate::ci_integration::CiRunStatus::InProgress,
+                "completed" => crate::ci_integration::CiRunStatus::Completed,
+                "cancelled" => crate::ci_integration::CiRunStatus::Cancelled,
+                "skipped" => crate::ci_integration::CiRunStatus::Skipped,
+                _ => crate::ci_integration::CiRunStatus::Queued,
+            };
 
-            Ok(Some(crate::CrossRepoBranch {
-                name: branch_row.name,
-                repos,
-                created_at: chrono::DateTime::parse_from_rfc3339(&branch_row.created_at)
-                    .map_err(|e| crate::Error::Other(e.to_string()))?
-                    .into(),
-                updated_at: chrono::DateTime::parse_from_rfc3339(&branch_row.updated_at)
-                    .map_err(|e| crate::Error::Other(e.to_string()))?
-                    .into(),
+            let conclusion = row.conclusion.and_then(|c| match c.as_str() {
+                "success" => Some(crate::ci_integration::CiConclusion::Success),
+                "failure" => Some(crate::ci_integration::CiConclusion::Failure),
+                "cancelled" => Some(crate::ci_integration::CiConclusion::Cancelled),
+                "skipped" => Some(crate::ci_integration::CiConclusion::Skipped),
+                "timed_out" => Some(crate::ci_integration::CiConclusion::TimedOut),
+                "action_required" => Some(crate::ci_integration::CiConclusion::ActionRequired),
+                "neutral" => Some(crate::ci_integration::CiConclusion::Neutral),
+                _ => None,
+            });
+
+            let jobs = self.get_ci_jobs(&row.id).await?;
+
+            Ok(Some(crate::ci_integration::CiRun {
+                id: row.id,
+                provider,
+                workflow_name: row.workflow_name,
+                branch: row.branch,
+                commit_sha: row.commit_sha,
+                status,
+                conclusion,
+                jobs,
+                started_at: row.started_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
+                completed_at: row.completed_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
+                duration_seconds: row.duration_seconds,
+                url: row.url,
+                triggered_by: row.triggered_by,
             }))
         } else {
             Ok(None)
         }
     }
 
-    /// Update repository branch status
-    pub async fn update_repo_branch_status(
-        &self,
-        branch_name: &str,
-        status: &crate::RepoBranchStatus,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO repo_branch_status (cross_branch_id, repo_id, branch_exists, commits_ahead, commits_behind, has_conflicts, pr_number, pr_status, updated_at)
-            SELECT cb.id, r.id, ?, ?, ?, ?, ?, ?, datetime('now')
-            FROM cross_repo_branches cb, repositories r
-            WHERE cb.name = ? AND r.name = ?
-            ON CONFLICT(cross_branch_id, repo_id) DO UPDATE SET
-                branch_exists = excluded.branch_exists,
-                commits_ahead = excluded.commits_ahead,
-                commits_behind = excluded.commits_behind,
-                has_conflicts = excluded.has_conflicts,
-                pr_number = excluded.pr_number,
-                pr_status = excluded.pr_status,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(status.branch_exists)
-        .bind(status.commits_ahead)
-        .bind(status.commits_behind)
-        .bind(status.has_conflicts)
-        .bind(status.pr_number)
-        .bind(&status.pr_status)
-        .bind(branch_name)
-        .bind(&status.repo_name)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
+    /// Get CI jobs for a run
+    async fn get_ci_jobs(&self, run_id: &str) -> Result<Vec<crate::ci_integration::CiJob>> {
+        #[derive(sqlx::FromRow)]
+        struct CiJobRow {
+            id: String,
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+            started_at: Option<String>,
+            completed_at: Option<String>,
+        }
 
-    /// List all cross-repository branches
-    pub async fn list_cross_repo_branches(&self) -> Result<Vec<crate::CrossRepoBranch>> {
-        let rows = sqlx::query_as::<_, CrossRepoBranchRow>(
-            "SELECT * FROM cross_repo_branches ORDER BY created_at DESC",
+        let rows = sqlx::query_as::<_, CiJobRow>(
+            "SELECT * FROM ci_jobs WHERE run_id = ? ORDER BY created_at"
         )
+        .bind(run_id)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut branches = Vec::new();
+        let mut jobs = Vec::new();
         for row in rows {
-            if let Some(branch) = self.get_cross_repo_branch(&row.name).await? {
-                branches.push(branch);
+            let status = match row.status.as_str() {
+                "queued" => crate::ci_integration::CiRunStatus::Queued,
+                "in_progress" => crate::ci_integration::CiRunStatus::InProgress,
+                "completed" => crate::ci_integration::CiRunStatus::Completed,
+                "cancelled" => crate::ci_integration::CiRunStatus::Cancelled,
+                "skipped" => crate::ci_integration::CiRunStatus::Skipped,
+                _ => crate::ci_integration::CiRunStatus::Queued,
+            };
+
+            let conclusion = row.conclusion.and_then(|c| match c.as_str() {
+                "success" => Some(crate::ci_integration::CiConclusion::Success),
+                "failure" => Some(crate::ci_integration::CiConclusion::Failure),
+                "cancelled" => Some(crate::ci_integration::CiConclusion::Cancelled),
+                "skipped" => Some(crate::ci_integration::CiConclusion::Skipped),
+                "timed_out" => Some(crate::ci_integration::CiConclusion::TimedOut),
+                "action_required" => Some(crate::ci_integration::CiConclusion::ActionRequired),
+                "neutral" => Some(crate::ci_integration::CiConclusion::Neutral),
+                _ => None,
+            });
+
+            let steps = self.get_ci_steps(&row.id).await?;
+
+            jobs.push(crate::ci_integration::CiJob {
+                id: row.id,
+                name: row.name,
+                status,
+                conclusion,
+                started_at: row.started_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
+                completed_at: row.completed_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
+                steps,
+            });
+        }
+
+        Ok(jobs)
+    }
+
+    /// Get CI steps for a job
+    async fn get_ci_steps(&self, job_id: &str) -> Result<Vec<crate::ci_integration::CiStep>> {
+        #[derive(sqlx::FromRow)]
+        struct CiStepRow {
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+            step_number: u32,
+        }
+
+        let rows = sqlx::query_as::<_, CiStepRow>(
+            "SELECT name, status, conclusion, step_number FROM ci_steps WHERE job_id = ? ORDER BY step_number"
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|row| {
+            let status = match row.status.as_str() {
+                "queued" => crate::ci_integration::CiRunStatus::Queued,
+                "in_progress" => crate::ci_integration::CiRunStatus::InProgress,
+                "completed" => crate::ci_integration::CiRunStatus::Completed,
+                "cancelled" => crate::ci_integration::CiRunStatus::Cancelled,
+                "skipped" => crate::ci_integration::CiRunStatus::Skipped,
+                _ => crate::ci_integration::CiRunStatus::Queued,
+            };
+
+            let conclusion = row.conclusion.and_then(|c| match c.as_str() {
+                "success" => Some(crate::ci_integration::CiConclusion::Success),
+                "failure" => Some(crate::ci_integration::CiConclusion::Failure),
+                "cancelled" => Some(crate::ci_integration::CiConclusion::Cancelled),
+                "skipped" => Some(crate::ci_integration::CiConclusion::Skipped),
+                "timed_out" => Some(crate::ci_integration::CiConclusion::TimedOut),
+                "action_required" => Some(crate::ci_integration::CiConclusion::ActionRequired),
+                "neutral" => Some(crate::ci_integration::CiConclusion::Neutral),
+                _ => None,
+            });
+
+            crate::ci_integration::CiStep {
+                name: row.name,
+                status,
+                conclusion,
+                number: row.step_number,
+            }
+        }).collect())
+    }
+
+    /// List recent CI runs
+    pub async fn list_ci_runs(&self, limit: i64) -> Result<Vec<crate::ci_integration::CiRun>> {
+        #[derive(sqlx::FromRow)]
+        struct CiRunRow {
+            id: String,
+        }
+
+        let rows = sqlx::query_as::<_, CiRunRow>(
+            "SELECT id FROM ci_runs ORDER BY created_at DESC LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            if let Some(run) = self.get_ci_run(&row.id).await? {
+                runs.push(run);
             }
         }
 
-        Ok(branches)
+        Ok(runs)
     }
 
-    /// Insert linked PR group
-    pub async fn insert_linked_pr_group(&self, group: &crate::LinkedPrGroup) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO linked_pr_groups (id, name, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&group.id)
-        .bind(&group.name)
-        .bind(group.status.as_str())
-        .bind(group.created_at.to_rfc3339())
-        .bind(group.created_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Get linked PR group by ID
-    pub async fn get_linked_pr_group(&self, id: &str) -> Result<Option<crate::LinkedPrGroup>> {
-        let row = sqlx::query_as::<_, LinkedPrGroupRow>(
-            "SELECT * FROM linked_pr_groups WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(group_row) = row {
-            // Fetch all PRs
-            let pr_rows = sqlx::query_as::<_, LinkedPrRow>(
-                r#"
-                SELECT lp.*, r.name as repo_name
-                FROM linked_prs lp
-                JOIN repositories r ON lp.repo_id = r.id
-                WHERE lp.group_id = ?
-                ORDER BY lp.merge_order
-                "#,
-            )
-            .bind(id)
-            .fetch_all(&self.pool)
-            .await?;
-
-            let prs = pr_rows.into_iter().map(|r| r.into()).collect::<Vec<_>>();
-            let merge_order = prs.iter().map(|pr: &crate::LinkedPr| pr.repo_name.clone()).collect();
-
-            Ok(Some(crate::LinkedPrGroup {
-                id: group_row.id,
-                name: group_row.name,
-                prs,
-                merge_order,
-                status: group_row.status.parse().unwrap_or(crate::LinkedPrStatus::Open),
-                created_at: chrono::DateTime::parse_from_rfc3339(&group_row.created_at)
-                    .map_err(|e| crate::Error::Other(e.to_string()))?
-                    .into(),
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Add linked PR to group
-    pub async fn add_linked_pr(
-        &self,
-        group_id: &str,
-        pr: &crate::LinkedPr,
-        merge_order: i32,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO linked_prs (group_id, repo_id, pr_number, title, status, mergeable, merge_order)
-            SELECT ?, r.id, ?, ?, ?, ?, ?
-            FROM repositories r
-            WHERE r.name = ?
-            "#,
-        )
-        .bind(group_id)
-        .bind(pr.pr_number as i32)
-        .bind(&pr.title)
-        .bind(&pr.status)
-        .bind(pr.mergeable)
-        .bind(merge_order)
-        .bind(&pr.repo_name)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Update linked PR group status
-    pub async fn update_linked_pr_group_status(
-        &self,
-        group_id: &str,
-        status: crate::LinkedPrStatus,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE linked_pr_groups SET status = ?, updated_at = datetime('now')
-            WHERE id = ?
-            "#,
-        )
-        .bind(status.as_str())
-        .bind(group_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// List linked PR groups with optional status filter
-    pub async fn list_linked_pr_groups(
-        &self,
-        status: Option<crate::LinkedPrStatus>,
-    ) -> Result<Vec<crate::LinkedPrGroup>> {
-        let rows = if let Some(status) = status {
-            sqlx::query_as::<_, LinkedPrGroupRow>(
-                "SELECT * FROM linked_pr_groups WHERE status = ? ORDER BY created_at DESC",
-            )
-            .bind(status.as_str())
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, LinkedPrGroupRow>(
-                "SELECT * FROM linked_pr_groups ORDER BY created_at DESC",
-            )
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut groups = Vec::new();
-        for row in rows {
-            if let Some(group) = self.get_linked_pr_group(&row.id).await? {
-                groups.push(group);
-            }
+    /// Save failure analysis
+    pub async fn save_ci_failure_analysis(&self, analysis: &crate::ci_integration::CiFailureAnalysis) -> Result<i64> {
+        #[derive(sqlx::FromRow)]
+        struct IdRow {
+            id: i64,
         }
 
-        Ok(groups)
-    }
-
-    /// Insert coordinated release
-    pub async fn insert_coordinated_release(
-        &self,
-        release: &crate::CoordinatedRelease,
-    ) -> Result<i64> {
-        let result = sqlx::query(
+        let row = sqlx::query_as::<_, IdRow>(
             r#"
-            INSERT INTO coordinated_releases (version, status, changelog, created_at)
+            INSERT INTO ci_failure_analysis (run_id, is_flaky, flaky_confidence, should_auto_fix)
             VALUES (?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                is_flaky = excluded.is_flaky,
+                flaky_confidence = excluded.flaky_confidence,
+                should_auto_fix = excluded.should_auto_fix,
+                analyzed_at = datetime('now')
+            RETURNING id
             "#,
         )
-        .bind(&release.version)
-        .bind(release.status.as_str())
-        .bind(&release.changelog)
-        .bind(release.created_at.to_rfc3339())
-        .execute(&self.pool)
+        .bind(&analysis.run_id)
+        .bind(analysis.is_flaky)
+        .bind(analysis.flaky_confidence)
+        .bind(analysis.should_auto_fix())
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(result.last_insert_rowid())
-    }
+        let id = row.id;
 
-    /// Get coordinated release by ID
-    pub async fn get_coordinated_release(
-        &self,
-        id: i64,
-    ) -> Result<Option<crate::CoordinatedRelease>> {
-        let row = sqlx::query_as::<_, CoordinatedReleaseRow>(
-            "SELECT * FROM coordinated_releases WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(release_row) = row {
-            // Fetch repo releases
-            let repo_rows = sqlx::query_as::<_, RepoReleaseRow>(
-                r#"
-                SELECT rr.*, r.name as repo_name
-                FROM repo_releases rr
-                JOIN repositories r ON rr.repo_id = r.id
-                WHERE rr.release_id = ?
-                "#,
+        // Save failed jobs
+        for job in &analysis.failed_jobs {
+            sqlx::query(
+                "INSERT INTO ci_failed_jobs (analysis_id, job_name, step_name, error_summary, log_url) VALUES (?, ?, ?, ?, ?)"
             )
             .bind(id)
-            .fetch_all(&self.pool)
+            .bind(&job.job_name)
+            .bind(&job.step_name)
+            .bind(&job.error_summary)
+            .bind(&job.log_url)
+            .execute(&self.pool)
             .await?;
-
-            let repos = repo_rows.into_iter().map(|r| r.into()).collect();
-
-            Ok(Some(crate::CoordinatedRelease {
-                version: release_row.version,
-                repos,
-                status: release_row
-                    .status
-                    .parse()
-                    .unwrap_or(crate::ReleaseStatus::Pending),
-                changelog: release_row.changelog,
-                created_at: chrono::DateTime::parse_from_rfc3339(&release_row.created_at)
-                    .map_err(|e| crate::Error::Other(e.to_string()))?
-                    .into(),
-                completed_at: release_row
-                    .completed_at
-                    .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
-                    .transpose()
-                    .map_err(|e| crate::Error::Other(e.to_string()))?
-                    .map(Into::into),
-            }))
-        } else {
-            Ok(None)
         }
-    }
 
-    /// Add repository release
-    pub async fn add_repo_release(
-        &self,
-        release_id: i64,
-        repo_release: &crate::RepoRelease,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO repo_releases (release_id, repo_id, version, status, tag, release_url)
-            SELECT ?, r.id, ?, ?, ?, ?
-            FROM repositories r
-            WHERE r.name = ?
-            "#,
-        )
-        .bind(release_id)
-        .bind(&repo_release.version)
-        .bind(repo_release.status.as_str())
-        .bind(&repo_release.tag)
-        .bind(&repo_release.release_url)
-        .bind(&repo_release.repo_name)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Update repository release status
-    pub async fn update_repo_release_status(
-        &self,
-        release_id: i64,
-        repo_name: &str,
-        status: crate::ReleaseStatus,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE repo_releases SET status = ?, updated_at = datetime('now')
-            WHERE release_id = ? AND repo_id = (SELECT id FROM repositories WHERE name = ?)
-            "#,
-        )
-        .bind(status.as_str())
-        .bind(release_id)
-        .bind(repo_name)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Update coordinated release status
-    pub async fn update_coordinated_release_status(
-        &self,
-        release_id: i64,
-        status: crate::ReleaseStatus,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE coordinated_releases SET status = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(status.as_str())
-        .bind(release_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Complete coordinated release
-    pub async fn complete_coordinated_release(&self, release_id: i64) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE coordinated_releases SET status = ?, completed_at = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(crate::ReleaseStatus::Completed.as_str())
-        .bind(&now)
-        .bind(release_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// List coordinated releases
-    pub async fn list_coordinated_releases(
-        &self,
-        status: Option<crate::ReleaseStatus>,
-    ) -> Result<Vec<crate::CoordinatedRelease>> {
-        let rows = if let Some(status) = status {
-            sqlx::query_as::<_, CoordinatedReleaseRow>(
-                "SELECT * FROM coordinated_releases WHERE status = ? ORDER BY created_at DESC",
+        // Save failed tests
+        for test in &analysis.failed_tests {
+            sqlx::query(
+                "INSERT INTO ci_failed_tests (analysis_id, test_name, test_file, error_message, stack_trace, failure_count, is_flaky) VALUES (?, ?, ?, ?, ?, ?, ?)"
             )
-            .bind(status.as_str())
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, CoordinatedReleaseRow>(
-                "SELECT * FROM coordinated_releases ORDER BY created_at DESC",
-            )
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut releases = Vec::new();
-        for row in rows {
-            if let Some(release) = self.get_coordinated_release(row.id).await? {
-                releases.push(release);
-            }
+            .bind(id)
+            .bind(&test.test_name)
+            .bind(&test.test_file)
+            .bind(&test.error_message)
+            .bind(&test.stack_trace)
+            .bind(test.failure_count)
+            .bind(test.is_flaky)
+            .execute(&self.pool)
+            .await?;
         }
 
-        Ok(releases)
+        // Save error messages
+        for msg in &analysis.error_messages {
+            sqlx::query(
+                "INSERT INTO ci_error_messages (analysis_id, message) VALUES (?, ?)"
+            )
+            .bind(id)
+            .bind(msg)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        // Save recommendations
+        for rec in &analysis.recommendations {
+            sqlx::query(
+                "INSERT INTO ci_recommendations (analysis_id, recommendation) VALUES (?, ?)"
+            )
+            .bind(id)
+            .bind(rec)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(id)
     }
 
-    /// Detect dependencies from package files
-    pub async fn detect_dependencies_from_packages(
-        &self,
-        repo_name: &str,
-        package_deps: &[String],
-    ) -> Result<()> {
-        // Match package names to repository names
-        let repos = self.list_repositories().await?;
-
-        for dep in package_deps {
-            // Try to match package name to repo name
-            for repo in &repos {
-                if dep.contains(&repo.name) || repo.url.contains(dep) {
-                    // Add dependency if not already exists
-                    let _ = self.add_repository_dependency(repo_name, &repo.name).await;
-                }
-            }
-        }
+    /// Track flaky test occurrence
+    pub async fn track_flaky_test(&self, test_name: &str, run_id: &str, failed: bool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO ci_flaky_test_history (test_name, run_id, failed) VALUES (?, ?, ?)"
+        )
+        .bind(test_name)
+        .bind(run_id)
+        .bind(failed)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
-    }
-}
-
-// ==================== Multi-Repository Row Types ====================
-
-#[derive(sqlx::FromRow)]
-struct RepositoryRow {
-    #[allow(dead_code)]
-    id: i64,
-    name: String,
-    url: String,
-    local_path: Option<String>,
-    default_branch: String,
-    provider: String,
-    status: String,
-    last_synced: Option<String>,
-    config: String,
-    #[allow(dead_code)]
-    created_at: String,
-    #[allow(dead_code)]
-    updated_at: String,
-}
-
-impl TryFrom<RepositoryRow> for crate::Repository {
-    type Error = crate::Error;
-
-    fn try_from(row: RepositoryRow) -> Result<Self> {
-        use std::str::FromStr;
-
-        let provider = match row.provider.as_str() {
-            "github" => crate::RepoProvider::GitHub,
-            "gitlab" => crate::RepoProvider::GitLab,
-            "bitbucket" => crate::RepoProvider::Bitbucket,
-            _ => crate::RepoProvider::Other,
-        };
-
-        let status = match row.status.as_str() {
-            "active" => crate::RepoStatus::Active,
-            "inactive" => crate::RepoStatus::Inactive,
-            "error" => crate::RepoStatus::Error,
-            "syncing" => crate::RepoStatus::Syncing,
-            _ => crate::RepoStatus::Inactive,
-        };
-
-        Ok(crate::Repository {
-            name: row.name,
-            url: row.url,
-            local_path: row.local_path,
-            default_branch: row.default_branch,
-            dependencies: vec![], // Loaded separately
-            provider,
-            status,
-            last_synced: row
-                .last_synced
-                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
-                .transpose()
-                .map_err(|e| crate::Error::Other(e.to_string()))?
-                .map(Into::into),
-            config: serde_json::from_str(&row.config).unwrap_or_default(),
-        })
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct CrossRepoBranchRow {
-    id: i64,
-    name: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct RepoBranchStatusRow {
-    #[allow(dead_code)]
-    id: i64,
-    #[allow(dead_code)]
-    cross_branch_id: i64,
-    #[allow(dead_code)]
-    repo_id: i64,
-    repo_name: String,
-    branch_exists: bool,
-    commits_ahead: Option<i32>,
-    commits_behind: Option<i32>,
-    has_conflicts: bool,
-    pr_number: Option<i32>,
-    pr_status: Option<String>,
-    #[allow(dead_code)]
-    updated_at: String,
-}
-
-impl From<RepoBranchStatusRow> for crate::RepoBranchStatus {
-    fn from(row: RepoBranchStatusRow) -> Self {
-        crate::RepoBranchStatus {
-            repo_name: row.repo_name,
-            branch_exists: row.branch_exists,
-            commits_ahead: row.commits_ahead.map(|v| v as u32),
-            commits_behind: row.commits_behind.map(|v| v as u32),
-            has_conflicts: row.has_conflicts,
-            pr_number: row.pr_number.map(|v| v as u32),
-            pr_status: row.pr_status,
-        }
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct LinkedPrGroupRow {
-    id: String,
-    name: String,
-    status: String,
-    created_at: String,
-    #[allow(dead_code)]
-    updated_at: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct LinkedPrRow {
-    #[allow(dead_code)]
-    id: i64,
-    #[allow(dead_code)]
-    group_id: String,
-    #[allow(dead_code)]
-    repo_id: i64,
-    repo_name: String,
-    pr_number: i32,
-    title: String,
-    status: String,
-    mergeable: bool,
-    #[allow(dead_code)]
-    merge_order: i32,
-    #[allow(dead_code)]
-    created_at: String,
-    #[allow(dead_code)]
-    updated_at: String,
-}
-
-impl From<LinkedPrRow> for crate::LinkedPr {
-    fn from(row: LinkedPrRow) -> Self {
-        crate::LinkedPr {
-            repo_name: row.repo_name,
-            pr_number: row.pr_number as u32,
-            title: row.title,
-            status: row.status,
-            mergeable: row.mergeable,
-        }
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct CoordinatedReleaseRow {
-    id: i64,
-    version: String,
-    status: String,
-    changelog: String,
-    created_at: String,
-    completed_at: Option<String>,
-}
-
-#[derive(sqlx::FromRow)]
-struct RepoReleaseRow {
-    #[allow(dead_code)]
-    id: i64,
-    #[allow(dead_code)]
-    release_id: i64,
-    #[allow(dead_code)]
-    repo_id: i64,
-    repo_name: String,
-    version: String,
-    status: String,
-    tag: Option<String>,
-    release_url: Option<String>,
-    #[allow(dead_code)]
-    created_at: String,
-    #[allow(dead_code)]
-    updated_at: String,
-}
-
-impl From<RepoReleaseRow> for crate::RepoRelease {
-    fn from(row: RepoReleaseRow) -> Self {
-        use std::str::FromStr;
-
-        crate::RepoRelease {
-            repo_name: row.repo_name,
-            version: row.version,
-            status: row
-                .status
-                .parse()
-                .unwrap_or(crate::ReleaseStatus::Pending),
-            tag: row.tag,
-            release_url: row.release_url,
-        }
     }
 }

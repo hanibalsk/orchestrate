@@ -26,6 +26,7 @@ pub mod epic;
 pub mod requirements;
 pub mod multi_repo;
 pub mod ci_integration;
+pub mod ci;
 pub mod incident;
 pub mod test_generation;
 pub mod deployment;
