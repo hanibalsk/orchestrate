@@ -194,6 +194,12 @@ impl Database {
         ))
         .execute(&self.pool)
         .await?;
+        // Story evaluations migration (Epic 016 - Story 8)
+        sqlx::query(include_str!(
+            "../../../migrations/024_story_evaluations.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -7969,6 +7975,445 @@ impl Database {
             },
         })
     }
+
+    // ==================== Story Evaluation Operations (Epic 016 - Story 8) ====================
+
+    /// Create a story evaluation record
+    pub async fn create_story_evaluation(
+        &self,
+        record: &crate::work_evaluation::StoryEvaluationRecord,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO story_evaluations
+                (story_id, agent_id, session_id, status, criteria_met_count,
+                 criteria_total_count, ci_passed, review_passed, review_iteration,
+                 pr_mergeable, feedback, details, evaluated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&record.story_id)
+        .bind(&record.agent_id)
+        .bind(&record.session_id)
+        .bind(record.status.as_str())
+        .bind(record.criteria_met_count as i64)
+        .bind(record.criteria_total_count as i64)
+        .bind(record.ci_passed)
+        .bind(record.review_passed)
+        .bind(record.review_iteration as i64)
+        .bind(record.pr_mergeable)
+        .bind(&record.feedback)
+        .bind(serde_json::to_string(&record.details)?)
+        .bind(record.evaluated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get story evaluation by ID
+    pub async fn get_story_evaluation(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::work_evaluation::StoryEvaluationRecord>> {
+        let row = sqlx::query_as::<_, StoryEvaluationRow>(
+            "SELECT * FROM story_evaluations WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_record()).transpose()
+    }
+
+    /// Get story evaluations for a story
+    pub async fn get_story_evaluations(
+        &self,
+        story_id: &str,
+    ) -> Result<Vec<crate::work_evaluation::StoryEvaluationRecord>> {
+        let rows = sqlx::query_as::<_, StoryEvaluationRow>(
+            r#"
+            SELECT * FROM story_evaluations
+            WHERE story_id = ?
+            ORDER BY evaluated_at DESC
+            "#,
+        )
+        .bind(story_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_record()).collect()
+    }
+
+    /// Get latest story evaluation for a story
+    pub async fn get_latest_story_evaluation(
+        &self,
+        story_id: &str,
+    ) -> Result<Option<crate::work_evaluation::StoryEvaluationRecord>> {
+        let row = sqlx::query_as::<_, StoryEvaluationRow>(
+            r#"
+            SELECT * FROM story_evaluations
+            WHERE story_id = ?
+            ORDER BY evaluated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(story_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_record()).transpose()
+    }
+
+    /// Get story evaluations for a session
+    pub async fn get_story_evaluations_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::work_evaluation::StoryEvaluationRecord>> {
+        let rows = sqlx::query_as::<_, StoryEvaluationRow>(
+            r#"
+            SELECT * FROM story_evaluations
+            WHERE session_id = ?
+            ORDER BY evaluated_at DESC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_record()).collect()
+    }
+
+    /// Create a code review result
+    pub async fn create_code_review_result(
+        &self,
+        story_id: &str,
+        agent_id: &str,
+        session_id: Option<&str>,
+        result: &crate::work_evaluation::ReviewResult,
+    ) -> Result<i64> {
+        let blocking_count = result.issues.iter().filter(|i| i.severity.blocks_merge()).count() as i64;
+
+        let result_row = sqlx::query(
+            r#"
+            INSERT INTO code_review_results
+                (story_id, agent_id, session_id, verdict, reviewer, iteration,
+                 issue_count, blocking_issue_count, issues, raw_output, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(story_id)
+        .bind(agent_id)
+        .bind(session_id)
+        .bind(result.verdict.as_str())
+        .bind(&result.reviewer)
+        .bind(result.iteration as i64)
+        .bind(result.issues.len() as i64)
+        .bind(blocking_count)
+        .bind(serde_json::to_string(&result.issues)?)
+        .bind(&result.raw_output)
+        .bind(result.reviewed_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result_row.last_insert_rowid())
+    }
+
+    /// Get code review results for a story
+    pub async fn get_code_review_results(
+        &self,
+        story_id: &str,
+    ) -> Result<Vec<crate::work_evaluation::ReviewResult>> {
+        let rows = sqlx::query_as::<_, CodeReviewResultRow>(
+            r#"
+            SELECT * FROM code_review_results
+            WHERE story_id = ?
+            ORDER BY reviewed_at DESC
+            "#,
+        )
+        .bind(story_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_result()).collect()
+    }
+
+    /// Get latest code review result for a story
+    pub async fn get_latest_code_review_result(
+        &self,
+        story_id: &str,
+    ) -> Result<Option<crate::work_evaluation::ReviewResult>> {
+        let row = sqlx::query_as::<_, CodeReviewResultRow>(
+            r#"
+            SELECT * FROM code_review_results
+            WHERE story_id = ?
+            ORDER BY reviewed_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(story_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_result()).transpose()
+    }
+
+    /// Get review iteration count for a story
+    pub async fn get_review_iteration_count(
+        &self,
+        story_id: &str,
+    ) -> Result<u32> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM code_review_results WHERE story_id = ?",
+        )
+        .bind(story_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count.0 as u32)
+    }
+
+    /// Create a CI check result
+    pub async fn create_ci_check_result(
+        &self,
+        story_id: Option<&str>,
+        agent_id: &str,
+        session_id: Option<&str>,
+        check: &crate::work_evaluation::CiCheckResult,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO ci_check_results
+                (story_id, agent_id, session_id, check_name, status, url,
+                 failure_details, duration_secs, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            "#,
+        )
+        .bind(story_id)
+        .bind(agent_id)
+        .bind(session_id)
+        .bind(&check.name)
+        .bind(check.status.as_str())
+        .bind(&check.url)
+        .bind(&check.failure_details)
+        .bind(check.duration_secs.map(|d| d as i64))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get CI check results for a story
+    pub async fn get_ci_check_results(
+        &self,
+        story_id: &str,
+    ) -> Result<Vec<crate::work_evaluation::CiCheckResult>> {
+        let rows = sqlx::query_as::<_, CiCheckResultRow>(
+            r#"
+            SELECT * FROM ci_check_results
+            WHERE story_id = ?
+            ORDER BY checked_at DESC
+            "#,
+        )
+        .bind(story_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_result()).collect()
+    }
+
+    /// Get latest CI check results for a story (one per check name)
+    pub async fn get_latest_ci_check_results(
+        &self,
+        story_id: &str,
+    ) -> Result<Vec<crate::work_evaluation::CiCheckResult>> {
+        // Use MAX(id) to get the latest record per check_name, which is more reliable than timestamp
+        let rows = sqlx::query_as::<_, CiCheckResultRow>(
+            r#"
+            SELECT c1.* FROM ci_check_results c1
+            INNER JOIN (
+                SELECT check_name, MAX(id) as max_id
+                FROM ci_check_results
+                WHERE story_id = ?
+                GROUP BY check_name
+            ) c2 ON c1.check_name = c2.check_name AND c1.id = c2.max_id
+            WHERE c1.story_id = ?
+            "#,
+        )
+        .bind(story_id)
+        .bind(story_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_result()).collect()
+    }
+
+    /// Get story evaluation summary stats
+    pub async fn get_story_evaluation_stats(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<StoryEvaluationStats> {
+        let base_query = if session_id.is_some() {
+            "SELECT status, COUNT(*) as count FROM story_evaluations WHERE session_id = ? GROUP BY status"
+        } else {
+            "SELECT status, COUNT(*) as count FROM story_evaluations GROUP BY status"
+        };
+
+        let rows: Vec<(String, i64)> = if let Some(sid) = session_id {
+            sqlx::query_as(base_query)
+                .bind(sid)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as("SELECT status, COUNT(*) as count FROM story_evaluations GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        let mut stats = StoryEvaluationStats::default();
+        for (status, count) in rows {
+            match status.as_str() {
+                "complete" => stats.complete = count as u32,
+                "in_progress" => stats.in_progress = count as u32,
+                "blocked" => stats.blocked = count as u32,
+                "failed" => stats.failed = count as u32,
+                "needs_review" => stats.needs_review = count as u32,
+                "needs_review_fixes" => stats.needs_review_fixes = count as u32,
+                "needs_ci_fixes" => stats.needs_ci_fixes = count as u32,
+                "needs_pr_approval" => stats.needs_pr_approval = count as u32,
+                "ready_to_merge" => stats.ready_to_merge = count as u32,
+                _ => {}
+            }
+        }
+        stats.total = stats.complete + stats.in_progress + stats.blocked + stats.failed
+            + stats.needs_review + stats.needs_review_fixes + stats.needs_ci_fixes
+            + stats.needs_pr_approval + stats.ready_to_merge;
+
+        Ok(stats)
+    }
+}
+
+// ==================== Story Evaluation Row (Epic 016 - Story 8) ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct StoryEvaluationRow {
+    id: i64,
+    story_id: String,
+    agent_id: String,
+    session_id: Option<String>,
+    status: String,
+    criteria_met_count: i64,
+    criteria_total_count: i64,
+    ci_passed: bool,
+    review_passed: bool,
+    review_iteration: i64,
+    pr_mergeable: bool,
+    feedback: Option<String>,
+    details: String,
+    evaluated_at: String,
+}
+
+impl StoryEvaluationRow {
+    fn into_record(self) -> Result<crate::work_evaluation::StoryEvaluationRecord> {
+        use crate::work_evaluation::WorkCompletionStatus;
+        use std::str::FromStr;
+
+        Ok(crate::work_evaluation::StoryEvaluationRecord {
+            id: self.id,
+            story_id: self.story_id,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            status: WorkCompletionStatus::from_str(&self.status)?,
+            criteria_met_count: self.criteria_met_count as u32,
+            criteria_total_count: self.criteria_total_count as u32,
+            ci_passed: self.ci_passed,
+            review_passed: self.review_passed,
+            review_iteration: self.review_iteration as u32,
+            pr_mergeable: self.pr_mergeable,
+            feedback: self.feedback,
+            details: serde_json::from_str(&self.details)?,
+            evaluated_at: parse_datetime(&self.evaluated_at)?,
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CodeReviewResultRow {
+    id: i64,
+    story_id: String,
+    agent_id: String,
+    session_id: Option<String>,
+    verdict: String,
+    reviewer: Option<String>,
+    iteration: i64,
+    issue_count: i64,
+    blocking_issue_count: i64,
+    issues: String,
+    raw_output: Option<String>,
+    reviewed_at: String,
+}
+
+impl CodeReviewResultRow {
+    fn into_result(self) -> Result<crate::work_evaluation::ReviewResult> {
+        use crate::work_evaluation::{ReviewVerdict, ReviewIssue};
+        use std::str::FromStr;
+
+        let verdict = ReviewVerdict::from_str(&self.verdict)?;
+        let issues: Vec<ReviewIssue> = serde_json::from_str(&self.issues)?;
+
+        Ok(crate::work_evaluation::ReviewResult {
+            verdict,
+            issues,
+            reviewer: self.reviewer,
+            reviewed_at: parse_datetime(&self.reviewed_at)?,
+            iteration: self.iteration as u32,
+            raw_output: self.raw_output,
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CiCheckResultRow {
+    id: i64,
+    story_id: Option<String>,
+    agent_id: String,
+    session_id: Option<String>,
+    check_name: String,
+    status: String,
+    url: Option<String>,
+    failure_details: Option<String>,
+    duration_secs: Option<i64>,
+    checked_at: String,
+}
+
+impl CiCheckResultRow {
+    fn into_result(self) -> Result<crate::work_evaluation::CiCheckResult> {
+        use crate::work_evaluation::CiStatus;
+        use std::str::FromStr;
+
+        Ok(crate::work_evaluation::CiCheckResult {
+            name: self.check_name,
+            status: CiStatus::from_str(&self.status)?,
+            url: self.url,
+            failure_details: self.failure_details,
+            duration_secs: self.duration_secs.map(|d| d as u64),
+        })
+    }
+}
+
+/// Story evaluation statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoryEvaluationStats {
+    pub total: u32,
+    pub complete: u32,
+    pub in_progress: u32,
+    pub blocked: u32,
+    pub failed: u32,
+    pub needs_review: u32,
+    pub needs_review_fixes: u32,
+    pub needs_ci_fixes: u32,
+    pub needs_pr_approval: u32,
+    pub ready_to_merge: u32,
 }
 
 // ==================== Recovery Attempt Row (Epic 016 - Story 7) ====================

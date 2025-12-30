@@ -70,10 +70,13 @@ pub mod worktree;
 pub mod test_stubs;
 pub mod stuck_detection;
 pub mod recovery;
+pub mod work_evaluation;
 #[cfg(test)]
 mod database_stuck_detection_tests;
 #[cfg(test)]
 mod database_recovery_tests;
+#[cfg(test)]
+mod database_work_evaluation_tests;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
@@ -314,4 +317,11 @@ pub use stuck_detection::{
 pub use recovery::{
     FixerAgentType, FixerRequest, PlannedRecoveryAction, RecoveryActionType, RecoveryAttempt,
     RecoveryConfig, RecoveryOutcome, RecoverySelector,
+};
+
+// Re-export work evaluation types (Epic 016 - Story 8)
+pub use work_evaluation::{
+    CiCheckResult, CiStatus, CriterionCheck, FeedbackItem, FeedbackType, PrMergeStatus,
+    ReviewIssue, ReviewIssueSeverity, ReviewResult, ReviewVerdict, StoryEvaluationRecord,
+    WorkCompletionStatus, WorkEvaluationResult, WorkEvaluator, WorkEvaluatorConfig,
 };
