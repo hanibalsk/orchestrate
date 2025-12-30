@@ -588,7 +588,13 @@ export function AutonomousProcessing() {
         <Button
           variant="outline"
           size="sm"
-          onClick={() => queryClient.invalidateQueries()}
+          onClick={() => {
+            // Invalidate only the relevant queries instead of all queries
+            queryClient.invalidateQueries({ queryKey: ['autoStatus'] });
+            queryClient.invalidateQueries({ queryKey: ['stuckAgents'] });
+            queryClient.invalidateQueries({ queryKey: ['edgeCases'] });
+            queryClient.invalidateQueries({ queryKey: ['sessions'] });
+          }}
         >
           Refresh
         </Button>
