@@ -95,6 +95,7 @@ impl ApiError {
 pub struct AppState {
     pub db: Database,
     pub api_key: Option<SecretString>,
+    pub metrics: Arc<crate::metrics::MetricsCollector>,
 }
 
 impl AppState {
@@ -103,6 +104,8 @@ impl AppState {
         Self {
             db,
             api_key: api_key.map(SecretString::new),
+            metrics: Arc::new(crate::metrics::MetricsCollector::new()
+                .expect("Failed to initialize metrics collector")),
         }
     }
 }
@@ -218,7 +221,9 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         ));
 
     // Public routes (no auth required)
-    let public_routes = Router::new().route("/api/health", get(health_check));
+    let public_routes = Router::new()
+        .route("/api/health", get(health_check))
+        .route("/metrics", get(metrics_handler));
 
     Router::new()
         .merge(protected_routes)
@@ -267,6 +272,15 @@ async fn health_check() -> Json<HealthResponse> {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+/// Prometheus metrics endpoint
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> Result<String, ApiError> {
+    state
+        .metrics
+        .gather(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to gather metrics: {}", e)))
 }
 
 async fn list_agents(
