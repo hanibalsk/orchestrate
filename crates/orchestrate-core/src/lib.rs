@@ -29,6 +29,8 @@ mod database_notifications_tests;
 #[cfg(test)]
 mod database_cost_tests;
 #[cfg(test)]
+mod database_performance_tests;
+#[cfg(test)]
 mod tracing_integration_tests;
 pub mod documentation;
 pub mod epic;
@@ -48,6 +50,7 @@ pub mod monitoring;
 pub mod network;
 pub mod notifications;
 pub mod pattern_export;
+pub mod performance_analytics;
 pub mod prompt_optimization;
 pub mod pipeline;
 pub mod pipeline_executor;
@@ -238,4 +241,11 @@ pub use monitoring::{
     DailyCost as MonitoringDailyCost, HealthStatus, HistogramBucket, HistogramValue,
     MetricDefinition, MetricType, MetricValue, MetricsSummary, NotificationChannel,
     NotificationChannelType, SystemHealth,
+};
+
+// Re-export performance analytics types
+pub use performance_analytics::{
+    AgentComparison, AgentExecution, DurationStats, ErrorAnalysis, ErrorPattern,
+    PerformanceAnalytics, PerformanceTrend, TokenEfficiency, TrendDataPoint,
+    TrendDirection as PerformanceTrendDirection,
 };

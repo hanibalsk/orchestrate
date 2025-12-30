@@ -1,8 +1,10 @@
 //! Database layer for SQLite
 
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -5636,6 +5638,263 @@ impl Database {
         Ok(rows.into_iter()
             .map(|row| (row.agent_type, row.success_rate))
             .collect())
+    }
+
+    // ==================== Performance Analytics Operations ====================
+
+    /// Get agent execution data for performance analytics
+    pub async fn get_agent_executions(
+        &self,
+        agent_type: Option<&str>,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    ) -> Result<Vec<crate::performance_analytics::AgentExecution>> {
+        use crate::performance_analytics::AgentExecution;
+
+        #[derive(sqlx::FromRow)]
+        struct ExecutionRow {
+            agent_type: String,
+            state: String,
+            duration_seconds: f64,
+            input_tokens: i64,
+            output_tokens: i64,
+            error_message: Option<String>,
+            completed_at: String,
+        }
+
+        let query = if let Some(agent_type) = agent_type {
+            sqlx::query_as::<_, ExecutionRow>(
+                r#"
+                SELECT
+                    a.agent_type,
+                    a.state,
+                    (julianday(COALESCE(a.completed_at, a.updated_at)) - julianday(a.created_at)) * 86400 as duration_seconds,
+                    COALESCE(SUM(m.input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(m.output_tokens), 0) as output_tokens,
+                    a.error_message,
+                    COALESCE(a.completed_at, a.updated_at) as completed_at
+                FROM agents a
+                LEFT JOIN agent_messages m ON a.id = m.agent_id
+                WHERE a.agent_type = ?
+                    AND a.state IN ('completed', 'failed')
+                    AND a.created_at >= ?
+                    AND a.created_at <= ?
+                GROUP BY a.id
+                ORDER BY a.created_at DESC
+                "#,
+            )
+            .bind(agent_type)
+            .bind(period_start.to_rfc3339())
+            .bind(period_end.to_rfc3339())
+        } else {
+            sqlx::query_as::<_, ExecutionRow>(
+                r#"
+                SELECT
+                    a.agent_type,
+                    a.state,
+                    (julianday(COALESCE(a.completed_at, a.updated_at)) - julianday(a.created_at)) * 86400 as duration_seconds,
+                    COALESCE(SUM(m.input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(m.output_tokens), 0) as output_tokens,
+                    a.error_message,
+                    COALESCE(a.completed_at, a.updated_at) as completed_at
+                FROM agents a
+                LEFT JOIN agent_messages m ON a.id = m.agent_id
+                WHERE a.state IN ('completed', 'failed')
+                    AND a.created_at >= ?
+                    AND a.created_at <= ?
+                GROUP BY a.id
+                ORDER BY a.created_at DESC
+                "#,
+            )
+            .bind(period_start.to_rfc3339())
+            .bind(period_end.to_rfc3339())
+        };
+
+        let rows = query.fetch_all(&self.pool).await?;
+
+        let executions: Result<Vec<AgentExecution>> = rows
+            .into_iter()
+            .map(|row| {
+                let agent_type = AgentType::from_str(&row.agent_type)?;
+                let state = AgentState::from_str(&row.state)?;
+                let completed_at = DateTime::parse_from_rfc3339(&row.completed_at)
+                    .map_err(|e| crate::Error::Other(format!("Failed to parse datetime: {}", e)))?
+                    .with_timezone(&Utc);
+
+                Ok(AgentExecution {
+                    agent_type,
+                    state,
+                    duration_seconds: row.duration_seconds.max(0.0),
+                    input_tokens: row.input_tokens.max(0) as u64,
+                    output_tokens: row.output_tokens.max(0) as u64,
+                    error_message: row.error_message,
+                    completed_at,
+                })
+            })
+            .collect();
+
+        executions
+    }
+
+    /// Calculate performance metrics for an agent type
+    pub async fn calculate_agent_performance(
+        &self,
+        agent_type: &str,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    ) -> Result<crate::monitoring::AgentPerformance> {
+        use crate::performance_analytics::PerformanceAnalytics;
+
+        let executions = self
+            .get_agent_executions(Some(agent_type), period_start, period_end)
+            .await?;
+
+        Ok(PerformanceAnalytics::calculate_metrics(
+            agent_type,
+            &executions,
+            period_start,
+            period_end,
+        ))
+    }
+
+    /// Get performance comparison for all agent types
+    pub async fn compare_agent_performance(
+        &self,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    ) -> Result<Vec<crate::performance_analytics::AgentComparison>> {
+        use crate::performance_analytics::PerformanceAnalytics;
+
+        // Get all unique agent types with executions in this period
+        let agent_types = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT agent_type
+            FROM agents
+            WHERE state IN ('completed', 'failed')
+                AND created_at >= ?
+                AND created_at <= ?
+            "#,
+        )
+        .bind(period_start.to_rfc3339())
+        .bind(period_end.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Calculate performance for each agent type
+        let mut performances = Vec::new();
+        for agent_type in agent_types {
+            let performance = self
+                .calculate_agent_performance(&agent_type, period_start, period_end)
+                .await?;
+            performances.push(performance);
+        }
+
+        Ok(PerformanceAnalytics::compare_agents(&performances))
+    }
+
+    /// Get error analysis for an agent type
+    pub async fn analyze_agent_errors(
+        &self,
+        agent_type: &str,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    ) -> Result<crate::performance_analytics::ErrorAnalysis> {
+        use crate::performance_analytics::PerformanceAnalytics;
+
+        let executions = self
+            .get_agent_executions(Some(agent_type), period_start, period_end)
+            .await?;
+
+        Ok(PerformanceAnalytics::analyze_error_patterns(&executions))
+    }
+
+    /// Get token efficiency metrics for an agent type
+    pub async fn calculate_token_efficiency(
+        &self,
+        agent_type: &str,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    ) -> Result<crate::performance_analytics::TokenEfficiency> {
+        use crate::performance_analytics::PerformanceAnalytics;
+
+        let executions = self
+            .get_agent_executions(Some(agent_type), period_start, period_end)
+            .await?;
+
+        Ok(PerformanceAnalytics::calculate_token_efficiency(&executions))
+    }
+
+    /// Get performance trend data points for an agent type
+    pub async fn get_performance_trend(
+        &self,
+        agent_type: &str,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+        bucket_hours: i64,
+    ) -> Result<crate::performance_analytics::PerformanceTrend> {
+        use crate::performance_analytics::{PerformanceAnalytics, TrendDataPoint};
+
+        #[derive(sqlx::FromRow)]
+        struct TrendRow {
+            timestamp: String,
+            success_rate: f64,
+            avg_duration: f64,
+            error_count: i64,
+        }
+
+        let rows = sqlx::query_as::<_, TrendRow>(
+            r#"
+            SELECT
+                datetime(created_at, 'start of day', printf('+%d hours',
+                    CAST(strftime('%H', created_at) AS INTEGER) / ? * ?)) as timestamp,
+                CAST(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) AS REAL) /
+                    COUNT(*) * 100.0 as success_rate,
+                AVG((julianday(COALESCE(completed_at, updated_at)) - julianday(created_at)) * 86400) as avg_duration,
+                SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) as error_count
+            FROM agents
+            WHERE agent_type = ?
+                AND state IN ('completed', 'failed')
+                AND created_at >= ?
+                AND created_at <= ?
+            GROUP BY timestamp
+            ORDER BY timestamp ASC
+            "#,
+        )
+        .bind(bucket_hours)
+        .bind(bucket_hours)
+        .bind(agent_type)
+        .bind(period_start.to_rfc3339())
+        .bind(period_end.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let data_points: Result<Vec<TrendDataPoint>> = rows
+            .into_iter()
+            .map(|row| {
+                let timestamp = DateTime::parse_from_rfc3339(&format!("{}Z", row.timestamp))
+                    .or_else(|_| {
+                        // Try parsing as naive datetime
+                        chrono::NaiveDateTime::parse_from_str(&row.timestamp, "%Y-%m-%d %H:%M:%S")
+                            .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).into())
+                    })
+                    .map_err(|e| crate::Error::Other(format!("Failed to parse datetime: {}", e)))?
+                    .with_timezone(&Utc);
+
+                Ok(TrendDataPoint {
+                    timestamp,
+                    success_rate: row.success_rate,
+                    avg_duration: row.avg_duration,
+                    error_count: row.error_count as u64,
+                })
+            })
+            .collect();
+
+        let data_points = data_points?;
+        Ok(PerformanceAnalytics::detect_trend(
+            data_points,
+            period_start,
+            period_end,
+        ))
     }
 
     // ==================== Alerting Operations ====================
