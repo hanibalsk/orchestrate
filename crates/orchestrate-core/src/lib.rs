@@ -8,11 +8,14 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod alerting;
 pub mod approval;
 pub mod approval_service;
 pub mod condition_evaluator;
 pub mod cron;
 pub mod database;
+#[cfg(test)]
+mod database_alerting_tests;
 #[cfg(test)]
 mod database_approval_tests;
 #[cfg(test)]
@@ -108,6 +111,12 @@ pub use pipeline_parser::{
 
 // Re-export condition evaluator types
 pub use condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationResult, SkipReason};
+
+// Re-export alerting types
+pub use alerting::{
+    Alert, AlertEvaluator, AlertRule, AlertSeverity, AlertStatus, ConditionParser, ConditionType,
+    ThresholdOperator, generate_fingerprint,
+};
 
 // Re-export approval types
 pub use approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};

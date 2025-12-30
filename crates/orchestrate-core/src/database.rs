@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::alerting::{Alert, AlertRule, AlertSeverity, AlertStatus};
 use crate::approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
 use crate::experiment::{
     Experiment, ExperimentMetric, ExperimentStatus, ExperimentType, ExperimentVariant,
@@ -147,6 +148,10 @@ impl Database {
             .await?;
         // Success patterns migration
         sqlx::query(include_str!("../../../migrations/011_success_patterns.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Alerting migration
+        sqlx::query(include_str!("../../../migrations/016_alerting.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -5618,5 +5623,465 @@ impl Database {
         Ok(rows.into_iter()
             .map(|row| (row.agent_type, row.success_rate))
             .collect())
+    }
+
+    // ==================== Alerting Operations ====================
+
+    /// Create a new alert rule
+    pub async fn create_alert_rule(&self, rule: AlertRule) -> Result<AlertRule> {
+        let mut rule = rule;
+        let channels_json = serde_json::to_string(&rule.channels)?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO alert_rules
+            (name, condition, severity, channels, enabled, evaluation_interval_seconds, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            "#,
+        )
+        .bind(&rule.name)
+        .bind(&rule.condition)
+        .bind(rule.severity.to_string())
+        .bind(&channels_json)
+        .bind(rule.enabled)
+        .bind(rule.evaluation_interval_seconds)
+        .execute(&self.pool)
+        .await?;
+
+        rule.id = Some(result.last_insert_rowid());
+        Ok(rule)
+    }
+
+    /// Get an alert rule by ID
+    pub async fn get_alert_rule(&self, id: i64) -> Result<Option<AlertRule>> {
+        let row = sqlx::query_as::<_, AlertRuleRow>(
+            r#"
+            SELECT id, name, condition, severity, channels, enabled, evaluation_interval_seconds, created_at, updated_at
+            FROM alert_rules
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get an alert rule by name
+    pub async fn get_alert_rule_by_name(&self, name: &str) -> Result<Option<AlertRule>> {
+        let row = sqlx::query_as::<_, AlertRuleRow>(
+            r#"
+            SELECT id, name, condition, severity, channels, enabled, evaluation_interval_seconds, created_at, updated_at
+            FROM alert_rules
+            WHERE name = ?
+            "#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List all alert rules
+    pub async fn list_alert_rules(&self) -> Result<Vec<AlertRule>> {
+        let rows = sqlx::query_as::<_, AlertRuleRow>(
+            r#"
+            SELECT id, name, condition, severity, channels, enabled, evaluation_interval_seconds, created_at, updated_at
+            FROM alert_rules
+            ORDER BY name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List enabled alert rules
+    pub async fn list_enabled_alert_rules(&self) -> Result<Vec<AlertRule>> {
+        let rows = sqlx::query_as::<_, AlertRuleRow>(
+            r#"
+            SELECT id, name, condition, severity, channels, enabled, evaluation_interval_seconds, created_at, updated_at
+            FROM alert_rules
+            WHERE enabled = 1
+            ORDER BY name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update an alert rule
+    pub async fn update_alert_rule(&self, rule: &AlertRule) -> Result<()> {
+        let id = rule
+            .id
+            .ok_or_else(|| crate::Error::Other("Alert rule ID is required".to_string()))?;
+
+        let channels_json = serde_json::to_string(&rule.channels)?;
+
+        sqlx::query(
+            r#"
+            UPDATE alert_rules
+            SET name = ?, condition = ?, severity = ?, channels = ?,
+                enabled = ?, evaluation_interval_seconds = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?
+            "#,
+        )
+        .bind(&rule.name)
+        .bind(&rule.condition)
+        .bind(rule.severity.to_string())
+        .bind(&channels_json)
+        .bind(rule.enabled)
+        .bind(rule.evaluation_interval_seconds)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Enable/disable an alert rule
+    pub async fn set_alert_rule_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE alert_rules
+            SET enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?
+            "#,
+        )
+        .bind(enabled)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete an alert rule
+    pub async fn delete_alert_rule(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM alert_rules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Create a new alert
+    pub async fn create_alert(&self, alert: Alert) -> Result<Alert> {
+        let mut alert = alert;
+
+        let trigger_value_json = alert.trigger_value.as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+        let metadata_json = alert.metadata.as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO alerts
+            (rule_id, status, triggered_at, resolved_at, acknowledged_at, acknowledged_by,
+             trigger_value, metadata, fingerprint, last_notified_at, notification_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(alert.rule_id)
+        .bind(alert.status.to_string())
+        .bind(alert.triggered_at.to_rfc3339())
+        .bind(alert.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(alert.acknowledged_at.map(|t| t.to_rfc3339()))
+        .bind(&alert.acknowledged_by)
+        .bind(trigger_value_json)
+        .bind(metadata_json)
+        .bind(&alert.fingerprint)
+        .bind(alert.last_notified_at.map(|t| t.to_rfc3339()))
+        .bind(alert.notification_count)
+        .execute(&self.pool)
+        .await?;
+
+        alert.id = Some(result.last_insert_rowid());
+        Ok(alert)
+    }
+
+    /// Get an alert by ID
+    pub async fn get_alert(&self, id: i64) -> Result<Option<Alert>> {
+        let row = sqlx::query_as::<_, AlertRow>(
+            r#"
+            SELECT id, rule_id, status, triggered_at, resolved_at, acknowledged_at, acknowledged_by,
+                   trigger_value, metadata, fingerprint, last_notified_at, notification_count
+            FROM alerts
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get active alert by fingerprint (for deduplication)
+    pub async fn get_active_alert_by_fingerprint(&self, fingerprint: &str) -> Result<Option<Alert>> {
+        let row = sqlx::query_as::<_, AlertRow>(
+            r#"
+            SELECT id, rule_id, status, triggered_at, resolved_at, acknowledged_at, acknowledged_by,
+                   trigger_value, metadata, fingerprint, last_notified_at, notification_count
+            FROM alerts
+            WHERE fingerprint = ? AND status = 'active'
+            ORDER BY triggered_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(fingerprint)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List alerts by status
+    pub async fn list_alerts_by_status(&self, status: AlertStatus) -> Result<Vec<Alert>> {
+        let rows = sqlx::query_as::<_, AlertRow>(
+            r#"
+            SELECT id, rule_id, status, triggered_at, resolved_at, acknowledged_at, acknowledged_by,
+                   trigger_value, metadata, fingerprint, last_notified_at, notification_count
+            FROM alerts
+            WHERE status = ?
+            ORDER BY triggered_at DESC
+            "#,
+        )
+        .bind(status.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// List all alerts for a rule
+    pub async fn list_alerts_by_rule(&self, rule_id: i64) -> Result<Vec<Alert>> {
+        let rows = sqlx::query_as::<_, AlertRow>(
+            r#"
+            SELECT id, rule_id, status, triggered_at, resolved_at, acknowledged_at, acknowledged_by,
+                   trigger_value, metadata, fingerprint, last_notified_at, notification_count
+            FROM alerts
+            WHERE rule_id = ?
+            ORDER BY triggered_at DESC
+            "#,
+        )
+        .bind(rule_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Update an alert
+    pub async fn update_alert(&self, alert: &Alert) -> Result<()> {
+        let id = alert
+            .id
+            .ok_or_else(|| crate::Error::Other("Alert ID is required".to_string()))?;
+
+        let trigger_value_json = alert.trigger_value.as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+        let metadata_json = alert.metadata.as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+
+        sqlx::query(
+            r#"
+            UPDATE alerts
+            SET status = ?, resolved_at = ?, acknowledged_at = ?, acknowledged_by = ?,
+                trigger_value = ?, metadata = ?, last_notified_at = ?, notification_count = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(alert.status.to_string())
+        .bind(alert.resolved_at.map(|t| t.to_rfc3339()))
+        .bind(alert.acknowledged_at.map(|t| t.to_rfc3339()))
+        .bind(&alert.acknowledged_by)
+        .bind(trigger_value_json)
+        .bind(metadata_json)
+        .bind(alert.last_notified_at.map(|t| t.to_rfc3339()))
+        .bind(alert.notification_count)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Acknowledge an alert
+    pub async fn acknowledge_alert(&self, id: i64, acknowledger: &str) -> Result<()> {
+        let now = chrono::Utc::now();
+
+        sqlx::query(
+            r#"
+            UPDATE alerts
+            SET status = 'acknowledged', acknowledged_at = ?, acknowledged_by = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(acknowledger)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Resolve an alert
+    pub async fn resolve_alert(&self, id: i64) -> Result<()> {
+        let now = chrono::Utc::now();
+
+        sqlx::query(
+            r#"
+            UPDATE alerts
+            SET status = 'resolved', resolved_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Increment notification count for an alert
+    pub async fn increment_alert_notification_count(&self, id: i64) -> Result<()> {
+        let now = chrono::Utc::now();
+
+        sqlx::query(
+            r#"
+            UPDATE alerts
+            SET notification_count = notification_count + 1, last_notified_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+}
+
+// ==================== Row Types for Alerting ====================
+
+#[derive(sqlx::FromRow)]
+struct AlertRuleRow {
+    id: i64,
+    name: String,
+    condition: String,
+    severity: String,
+    channels: String,
+    enabled: bool,
+    evaluation_interval_seconds: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<AlertRuleRow> for AlertRule {
+    type Error = crate::Error;
+
+    fn try_from(row: AlertRuleRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        let severity = AlertSeverity::from_str(&row.severity)
+            .map_err(|e| crate::Error::Other(e))?;
+        let channels: Vec<String> = serde_json::from_str(&row.channels)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(AlertRule {
+            id: Some(row.id),
+            name: row.name,
+            condition: row.condition,
+            severity,
+            channels,
+            enabled: row.enabled,
+            evaluation_interval_seconds: row.evaluation_interval_seconds,
+            created_at: Some(created_at),
+            updated_at: Some(updated_at),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AlertRow {
+    id: i64,
+    rule_id: i64,
+    status: String,
+    triggered_at: String,
+    resolved_at: Option<String>,
+    acknowledged_at: Option<String>,
+    acknowledged_by: Option<String>,
+    trigger_value: Option<String>,
+    metadata: Option<String>,
+    fingerprint: String,
+    last_notified_at: Option<String>,
+    notification_count: i64,
+}
+
+impl TryFrom<AlertRow> for Alert {
+    type Error = crate::Error;
+
+    fn try_from(row: AlertRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        let status = AlertStatus::from_str(&row.status)
+            .map_err(|e| crate::Error::Other(e))?;
+        let triggered_at = chrono::DateTime::parse_from_rfc3339(&row.triggered_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+        let resolved_at = row.resolved_at
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let acknowledged_at = row.acknowledged_at
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let trigger_value = row.trigger_value
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?;
+        let metadata = row.metadata
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?;
+        let last_notified_at = row.last_notified_at
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        Ok(Alert {
+            id: Some(row.id),
+            rule_id: row.rule_id,
+            status,
+            triggered_at,
+            resolved_at,
+            acknowledged_at,
+            acknowledged_by: row.acknowledged_by,
+            trigger_value,
+            metadata,
+            fingerprint: row.fingerprint,
+            last_notified_at,
+            notification_count: row.notification_count,
+        })
     }
 }
