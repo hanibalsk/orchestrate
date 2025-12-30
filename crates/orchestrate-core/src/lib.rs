@@ -32,6 +32,10 @@ pub mod deployment;
 pub mod monitoring;
 pub mod slack;
 pub mod security;
+pub mod security_gate;
+pub mod security_report;
+pub mod audit;
+pub mod cost_analytics;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -55,6 +59,7 @@ pub mod shell_state;
 pub mod webhook;
 pub mod webhook_config;
 pub mod worktree;
+pub mod test_stubs;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
@@ -198,10 +203,10 @@ pub use incident::{
 
 // Re-export test generation types
 pub use test_generation::{
-    CoverageReport, CoverageTrend, FileCoverage, GeneratedTest, IssueSeverity, ModuleCoverage,
-    TestableUnit, TestableUnitType, TestFramework, TestGenerationRequest, TestQualityIssue,
-    TestQualityIssueType, TestQualityReport, TestResult, TestResultStatus, TestRun, TestRunStatus,
-    TestSuggestion, TestType,
+    AcceptanceCriterion, E2ETestPlatform, E2ETestResult, FunctionSignature, IntegrationTestResult,
+    InterfaceInfo, InterfaceType, Language, ModuleInfo, Parameter, PropertyTestCase,
+    PropertyTestResult, PropertyType, TestCase, TestCategory, TestFixture, TestGenerationResult,
+    TestGenerationService, TestType,
 };
 
 // Re-export deployment types
@@ -221,6 +226,12 @@ pub use monitoring::{
     NotificationChannel, NotificationChannelType, SystemHealth,
 };
 
+// Re-export audit types
+pub use audit::{AuditQuery, AuditStats, ExportFormat, RetentionPolicy};
+
+// Re-export cost analytics types
+pub use cost_analytics::BudgetPeriod;
+
 // Re-export Slack types
 pub use slack::{
     ButtonStyle, ChannelConfig, DigestMode, InteractionAction, InteractionChannel,
@@ -238,4 +249,18 @@ pub use security::{
     SarifPhysicalLocation, SarifRegion, SarifReport, SarifResult, SarifRun, SarifTool,
     ScanStatus, ScanSummary, ScanType, SecretType, SecurityException, SecurityFix,
     SecurityPolicy, SecurityScan, Severity, Vulnerability, VulnerabilityType,
+};
+
+// Re-export security gate types
+pub use security_gate::{GateDecision, SecurityGate};
+
+// Re-export security report types
+pub use security_report::ReportFormat;
+
+// Re-export test stub types (placeholders for incomplete features)
+pub use test_stubs::{
+    CoverageReport, FileCoverage, GeneratedTest, IssueSeverity, ModuleCoverage,
+    SlackService, SlackUserService,
+    TestFramework, TestQualityIssue, TestQualityIssueType, TestQualityReport,
+    TestResult, TestResultStatus, TestRun, TestRunStatus,
 };

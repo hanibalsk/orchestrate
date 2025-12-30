@@ -297,10 +297,15 @@ export interface MetricValue {
 
 export interface MetricsSummary {
   active_agents: number;
-  total_requests_24h: number;
+  pending_prs?: number;
+  queue_depth?: number;
+  total_requests_24h?: number;
   avg_response_time_ms: number;
-  error_rate: number;
-  total_tokens_24h: number;
+  error_rate?: number;
+  error_rate_percent?: number;
+  total_tokens_24h?: number;
+  tokens_used_today?: number;
+  cost_today_usd?: number;
 }
 
 export interface ComponentHealth {
@@ -335,12 +340,89 @@ export interface CostBreakdown {
 export interface CostReport {
   period_start: string;
   period_end: string;
-  total_cost: number;
-  breakdown_by_agent: CostBreakdown[];
-  breakdown_by_epic: Record<string, number>;
+  // Frontend field name
+  total_cost?: number;
+  // Backend field name
+  total_cost_usd?: number;
+  // Frontend field name
+  breakdown_by_agent?: CostBreakdown[];
+  // Backend field name (object format)
+  by_agent_type?: Record<string, { cost: number; tokens: number }>;
+  breakdown_by_epic?: Record<string, number>;
+  by_epic?: Record<string, number>;
 }
 
 export interface AcknowledgeAlertRequest {
   acknowledged_by: string;
   notes?: string;
+}
+
+// Deployment types
+export type EnvironmentType = 'development' | 'staging' | 'production';
+export type DeploymentStatus = 'pending' | 'in_progress' | 'success' | 'failed' | 'rolled_back';
+
+export interface Environment {
+  id: string;
+  name: string;
+  env_type: EnvironmentType;
+  type: EnvironmentType; // alias for backwards compatibility
+  url?: string;
+  current_version?: string;
+  last_deployment_at?: string;
+  last_deployed_by?: string;
+  is_protected: boolean;
+  requires_approval: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Deployment {
+  id: number;
+  environment_id: string;
+  environment_name: string;
+  environment?: string;
+  version: string;
+  status: DeploymentStatus;
+  strategy: string;
+  provider?: string;
+  deployed_by: string;
+  started_at: string;
+  completed_at?: string;
+  rollback_version?: string;
+  notes?: string;
+  error_message?: string;
+}
+
+export interface CreateDeploymentRequest {
+  environment_id?: string;
+  environment?: string;
+  version: string;
+  strategy?: string;
+  notes?: string;
+}
+
+export interface Release {
+  id: number;
+  version: string;
+  tag_name?: string;
+  title: string;
+  description?: string;
+  changelog?: string;
+  created_by: string;
+  created_at: string;
+  is_prerelease: boolean;
+  is_published: boolean;
+  published?: boolean; // alias for backwards compatibility
+  published_at?: string;
+  download_url?: string;
+  github_release_url?: string;
+}
+
+export interface CreateReleaseRequest {
+  version: string;
+  tag_name?: string;
+  title?: string;
+  description?: string;
+  changelog?: string;
+  is_prerelease?: boolean;
 }

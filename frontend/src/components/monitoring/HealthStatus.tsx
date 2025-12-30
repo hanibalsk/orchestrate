@@ -9,8 +9,15 @@ interface HealthStatusProps {
 }
 
 export function HealthStatus({ status, components }: HealthStatusProps) {
-  const statusConfig = {
+  // Backend uses snake_case, frontend types use PascalCase - handle both
+  const statusConfig: Record<string, { icon: typeof CheckCircle; color: string; bgColor: string; label: string }> = {
     Healthy: {
+      icon: CheckCircle,
+      color: 'text-green-500',
+      bgColor: 'bg-green-50',
+      label: 'Healthy',
+    },
+    healthy: {
       icon: CheckCircle,
       color: 'text-green-500',
       bgColor: 'bg-green-50',
@@ -22,7 +29,19 @@ export function HealthStatus({ status, components }: HealthStatusProps) {
       bgColor: 'bg-yellow-50',
       label: 'Degraded',
     },
+    degraded: {
+      icon: AlertCircle,
+      color: 'text-yellow-500',
+      bgColor: 'bg-yellow-50',
+      label: 'Degraded',
+    },
     Unhealthy: {
+      icon: XCircle,
+      color: 'text-red-500',
+      bgColor: 'bg-red-50',
+      label: 'Unhealthy',
+    },
+    unhealthy: {
       icon: XCircle,
       color: 'text-red-500',
       bgColor: 'bg-red-50',
@@ -30,7 +49,14 @@ export function HealthStatus({ status, components }: HealthStatusProps) {
     },
   };
 
-  const config = statusConfig[status];
+  const defaultConfig = {
+    icon: AlertCircle,
+    color: 'text-gray-500',
+    bgColor: 'bg-gray-50',
+    label: 'Unknown',
+  };
+
+  const config = statusConfig[status] || defaultConfig;
   const Icon = config.icon;
 
   return (
@@ -55,7 +81,7 @@ export function HealthStatus({ status, components }: HealthStatusProps) {
           <div className="space-y-2">
             <div className="text-sm font-medium">Components</div>
             {components.map((component) => {
-              const componentConfig = statusConfig[component.status];
+              const componentConfig = statusConfig[component.status] || defaultConfig;
               const ComponentIcon = componentConfig.icon;
 
               return (

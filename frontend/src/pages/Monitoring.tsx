@@ -18,6 +18,17 @@ import {
   AlertTriangle,
   Zap,
 } from 'lucide-react';
+import type { CostBreakdown } from '@/api/types';
+
+// Helper to convert backend's by_agent_type object to breakdown array
+function convertByAgentType(byAgentType: Record<string, { cost: number; tokens: number }> | undefined): CostBreakdown[] {
+  if (!byAgentType) return [];
+  return Object.entries(byAgentType).map(([agent_type, data]) => ({
+    agent_type,
+    total_cost: data?.cost ?? 0,
+    token_count: data?.tokens ?? 0,
+  }));
+}
 
 export function Monitoring() {
   // Fetch system health with auto-refresh every 30 seconds
@@ -55,12 +66,19 @@ export function Monitoring() {
     refetchInterval: 60000,
   });
 
-  const summary = metrics?.summary || {
-    active_agents: 0,
-    total_requests_24h: 0,
-    avg_response_time_ms: 0,
-    error_rate: 0,
-    total_tokens_24h: 0,
+  // Map backend field names to frontend field names with safe defaults
+  const rawSummary = metrics?.summary;
+  const summary = {
+    active_agents: rawSummary?.active_agents ?? 0,
+    pending_prs: rawSummary?.pending_prs ?? 0,
+    queue_depth: rawSummary?.queue_depth ?? 0,
+    total_requests_24h: rawSummary?.total_requests_24h ?? 0,
+    avg_response_time_ms: rawSummary?.avg_response_time_ms ?? 0,
+    error_rate: rawSummary?.error_rate ?? rawSummary?.error_rate_percent ?? 0,
+    error_rate_percent: rawSummary?.error_rate_percent ?? 0,
+    total_tokens_24h: rawSummary?.total_tokens_24h ?? rawSummary?.tokens_used_today ?? 0,
+    tokens_used_today: rawSummary?.tokens_used_today ?? 0,
+    cost_today_usd: rawSummary?.cost_today_usd ?? 0,
   };
 
   return (
@@ -147,7 +165,7 @@ export function Monitoring() {
         {/* Performance Table - 2/3 width */}
         <div className="lg:col-span-2">
           {performanceData && (
-            <PerformanceTable stats={performanceData.stats} />
+            <PerformanceTable stats={performanceData.stats ?? []} />
           )}
         </div>
 
@@ -155,8 +173,8 @@ export function Monitoring() {
         <div className="lg:col-span-1">
           {costData && (
             <CostChart
-              totalCost={costData.report.total_cost}
-              breakdown={costData.report.breakdown_by_agent}
+              totalCost={costData.report.total_cost ?? costData.report.total_cost_usd ?? 0}
+              breakdown={costData.report.breakdown_by_agent ?? convertByAgentType(costData.report.by_agent_type)}
             />
           )}
         </div>

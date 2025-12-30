@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import type { Alert, AlertSeverity } from '@/api/types';
+import type { Alert } from '@/api/types';
 import { acknowledgeAlert } from '@/api/monitoring';
 import { AlertCircle, CheckCircle, Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -12,11 +12,17 @@ interface AlertsListProps {
   alerts: Alert[];
 }
 
+// Backend uses snake_case, frontend uses PascalCase - handle both
 const severityConfig: Record<
-  AlertSeverity,
+  string,
   { icon: React.ElementType; color: string; variant: 'default' | 'secondary' | 'destructive' }
 > = {
   Info: {
+    icon: Info,
+    color: 'text-blue-500',
+    variant: 'default',
+  },
+  info: {
     icon: Info,
     color: 'text-blue-500',
     variant: 'default',
@@ -26,11 +32,27 @@ const severityConfig: Record<
     color: 'text-yellow-500',
     variant: 'secondary',
   },
+  warning: {
+    icon: AlertCircle,
+    color: 'text-yellow-500',
+    variant: 'secondary',
+  },
   Critical: {
     icon: AlertCircle,
     color: 'text-red-500',
     variant: 'destructive',
   },
+  critical: {
+    icon: AlertCircle,
+    color: 'text-red-500',
+    variant: 'destructive',
+  },
+};
+
+const defaultSeverityConfig = {
+  icon: Info,
+  color: 'text-gray-500',
+  variant: 'default' as const,
 };
 
 export function AlertsList({ alerts }: AlertsListProps) {
@@ -84,7 +106,7 @@ export function AlertsList({ alerts }: AlertsListProps) {
       <CardContent>
         <div className="space-y-3">
           {alerts.map((alert) => {
-            const config = severityConfig[alert.severity];
+            const config = severityConfig[alert.severity] || defaultSeverityConfig;
             const Icon = config.icon;
             const isAcknowledged = alert.status === 'Acknowledged';
             const isAcknowledging = acknowledgingId === alert.id;

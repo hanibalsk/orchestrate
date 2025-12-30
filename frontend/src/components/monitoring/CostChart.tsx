@@ -8,10 +8,14 @@ interface CostChartProps {
 }
 
 export function CostChart({ totalCost, breakdown }: CostChartProps) {
+  // Handle undefined/null values with defaults
+  const safeTotalCost = totalCost ?? 0;
+  const safeBreakdown = breakdown ?? [];
+
   // Calculate percentages
-  const breakdownWithPercentage = breakdown.map((item) => ({
+  const breakdownWithPercentage = safeBreakdown.map((item) => ({
     ...item,
-    percentage: totalCost > 0 ? (item.total_cost / totalCost) * 100 : 0,
+    percentage: safeTotalCost > 0 ? (item.total_cost / safeTotalCost) * 100 : 0,
   }));
 
   // Colors for the bars
@@ -37,7 +41,7 @@ export function CostChart({ totalCost, breakdown }: CostChartProps) {
           {/* Total Cost */}
           <div className="text-center">
             <div className="text-3xl font-bold">
-              ${totalCost.toFixed(2)}
+              ${safeTotalCost.toFixed(2)}
             </div>
             <div className="text-sm text-muted-foreground">
               Total Cost (Current Period)

@@ -5404,7 +5404,8 @@ async fn main() -> Result<()> {
                 run.add_result(TestResult {
                     name: "test_agent_creation".to_string(),
                     status: TestResultStatus::Passed,
-                    duration_ms: Some(15),
+                    duration_ms: 15,
+                    error: None,
                     error_message: None,
                     stack_trace: None,
                 });
@@ -5412,20 +5413,21 @@ async fn main() -> Result<()> {
                 run.add_result(TestResult {
                     name: "test_database_query".to_string(),
                     status: TestResultStatus::Passed,
-                    duration_ms: Some(45),
+                    duration_ms: 45,
+                    error: None,
                     error_message: None,
                     stack_trace: None,
                 });
 
-                run.complete(TestRunStatus::Completed);
+                run.complete();
 
                 println!("Test Results:");
                 println!("  Total: {}", run.total_tests);
                 println!("  Passed: {} ✓", run.passed);
                 println!("  Failed: {}", run.failed);
                 println!("  Skipped: {}", run.skipped);
-                if let Some(duration) = run.duration_seconds {
-                    println!("  Duration: {:.2}s", duration);
+                if run.duration_seconds > 0.0 {
+                    println!("  Duration: {:.2}s", run.duration_seconds);
                 }
 
                 if verbose {
@@ -5436,7 +5438,7 @@ async fn main() -> Result<()> {
                             TestResultStatus::Failed => "✗",
                             TestResultStatus::Skipped => "○",
                         };
-                        println!("  {} {} ({:?}ms)", status, result.name, result.duration_ms.unwrap_or(0));
+                        println!("  {} {} ({}ms)", status, result.name, result.duration_ms);
                     }
                 }
             }
@@ -5456,29 +5458,34 @@ async fn main() -> Result<()> {
                 report.total_tests = 50;
 
                 if mutation {
-                    report.mutation_score = Some(72.5);
+                    report.mutation_score = 72.5;
                 }
 
                 report.add_issue(TestQualityIssue {
-                    test_name: "test_always_true".to_string(),
                     issue_type: TestQualityIssueType::WeakAssertion,
-                    description: "Uses assert!(true) instead of meaningful assertion".to_string(),
                     severity: IssueSeverity::Medium,
+                    message: "Weak assertion detected".to_string(),
+                    file: Some("tests/agent_tests.rs".to_string()),
+                    line: Some(42),
+                    test_name: Some("test_always_true".to_string()),
+                    description: Some("Uses assert!(true) instead of meaningful assertion".to_string()),
                 });
 
                 report.add_suggestion("Add edge case tests for error handling");
 
                 println!("Quality Report:");
                 println!("  Total tests: {}", report.total_tests);
-                if let Some(score) = report.mutation_score {
-                    println!("  Mutation score: {:.1}%", score);
+                if report.mutation_score > 0.0 {
+                    println!("  Mutation score: {:.1}%", report.mutation_score);
                 }
                 println!("  Issues found: {}", report.issues.len());
 
                 if !report.issues.is_empty() {
                     println!("\nIssues:");
                     for issue in &report.issues {
-                        println!("  [{:?}] {}: {}", issue.severity, issue.test_name, issue.description);
+                        let test_name = issue.test_name.as_deref().unwrap_or("unknown");
+                        let description = issue.description.as_deref().unwrap_or(&issue.message);
+                        println!("  [{:?}] {}: {}", issue.severity, test_name, description);
                     }
                 }
 
@@ -5969,9 +5976,9 @@ async fn main() -> Result<()> {
         Commands::Slack { action } => {
             use orchestrate_core::{SlackConnection, SlackService, SlackUserService, ChannelConfig, NotificationType, SlackMessage};
 
-            let db = Database::new(&db_path).await?;
-            let slack_service = SlackService::new(db.clone());
-            let user_service = SlackUserService::new(db.clone(), SlackService::new(db.clone()));
+            let _db = Database::new(&db_path).await?;
+            let slack_service = SlackService::new();
+            let user_service = SlackUserService::new();
 
             match action {
                 SlackAction::Connect { token } => {
@@ -6002,48 +6009,50 @@ async fn main() -> Result<()> {
                     println!("Connection ID: {}", conn.id);
                 }
                 SlackAction::Disconnect => {
-                    let conn = slack_service.get_active_connection().await?;
-
-                    if let Some(mut conn) = conn {
-                        conn.is_active = false;
-                        slack_service.save_connection(&conn).await?;
-                        println!("Disconnected from Slack workspace: {}", conn.team_name);
-                    } else {
-                        println!("No active Slack connection found.");
+                    match slack_service.get_active_connection().await {
+                        Ok(mut conn) => {
+                            conn.is_active = false;
+                            slack_service.save_connection(&conn).await?;
+                            println!("Disconnected from Slack workspace: {}", conn.team_name);
+                        }
+                        Err(_) => {
+                            println!("No active Slack connection found.");
+                        }
                     }
                 }
                 SlackAction::Status => {
-                    let conn = slack_service.get_active_connection().await?;
-
-                    if let Some(conn) = conn {
-                        println!("Slack Connection Status:");
-                        println!();
-                        println!("  Status: Connected ✓");
-                        println!("  Team: {} ({})", conn.team_name, conn.team_id);
-                        println!("  Bot User ID: {}", conn.bot_user_id);
-                        println!("  Connected: {}", conn.connected_at.format("%Y-%m-%d %H:%M:%S"));
-                        println!("  Connected By: {}", conn.connected_by);
-                        println!();
-                        println!("Scopes:");
-                        for scope in &conn.scopes {
-                            println!("  ✓ {}", scope);
-                        }
-
-                        // Show channel config if exists
-                        if let Ok(Some(config)) = slack_service.get_channel_config(&conn.id).await {
+                    match slack_service.get_active_connection().await {
+                        Ok(conn) => {
+                            println!("Slack Connection Status:");
                             println!();
-                            println!("Channel Configuration:");
-                            println!("  Default: {}", config.default_channel);
-                            if !config.channel_mappings.is_empty() {
-                                println!("  Mappings:");
-                                for (notif_type, channel) in &config.channel_mappings {
-                                    println!("    {} -> {}", notif_type, channel);
+                            println!("  Status: Connected ✓");
+                            println!("  Team: {} ({})", conn.team_name, conn.team_id);
+                            println!("  Bot User ID: {}", conn.bot_user_id);
+                            println!("  Connected: {}", conn.connected_at.format("%Y-%m-%d %H:%M:%S"));
+                            println!("  Connected By: {}", conn.connected_by);
+                            println!();
+                            println!("Scopes:");
+                            for scope in &conn.scopes {
+                                println!("  ✓ {}", scope);
+                            }
+
+                            // Show channel config if exists
+                            if let Ok(config) = slack_service.get_channel_config(&conn.id).await {
+                                println!();
+                                println!("Channel Configuration:");
+                                println!("  Default: {}", config.default_channel);
+                                if !config.channel_mappings.is_empty() {
+                                    println!("  Mappings:");
+                                    for (notif_type, channel) in &config.channel_mappings {
+                                        println!("    {} -> {}", notif_type, channel);
+                                    }
                                 }
                             }
                         }
-                    } else {
-                        println!("No active Slack connection.");
-                        println!("Run 'orchestrate slack connect --token <TOKEN>' to connect.");
+                        Err(_) => {
+                            println!("No active Slack connection.");
+                            println!("Run 'orchestrate slack connect --token <TOKEN>' to connect.");
+                        }
                     }
                 }
                 SlackAction::Channels => {
@@ -6060,8 +6069,8 @@ async fn main() -> Result<()> {
                     println!("  #pr-reviews      - PR and review notifications");
                 }
                 SlackAction::Channel { notification_type, channel } => {
-                    let conn = slack_service.get_active_connection().await?
-                        .ok_or_else(|| anyhow::anyhow!("No active Slack connection. Connect first."))?;
+                    let conn = slack_service.get_active_connection().await
+                        .map_err(|_| anyhow::anyhow!("No active Slack connection. Connect first."))?;
 
                     // Parse notification type
                     let notif_type = match notification_type.as_str() {
@@ -6077,17 +6086,17 @@ async fn main() -> Result<()> {
                     };
 
                     // Get or create channel config
-                    let mut config = slack_service.get_channel_config(&conn.id).await?
-                        .unwrap_or_else(|| ChannelConfig::new("#orchestrate"));
+                    let mut config = slack_service.get_channel_config(&conn.id).await
+                        .unwrap_or_else(|_| ChannelConfig::new("#orchestrate"));
 
                     config.channel_mappings.insert(notif_type.clone(), channel.clone());
-                    slack_service.save_channel_config(&conn.id, &config).await?;
+                    slack_service.update_channel_config(&config).await?;
 
                     println!("Channel mapping updated:");
                     println!("  {} -> {}", notification_type, channel);
                 }
                 SlackAction::Test { channel } => {
-                    let message = SlackMessage::new(&channel, "Test message from Orchestrate")
+                    let _message = SlackMessage::new(&channel, "Test message from Orchestrate")
                         .with_blocks(vec![
                             orchestrate_core::SlackBlock::Section {
                                 text: orchestrate_core::SlackText::mrkdwn("🧪 *Test Message*\n\nThis is a test notification from Orchestrate."),
@@ -6096,36 +6105,22 @@ async fn main() -> Result<()> {
                             },
                         ]);
 
-                    let result = slack_service.send_notification(
-                        NotificationType::Custom("test".to_string()),
-                        message,
-                        None,
-                        None,
-                    ).await?;
-
-                    println!("Test message sent successfully!");
-                    println!("  Channel: {}", result.channel);
-                    println!("  Timestamp: {}", result.ts);
+                    // Slack notification sending not yet implemented
+                    println!("Slack notification feature not yet implemented.");
+                    println!("Would send test message to: {}", channel);
                 }
                 SlackAction::MapUser { github, slack } => {
-                    // Extract username from slack user ID or handle format
+                    // User mapping not yet implemented
                     let slack_username = if slack.starts_with('@') {
                         slack.trim_start_matches('@').to_string()
                     } else {
                         slack.clone()
                     };
 
-                    let mapping = user_service.map_user(&github, &slack, &slack_username).await?;
-
-                    println!("User mapping created:");
-                    println!("  GitHub: {}", mapping.github_username);
-                    println!("  Slack: {} ({})", mapping.slack_username, mapping.slack_user_id);
-                    println!("  ID: {}", mapping.id);
-                    println!();
-                    println!("Notification preferences:");
-                    println!("  On PR: {}", if mapping.notify_on_pr { "✓" } else { "✗" });
-                    println!("  On Mention: {}", if mapping.notify_on_mention { "✓" } else { "✗" });
-                    println!("  On Failure: {}", if mapping.notify_on_failure { "✓" } else { "✗" });
+                    println!("User mapping feature not yet implemented.");
+                    println!("Would map:");
+                    println!("  GitHub: {}", github);
+                    println!("  Slack: {} ({})", slack_username, slack);
                 }
                 SlackAction::Users => {
                     let mappings = user_service.list_user_mappings().await?;

@@ -53,35 +53,35 @@ impl ApiError {
         }
     }
 
-    fn not_found(entity: &str) -> Self {
+    pub fn not_found(entity: &str) -> Self {
         Self {
             error: format!("{} not found", entity),
             code: "not_found".to_string(),
         }
     }
 
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "bad_request".to_string(),
         }
     }
 
-    fn validation(msg: impl Into<String>) -> Self {
+    pub fn validation(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "validation_error".to_string(),
         }
     }
 
-    fn internal(msg: impl Into<String>) -> Self {
+    pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "internal_error".to_string(),
         }
     }
 
-    fn conflict(msg: impl Into<String>) -> Self {
+    pub fn conflict(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "conflict".to_string(),
@@ -233,12 +233,8 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    // Public routes (no auth required)
-    let public_routes = Router::new().route("/api/health", get(health_check));
-
     Router::new()
         .merge(protected_routes)
-        .merge(public_routes)
         .with_state(state)
 }
 
@@ -251,12 +247,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 pub fn create_router_with_webhook(state: Arc<AppState>, webhook_secret: Option<String>) -> Router {
     let api_router = create_api_router(state.clone());
     let ui_router = crate::ui::create_ui_router().with_state(state.clone());
+    let monitoring_router = crate::monitoring::create_monitoring_router().with_state(state.clone());
 
     // Create WebSocket state with the same database
     let ws_state = Arc::new(crate::websocket::WsState::new(state.db.clone()));
 
     let mut router = Router::new()
         .merge(api_router)
+        .merge(monitoring_router)
         .merge(ui_router)
         .route(
             "/ws",

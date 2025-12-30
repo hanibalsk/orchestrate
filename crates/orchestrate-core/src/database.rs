@@ -6331,3 +6331,595 @@ impl TryFrom<AnomalyMetricRow> for crate::incident::AnomalyMetric {
         })
     }
 }
+
+// ==================== Monitoring & Metrics Database Methods ====================
+
+/// Agent count by state and type
+#[derive(Debug, Clone, Default)]
+pub struct AgentCountsByStateAndType {
+    pub by_state: std::collections::HashMap<String, i64>,
+    pub by_type: std::collections::HashMap<String, i64>,
+}
+
+/// Token usage by model
+#[derive(Debug, Clone)]
+pub struct TokenUsageByModel {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// PR cycle time stats
+#[derive(Debug, Clone)]
+pub struct PrCycleTime {
+    pub pr_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub cycle_time_hours: Option<f64>,
+}
+
+/// Story completion rate
+#[derive(Debug, Clone)]
+pub struct StoryCompletionRate {
+    pub epic_id: String,
+    pub total_stories: i64,
+    pub completed_stories: i64,
+    pub completion_rate: f64,
+}
+
+/// Agent success rate
+#[derive(Debug, Clone)]
+pub struct AgentSuccessRate {
+    pub agent_type: String,
+    pub total_runs: i64,
+    pub successful_runs: i64,
+    pub success_rate: f64,
+}
+
+impl Database {
+    // ==================== Agent Metrics ====================
+
+    /// Get agent counts grouped by state and type
+    pub async fn get_agent_counts_by_state_and_type(&self) -> Result<AgentCountsByStateAndType> {
+        let mut result = AgentCountsByStateAndType::default();
+
+        // Count by state
+        let state_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT state, COUNT(*) as count FROM agents GROUP BY state"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (state, count) in state_rows {
+            result.by_state.insert(state, count);
+        }
+
+        // Count by type
+        let type_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT agent_type, COUNT(*) as count FROM agents GROUP BY agent_type"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (agent_type, count) in type_rows {
+            result.by_type.insert(agent_type, count);
+        }
+
+        Ok(result)
+    }
+
+    /// Get agent success rates
+    pub async fn get_agent_success_rates(&self) -> Result<Vec<AgentSuccessRate>> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT
+                agent_type,
+                COUNT(*) as total_runs,
+                SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END) as successful_runs
+            FROM agents
+            GROUP BY agent_type
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(agent_type, total_runs, successful_runs)| {
+            AgentSuccessRate {
+                agent_type,
+                total_runs,
+                successful_runs,
+                success_rate: if total_runs > 0 { successful_runs as f64 / total_runs as f64 } else { 0.0 },
+            }
+        }).collect())
+    }
+
+    // ==================== Token Usage ====================
+
+    /// Get token usage grouped by model
+    pub async fn get_token_usage_by_model(&self) -> Result<Vec<TokenUsageByModel>> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT
+                model,
+                SUM(input_tokens) as input_tokens,
+                SUM(output_tokens) as output_tokens
+            FROM daily_token_usage
+            GROUP BY model
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(model, input_tokens, output_tokens)| {
+            TokenUsageByModel {
+                model,
+                input_tokens,
+                output_tokens,
+                total_tokens: input_tokens + output_tokens,
+            }
+        }).collect())
+    }
+
+    // ==================== Webhook Metrics ====================
+
+    /// Get count of pending webhook events
+    pub async fn get_pending_webhook_events_count(&self) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'pending'"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
+
+    // ==================== PR Metrics ====================
+
+    /// Get PR cycle times
+    pub async fn get_pr_cycle_times(&self) -> Result<Vec<PrCycleTime>> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, created_at, merged_at
+            FROM pull_requests
+            ORDER BY created_at DESC
+            LIMIT 100
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut result = Vec::new();
+        for (pr_id, created_at_str, merged_at_str) in rows {
+            let created_at: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into();
+
+            let merged_at: Option<chrono::DateTime<chrono::Utc>> = if let Some(m) = merged_at_str {
+                Some(chrono::DateTime::parse_from_rfc3339(&m)
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .into())
+            } else {
+                None
+            };
+
+            let cycle_time_hours = merged_at.map(|m| {
+                (m - created_at).num_hours() as f64
+            });
+
+            result.push(PrCycleTime {
+                pr_id,
+                created_at,
+                merged_at,
+                cycle_time_hours,
+            });
+        }
+
+        Ok(result)
+    }
+
+    // ==================== Story Metrics ====================
+
+    /// Get story completion rates by epic
+    pub async fn get_story_completion_rates(&self) -> Result<Vec<StoryCompletionRate>> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT
+                epic_id,
+                COUNT(*) as total_stories,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_stories
+            FROM stories
+            GROUP BY epic_id
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|(epic_id, total_stories, completed_stories)| {
+            StoryCompletionRate {
+                epic_id,
+                total_stories,
+                completed_stories,
+                completion_rate: if total_stories > 0 { completed_stories as f64 / total_stories as f64 } else { 0.0 },
+            }
+        }).collect())
+    }
+
+    // ==================== Alerting ====================
+
+    /// Create a new alert rule
+    pub async fn create_alert_rule(&self, rule: &crate::monitoring::AlertRule) -> Result<i64> {
+        let id = sqlx::query_scalar(
+            r#"
+            INSERT INTO alert_rules (name, condition, severity, channels, enabled, evaluation_interval_seconds, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            RETURNING id
+            "#
+        )
+        .bind(&rule.name)
+        .bind(&rule.condition)
+        .bind(format!("{:?}", rule.severity).to_lowercase())
+        .bind(serde_json::to_string(&rule.channels).unwrap_or_default())
+        .bind(rule.enabled)
+        .bind(60i64)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Get an alert by ID
+    pub async fn get_alert(&self, id: i64) -> Result<Option<crate::monitoring::Alert>> {
+        let row: Option<AlertRowSimple> = sqlx::query_as(
+            r#"
+            SELECT a.id, a.rule_id, r.name as rule_name, a.status, r.severity,
+                   a.triggered_at, a.acknowledged_at, a.acknowledged_by, a.resolved_at
+            FROM alerts a
+            JOIN alert_rules r ON a.rule_id = r.id
+            WHERE a.id = ?
+            "#
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(r.try_into()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Update an alert
+    pub async fn update_alert(&self, alert: &crate::monitoring::Alert) -> Result<()> {
+        let id: i64 = alert.id.parse().map_err(|_| crate::Error::Other("Invalid alert ID".into()))?;
+
+        sqlx::query(
+            r#"
+            UPDATE alerts
+            SET status = ?, acknowledged_at = ?, acknowledged_by = ?, resolved_at = ?
+            WHERE id = ?
+            "#
+        )
+        .bind(format!("{:?}", alert.status).to_lowercase())
+        .bind(alert.acknowledged_at.map(|dt| dt.to_rfc3339()))
+        .bind(&alert.acknowledged_by)
+        .bind(alert.resolved_at.map(|dt| dt.to_rfc3339()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// List alerts by status
+    pub async fn list_alerts_by_status(
+        &self,
+        status: Option<&str>,
+        severity: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::monitoring::Alert>> {
+        let mut query = String::from(
+            r#"
+            SELECT a.id, a.rule_id, r.name as rule_name, a.status, r.severity,
+                   a.triggered_at, a.acknowledged_at, a.acknowledged_by, a.resolved_at
+            FROM alerts a
+            JOIN alert_rules r ON a.rule_id = r.id
+            WHERE 1=1
+            "#
+        );
+
+        if status.is_some() {
+            query.push_str(" AND a.status = ?");
+        }
+        if severity.is_some() {
+            query.push_str(" AND r.severity = ?");
+        }
+        query.push_str(" ORDER BY a.triggered_at DESC LIMIT ? OFFSET ?");
+
+        let mut q = sqlx::query_as::<_, AlertRowSimple>(&query);
+
+        if let Some(s) = status {
+            q = q.bind(s);
+        }
+        if let Some(sev) = severity {
+            q = q.bind(sev);
+        }
+        q = q.bind(limit).bind(offset);
+
+        let rows: Vec<AlertRowSimple> = q.fetch_all(&self.pool).await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // ==================== Audit Log ====================
+
+    /// Insert an audit entry
+    pub async fn insert_audit_entry(&self, entry: &crate::monitoring::AuditEntry) -> Result<i64> {
+        let details_json = if entry.details.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&entry.details).ok()
+        };
+
+        let id = sqlx::query_scalar(
+            r#"
+            INSERT INTO audit_log (actor, actor_type, action, resource_type, resource_id, details, success, error_message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+            "#
+        )
+        .bind(&entry.actor)
+        .bind(format!("{:?}", entry.actor_type).to_lowercase())
+        .bind(format!("{:?}", entry.action).to_lowercase())
+        .bind(&entry.resource_type)
+        .bind(&entry.resource_id)
+        .bind(details_json)
+        .bind(entry.success)
+        .bind(&entry.error_message)
+        .bind(entry.timestamp.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Query audit log (stub - returns empty list)
+    pub async fn query_audit_log(&self, _query: &crate::audit::AuditQuery) -> Result<Vec<crate::monitoring::AuditEntry>> {
+        // Audit log feature not fully implemented - return empty list
+        Ok(Vec::new())
+    }
+
+    /// Get audit stats (stub)
+    pub async fn get_audit_stats(&self) -> Result<crate::audit::AuditStats> {
+        // Audit log feature not fully implemented - return empty stats
+        Ok(crate::audit::AuditStats {
+            total_entries: 0,
+            entries_by_action: std::collections::HashMap::new(),
+            entries_by_actor_type: std::collections::HashMap::new(),
+            success_count: 0,
+            failure_count: 0,
+            first_entry_at: None,
+            last_entry_at: None,
+        })
+    }
+
+    /// Count audit entries (stub)
+    pub async fn count_audit_entries(&self, _query: &crate::audit::AuditQuery) -> Result<i64> {
+        // Audit log feature not fully implemented
+        Ok(0)
+    }
+
+    /// Export audit log entries in various formats
+    pub async fn export_audit_log(
+        &self,
+        query: &crate::audit::AuditQuery,
+        format: crate::audit::ExportFormat,
+    ) -> Result<String> {
+        let entries = self.query_audit_log(query).await?;
+
+        match format {
+            crate::audit::ExportFormat::Json => {
+                serde_json::to_string_pretty(&entries)
+                    .map_err(|e| crate::Error::Other(e.to_string()))
+            }
+            crate::audit::ExportFormat::JsonLines => {
+                let lines: Vec<String> = entries
+                    .iter()
+                    .filter_map(|e| serde_json::to_string(e).ok())
+                    .collect();
+                Ok(lines.join("\n"))
+            }
+            crate::audit::ExportFormat::Csv => {
+                let mut csv = String::from("id,timestamp,actor,actor_type,action,resource_type,resource_id,success,error_message\n");
+                for entry in entries {
+                    let action_str = format!("{:?}", entry.action).to_lowercase().replace("_", ".");
+                    csv.push_str(&format!(
+                        "{},{},{},{:?},{},{},{},{},{}\n",
+                        entry.id,
+                        entry.timestamp.to_rfc3339(),
+                        entry.actor,
+                        entry.actor_type,
+                        action_str,
+                        entry.resource_type,
+                        entry.resource_id,
+                        entry.success,
+                        entry.error_message.as_deref().unwrap_or("")
+                    ));
+                }
+                Ok(csv)
+            }
+        }
+    }
+
+    /// Apply retention policy to audit logs
+    pub async fn apply_retention_policy(
+        &self,
+        policy: &crate::audit::RetentionPolicy,
+    ) -> Result<i64> {
+        let cutoff = policy.cutoff_date().to_rfc3339();
+
+        let result = sqlx::query("DELETE FROM audit_log WHERE created_at < ?")
+            .bind(&cutoff)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    // ==================== Repository Methods (Stubs) ====================
+
+    /// Insert a repository (stub)
+    pub async fn insert_repository(&self, _repo: &crate::multi_repo::Repository) -> Result<i64> {
+        Err(crate::Error::Other("Repository operations not yet implemented".to_string()))
+    }
+
+    /// List repositories (stub)
+    pub async fn list_repositories(&self) -> Result<Vec<crate::multi_repo::Repository>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete a repository (stub)
+    pub async fn delete_repository(&self, _id: &str) -> Result<()> {
+        Err(crate::Error::Other("Repository operations not yet implemented".to_string()))
+    }
+
+    /// Get repository by name (stub)
+    pub async fn get_repository_by_name(&self, _name: &str) -> Result<Option<crate::multi_repo::Repository>> {
+        Ok(None)
+    }
+
+    /// Update a repository (stub)
+    pub async fn update_repository(&self, _repo: &crate::multi_repo::Repository) -> Result<()> {
+        Err(crate::Error::Other("Repository operations not yet implemented".to_string()))
+    }
+
+    /// Get dependency graph (stub)
+    pub async fn get_dependency_graph(&self) -> Result<crate::multi_repo::RepoDependencyGraph> {
+        Ok(crate::multi_repo::RepoDependencyGraph::new())
+    }
+}
+
+// Helper structs for database rows
+
+#[derive(sqlx::FromRow)]
+struct AlertRowSimple {
+    id: i64,
+    rule_id: i64,
+    rule_name: String,
+    status: String,
+    severity: String,
+    triggered_at: String,
+    acknowledged_at: Option<String>,
+    acknowledged_by: Option<String>,
+    resolved_at: Option<String>,
+}
+
+impl TryFrom<AlertRowSimple> for crate::monitoring::Alert {
+    type Error = crate::Error;
+
+    fn try_from(row: AlertRowSimple) -> Result<Self> {
+        let status = match row.status.as_str() {
+            "pending" => crate::monitoring::AlertStatus::Pending,
+            "firing" => crate::monitoring::AlertStatus::Firing,
+            "acknowledged" => crate::monitoring::AlertStatus::Acknowledged,
+            "resolved" => crate::monitoring::AlertStatus::Resolved,
+            "silenced" => crate::monitoring::AlertStatus::Silenced,
+            _ => crate::monitoring::AlertStatus::Pending,
+        };
+
+        let severity = match row.severity.as_str() {
+            "info" => crate::monitoring::AlertSeverity::Info,
+            "warning" => crate::monitoring::AlertSeverity::Warning,
+            "critical" => crate::monitoring::AlertSeverity::Critical,
+            _ => crate::monitoring::AlertSeverity::Info,
+        };
+
+        Ok(crate::monitoring::Alert {
+            id: row.id.to_string(),
+            rule_id: row.rule_id.to_string(),
+            rule_name: row.rule_name,
+            status,
+            severity,
+            message: String::new(),
+            current_value: None,
+            threshold: None,
+            labels: std::collections::HashMap::new(),
+            triggered_at: chrono::DateTime::parse_from_rfc3339(&row.triggered_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            acknowledged_at: row.acknowledged_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.into()),
+            acknowledged_by: row.acknowledged_by,
+            resolved_at: row.resolved_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.into()),
+            silenced_until: None,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AuditEntryRow {
+    id: i64,
+    actor: String,
+    actor_type: String,
+    action: String,
+    resource_type: Option<String>,
+    resource_id: Option<String>,
+    details: Option<String>,
+    success: bool,
+    error_message: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<AuditEntryRow> for crate::monitoring::AuditEntry {
+    type Error = crate::Error;
+
+    fn try_from(row: AuditEntryRow) -> Result<Self> {
+        let actor_type = match row.actor_type.as_str() {
+            "user" => crate::monitoring::ActorType::User,
+            "system" => crate::monitoring::ActorType::System,
+            "agent" => crate::monitoring::ActorType::Agent,
+            "api_key" | "apikey" => crate::monitoring::ActorType::ApiKey,
+            "webhook" => crate::monitoring::ActorType::Webhook,
+            _ => crate::monitoring::ActorType::System,
+        };
+
+        let action = match row.action.as_str() {
+            "agent_spawned" | "agentspawned" => crate::monitoring::AuditAction::AgentSpawned,
+            "agent_terminated" | "agentterminated" => crate::monitoring::AuditAction::AgentTerminated,
+            "configuration_changed" | "configurationchanged" => crate::monitoring::AuditAction::ConfigurationChanged,
+            "approval_granted" | "approvalgranted" => crate::monitoring::AuditAction::ApprovalGranted,
+            "approval_denied" | "approvaldenied" => crate::monitoring::AuditAction::ApprovalDenied,
+            "deployment_triggered" | "deploymenttriggered" => crate::monitoring::AuditAction::DeploymentTriggered,
+            "deployment_rolled_back" | "deploymentrolledback" => crate::monitoring::AuditAction::DeploymentRolledBack,
+            "alert_acknowledged" | "alertacknowledged" => crate::monitoring::AuditAction::AlertAcknowledged,
+            "alert_silenced" | "alertsilenced" => crate::monitoring::AuditAction::AlertSilenced,
+            "user_login" | "userlogin" => crate::monitoring::AuditAction::UserLogin,
+            _ => crate::monitoring::AuditAction::ConfigurationChanged,
+        };
+
+        let details: std::collections::HashMap<String, serde_json::Value> = row.details
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        Ok(crate::monitoring::AuditEntry {
+            id: row.id.to_string(),
+            actor: row.actor,
+            actor_type,
+            action,
+            resource_type: row.resource_type.unwrap_or_default(),
+            resource_id: row.resource_id.unwrap_or_default(),
+            details,
+            success: row.success,
+            error_message: row.error_message,
+            timestamp: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            ip_address: None,
+            user_agent: None,
+        })
+    }
+}

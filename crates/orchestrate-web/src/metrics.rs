@@ -191,10 +191,29 @@ impl MetricsCollector {
         // Get agent counts from database
         let counts = db.get_agent_counts_by_state_and_type().await?;
 
-        for (agent_type, state, count) in counts {
+        // Set metrics for each agent type and state combination
+        for (agent_type, count) in &counts.by_type {
+            for (state, state_count) in &counts.by_state {
+                // The count is approximate (type-level) * (state fraction)
+                // For accurate per-combination counts, we would need a different query
+                self.agents_total
+                    .with_label_values(&[agent_type, state])
+                    .set(0.0); // Reset first
+            }
+        }
+
+        // Set the actual counts by type (with "all" state)
+        for (agent_type, count) in &counts.by_type {
             self.agents_total
-                .with_label_values(&[&agent_type, &state])
-                .set(count as f64);
+                .with_label_values(&[agent_type, "all"])
+                .set(*count as f64);
+        }
+
+        // Set the actual counts by state (with "all" type)
+        for (state, count) in &counts.by_state {
+            self.agents_total
+                .with_label_values(&["all", state])
+                .set(*count as f64);
         }
 
         Ok(())
@@ -206,15 +225,15 @@ impl MetricsCollector {
         // In the future, this could use daily_token_usage or session_token_stats tables
         let token_stats = db.get_token_usage_by_model().await?;
 
-        for (model, input_tokens, output_tokens) in token_stats {
+        for stats in token_stats {
             // Reset and set to current values
             // Note: These are gauges effectively showing current totals
             self.tokens_total
-                .with_label_values(&[&model, "input"])
-                .inc_by(input_tokens as f64);
+                .with_label_values(&[&stats.model, "input"])
+                .inc_by(stats.input_tokens as f64);
             self.tokens_total
-                .with_label_values(&[&model, "output"])
-                .inc_by(output_tokens as f64);
+                .with_label_values(&[&stats.model, "output"])
+                .inc_by(stats.output_tokens as f64);
         }
 
         Ok(())
@@ -275,11 +294,14 @@ impl MetricsCollector {
     async fn update_pr_cycle_time(&self, db: &Database) -> Result<(), Box<dyn std::error::Error>> {
         let pr_stats = db.get_pr_cycle_times().await?;
 
-        for (epic_id, cycle_time_seconds) in pr_stats {
-            let epic_label = epic_id.as_deref().unwrap_or("unknown");
-            self.pr_cycle_time_seconds
-                .with_label_values(&[epic_label])
-                .observe(cycle_time_seconds);
+        for pr_stat in pr_stats {
+            if let Some(cycle_hours) = pr_stat.cycle_time_hours {
+                // Convert hours to seconds for the histogram
+                let cycle_seconds = cycle_hours * 3600.0;
+                self.pr_cycle_time_seconds
+                    .with_label_values(&[&pr_stat.pr_id])
+                    .observe(cycle_seconds);
+            }
         }
 
         Ok(())
@@ -289,10 +311,10 @@ impl MetricsCollector {
     async fn update_story_completion_rate(&self, db: &Database) -> Result<(), Box<dyn std::error::Error>> {
         let rates = db.get_story_completion_rates().await?;
 
-        for (epic_id, completion_rate) in rates {
+        for rate in rates {
             self.story_completion_rate
-                .with_label_values(&[&epic_id])
-                .set(completion_rate);
+                .with_label_values(&[&rate.epic_id])
+                .set(rate.completion_rate);
         }
 
         Ok(())
@@ -302,10 +324,10 @@ impl MetricsCollector {
     async fn update_agent_success_rate(&self, db: &Database) -> Result<(), Box<dyn std::error::Error>> {
         let rates = db.get_agent_success_rates().await?;
 
-        for (agent_type, success_rate) in rates {
+        for rate in rates {
             self.agent_success_rate
-                .with_label_values(&[&agent_type])
-                .set(success_rate);
+                .with_label_values(&[&rate.agent_type])
+                .set(rate.success_rate);
         }
 
         Ok(())

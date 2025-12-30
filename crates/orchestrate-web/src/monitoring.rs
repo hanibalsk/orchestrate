@@ -231,17 +231,11 @@ pub struct CostReportResponse {
 
 /// GET /api/metrics - Current metrics snapshot
 async fn get_metrics_snapshot(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
 ) -> Result<Json<MetricsSnapshotResponse>, ApiError> {
-    // Gather Prometheus metrics
-    let prometheus_text = state
-        .metrics
-        .gather(&state.db)
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to gather metrics: {}", e)))?;
-
-    // Parse metrics into structured format
-    let metrics = parse_prometheus_metrics(&prometheus_text);
+    // TODO: Integrate MetricsCollector into AppState to enable full metrics gathering
+    // For now, return empty metrics
+    let metrics = Vec::new();
 
     // Get metrics summary from database (using default for now)
     let summary = MetricsSummary::default();
@@ -292,20 +286,17 @@ async fn list_alerts(
     }
 
     // Get alerts from database (using existing list_alerts_by_status)
-    let alerts = if let Some(status) = status_filter {
-        state
-            .db
-            .list_alerts_by_status(status)
-            .await
-            .map_err(|e| ApiError::internal(format!("Failed to list alerts: {}", e)))?
-    } else {
-        // Get all active alerts by default
-        state
-            .db
-            .list_alerts_by_status(AlertStatus::Active)
-            .await
-            .map_err(|e| ApiError::internal(format!("Failed to list alerts: {}", e)))?
-    };
+    let status_str = status_filter.map(|s| format!("{:?}", s).to_lowercase());
+    let alerts = state
+        .db
+        .list_alerts_by_status(
+            status_str.as_deref(),
+            query.severity.as_deref(),
+            query.limit,
+            query.offset,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to list alerts: {}", e)))?;
 
     let total = alerts.len() as i64;
     let offset = query.offset as usize;
@@ -387,10 +378,10 @@ async fn get_system_health(
         }
     }
 
-    // Get active alerts count
+    // Get active alerts count (firing alerts)
     let active_alerts = state
         .db
-        .list_alerts_by_status(AlertStatus::Active)
+        .list_alerts_by_status(Some("firing"), None, 100, 0)
         .await
         .unwrap_or_default();
     health.active_alerts = active_alerts.len() as u32;
@@ -409,19 +400,21 @@ async fn create_alert_rule(
     // Parse severity
     let severity = parse_alert_severity(&req.severity)?;
 
-    // Create alert rule
-    let mut rule = AlertRule::new(req.name.clone(), req.condition.clone(), severity, req.channels);
-    rule.evaluation_interval_seconds = req.evaluation_interval_seconds;
+    // Create alert rule using builder pattern
+    let mut rule = AlertRule::new(req.name.clone(), req.condition.clone(), severity);
+    for channel in &req.channels {
+        rule = rule.with_channel(channel);
+    }
     rule.enabled = req.enabled;
 
-    // Insert into database (using create_alert_rule which returns the rule with ID)
-    let created_rule = state
+    // Insert into database (using create_alert_rule which returns the rule ID)
+    let rule_id = state
         .db
-        .create_alert_rule(rule)
+        .create_alert_rule(&rule)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to create alert rule: {}", e)))?;
 
-    let id = created_rule.id.unwrap_or(0);
+    let id = rule_id;
 
     // Create audit log entry
     let audit_entry = AuditEntry::new(
@@ -436,7 +429,7 @@ async fn create_alert_rule(
 
     Ok(Json(CreateAlertRuleResponse {
         id,
-        rule: created_rule,
+        rule,
     }))
 }
 
@@ -610,9 +603,11 @@ fn parse_metric_name_and_labels(metric_part: &str) -> (String, HashMap<String, S
 /// Helper function to parse alert status from string
 fn parse_alert_status(status: &str) -> Result<AlertStatus, ApiError> {
     match status.to_lowercase().as_str() {
-        "active" => Ok(AlertStatus::Active),
+        "pending" => Ok(AlertStatus::Pending),
+        "active" | "firing" => Ok(AlertStatus::Firing),
         "acknowledged" => Ok(AlertStatus::Acknowledged),
         "resolved" => Ok(AlertStatus::Resolved),
+        "silenced" => Ok(AlertStatus::Silenced),
         _ => Err(ApiError::validation(format!(
             "Invalid alert status: {}",
             status

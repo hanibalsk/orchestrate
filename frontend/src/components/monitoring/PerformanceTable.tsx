@@ -15,6 +15,9 @@ export function PerformanceTable({ stats }: PerformanceTableProps) {
   const [sortField, setSortField] = useState<SortField>('total_executions');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
 
+  // Handle undefined/null stats with default empty array
+  const safeStats = stats ?? [];
+
   const handleSort = (field: SortField) => {
     if (sortField === field) {
       setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
@@ -24,7 +27,7 @@ export function PerformanceTable({ stats }: PerformanceTableProps) {
     }
   };
 
-  const sortedStats = [...stats].sort((a, b) => {
+  const sortedStats = [...safeStats].sort((a, b) => {
     const aValue = a[sortField];
     const bValue = b[sortField];
 
@@ -48,7 +51,7 @@ export function PerformanceTable({ stats }: PerformanceTableProps) {
     );
   };
 
-  if (stats.length === 0) {
+  if (safeStats.length === 0) {
     return (
       <Card>
         <CardHeader>
