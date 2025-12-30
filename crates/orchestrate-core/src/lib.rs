@@ -68,6 +68,9 @@ pub mod webhook;
 pub mod webhook_config;
 pub mod worktree;
 pub mod test_stubs;
+pub mod stuck_detection;
+#[cfg(test)]
+mod database_stuck_detection_tests;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
@@ -296,4 +299,10 @@ pub use context_summary::{
     Blocker, BlockerSeverity, BlockerType, ContextSummary, DecisionCategory, FileChange,
     FileChangeType, KeyDecision, OutputSummarizer, TestAdded, TestType as SummaryTestType,
     WorkStatus,
+};
+
+// Re-export stuck detection types (Epic 016)
+pub use stuck_detection::{
+    AgentProgress, EvaluationStatus, EvaluationType, RateLimitBackoff, StuckDetection,
+    StuckDetectionConfig, StuckDetector, StuckSeverity, StuckType, WorkEvaluation,
 };

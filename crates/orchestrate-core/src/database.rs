@@ -181,6 +181,12 @@ impl Database {
         ))
         .execute(&self.pool)
         .await?;
+        // Work evaluations and stuck detection migration (Epic 016 - Story 6)
+        sqlx::query(include_str!(
+            "../../../migrations/022_work_evaluations.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -7304,6 +7310,84 @@ impl AgentContinuationRow {
     }
 }
 
+// ==================== Work Evaluation Row (Epic 016 - Story 6) ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct WorkEvaluationRow {
+    id: i64,
+    agent_id: String,
+    session_id: Option<String>,
+    story_id: Option<String>,
+    evaluation_type: String,
+    status: String,
+    details: String,
+    turn_count: Option<i64>,
+    max_turns: Option<i64>,
+    token_count: Option<i64>,
+    max_tokens: Option<i64>,
+    duration_secs: Option<i64>,
+    created_at: String,
+}
+
+impl WorkEvaluationRow {
+    fn into_evaluation(self) -> Result<crate::stuck_detection::WorkEvaluation> {
+        use crate::stuck_detection::{EvaluationStatus, EvaluationType};
+        use std::str::FromStr;
+
+        Ok(crate::stuck_detection::WorkEvaluation {
+            id: self.id,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            story_id: self.story_id,
+            evaluation_type: EvaluationType::from_str(&self.evaluation_type)?,
+            status: EvaluationStatus::from_str(&self.status)?,
+            details: serde_json::from_str(&self.details)?,
+            turn_count: self.turn_count.map(|v| v as u32),
+            max_turns: self.max_turns.map(|v| v as u32),
+            token_count: self.token_count.map(|v| v as u64),
+            max_tokens: self.max_tokens.map(|v| v as u64),
+            duration_secs: self.duration_secs.map(|v| v as u64),
+            created_at: parse_datetime(&self.created_at)?,
+        })
+    }
+}
+
+// ==================== Stuck Detection Row (Epic 016 - Story 6) ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct StuckDetectionRow {
+    id: i64,
+    agent_id: String,
+    session_id: Option<String>,
+    detection_type: String,
+    severity: String,
+    details: String,
+    resolved: bool,
+    resolution_action: Option<String>,
+    detected_at: String,
+    resolved_at: Option<String>,
+}
+
+impl StuckDetectionRow {
+    fn into_detection(self) -> Result<crate::stuck_detection::StuckDetection> {
+        use crate::stuck_detection::{StuckSeverity, StuckType};
+        use std::str::FromStr;
+
+        Ok(crate::stuck_detection::StuckDetection {
+            id: self.id,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            detection_type: StuckType::from_str(&self.detection_type)?,
+            severity: StuckSeverity::from_str(&self.severity)?,
+            details: serde_json::from_str(&self.details)?,
+            resolved: self.resolved,
+            resolution_action: self.resolution_action,
+            detected_at: parse_datetime(&self.detected_at)?,
+            resolved_at: self.resolved_at.map(|s| parse_datetime(&s)).transpose()?,
+        })
+    }
+}
+
 impl Database {
     // ==================== Agent Continuation Operations ====================
 
@@ -7478,6 +7562,233 @@ impl Database {
     ) -> Result<std::collections::HashMap<String, i64>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT status, COUNT(*) as count FROM agent_continuations GROUP BY status",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().collect())
+    }
+
+    // ==================== Work Evaluation Operations (Epic 016 - Story 6) ====================
+
+    /// Create a new work evaluation
+    pub async fn create_work_evaluation(
+        &self,
+        eval: &crate::stuck_detection::WorkEvaluation,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO work_evaluations
+                (agent_id, session_id, story_id, evaluation_type, status, details,
+                 turn_count, max_turns, token_count, max_tokens, duration_secs, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&eval.agent_id)
+        .bind(&eval.session_id)
+        .bind(&eval.story_id)
+        .bind(eval.evaluation_type.as_str())
+        .bind(eval.status.as_str())
+        .bind(serde_json::to_string(&eval.details)?)
+        .bind(eval.turn_count.map(|v| v as i64))
+        .bind(eval.max_turns.map(|v| v as i64))
+        .bind(eval.token_count.map(|v| v as i64))
+        .bind(eval.max_tokens.map(|v| v as i64))
+        .bind(eval.duration_secs.map(|v| v as i64))
+        .bind(eval.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get work evaluation by ID
+    pub async fn get_work_evaluation(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::stuck_detection::WorkEvaluation>> {
+        let row = sqlx::query_as::<_, WorkEvaluationRow>(
+            "SELECT * FROM work_evaluations WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_evaluation()).transpose()
+    }
+
+    /// Get work evaluations for an agent
+    pub async fn get_work_evaluations_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::stuck_detection::WorkEvaluation>> {
+        let rows = sqlx::query_as::<_, WorkEvaluationRow>(
+            r#"
+            SELECT * FROM work_evaluations
+            WHERE agent_id = ?
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_evaluation()).collect()
+    }
+
+    /// Get latest evaluation for an agent
+    pub async fn get_latest_evaluation(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<crate::stuck_detection::WorkEvaluation>> {
+        let row = sqlx::query_as::<_, WorkEvaluationRow>(
+            r#"
+            SELECT * FROM work_evaluations
+            WHERE agent_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_evaluation()).transpose()
+    }
+
+    // ==================== Stuck Detection Operations (Epic 016 - Story 6) ====================
+
+    /// Create a new stuck detection
+    pub async fn create_stuck_detection(
+        &self,
+        detection: &crate::stuck_detection::StuckDetection,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO stuck_agent_detections
+                (agent_id, session_id, detection_type, severity, details,
+                 resolved, resolution_action, detected_at, resolved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&detection.agent_id)
+        .bind(&detection.session_id)
+        .bind(detection.detection_type.as_str())
+        .bind(detection.severity.as_str())
+        .bind(serde_json::to_string(&detection.details)?)
+        .bind(detection.resolved)
+        .bind(&detection.resolution_action)
+        .bind(detection.detected_at.to_rfc3339())
+        .bind(detection.resolved_at.map(|dt| dt.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get stuck detection by ID
+    pub async fn get_stuck_detection(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::stuck_detection::StuckDetection>> {
+        let row = sqlx::query_as::<_, StuckDetectionRow>(
+            "SELECT * FROM stuck_agent_detections WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_detection()).transpose()
+    }
+
+    /// Update a stuck detection (for resolution)
+    pub async fn update_stuck_detection(
+        &self,
+        detection: &crate::stuck_detection::StuckDetection,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE stuck_agent_detections
+            SET resolved = ?, resolution_action = ?, resolved_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(detection.resolved)
+        .bind(&detection.resolution_action)
+        .bind(detection.resolved_at.map(|dt| dt.to_rfc3339()))
+        .bind(detection.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get unresolved stuck detections for an agent
+    pub async fn get_unresolved_stuck_detections(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::stuck_detection::StuckDetection>> {
+        let rows = sqlx::query_as::<_, StuckDetectionRow>(
+            r#"
+            SELECT * FROM stuck_agent_detections
+            WHERE agent_id = ? AND resolved = FALSE
+            ORDER BY detected_at DESC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_detection()).collect()
+    }
+
+    /// Get all stuck detections for an agent
+    pub async fn get_stuck_detections_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::stuck_detection::StuckDetection>> {
+        let rows = sqlx::query_as::<_, StuckDetectionRow>(
+            r#"
+            SELECT * FROM stuck_agent_detections
+            WHERE agent_id = ?
+            ORDER BY detected_at DESC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_detection()).collect()
+    }
+
+    /// Get all unresolved stuck detections (for monitoring)
+    pub async fn get_all_unresolved_stuck_detections(
+        &self,
+    ) -> Result<Vec<crate::stuck_detection::StuckDetection>> {
+        let rows = sqlx::query_as::<_, StuckDetectionRow>(
+            r#"
+            SELECT * FROM stuck_agent_detections
+            WHERE resolved = FALSE
+            ORDER BY severity DESC, detected_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_detection()).collect()
+    }
+
+    /// Count stuck detections by type
+    pub async fn count_stuck_detections_by_type(
+        &self,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT detection_type, COUNT(*) as count
+            FROM stuck_agent_detections
+            WHERE resolved = FALSE
+            GROUP BY detection_type
+            "#,
         )
         .fetch_all(&self.pool)
         .await?;
