@@ -20,9 +20,8 @@ mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
 #[cfg(test)]
-mod database_slack_tests;
+mod database_learning_tests;
 pub mod documentation;
-pub mod doc_generator;
 pub mod epic;
 pub mod requirements;
 pub mod multi_repo;
@@ -32,9 +31,6 @@ pub mod test_generation;
 pub mod deployment;
 pub mod monitoring;
 pub mod slack;
-pub mod slack_interactions;
-pub mod slack_service;
-pub mod slack_user_service;
 pub mod security;
 pub mod security_fix_agent;
 pub mod security_report;
@@ -66,7 +62,7 @@ pub mod worktree;
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
     AgentStats, DailyTokenUsage, Database, EffectivenessAnalysisRow, EffectivenessSummary,
-    SlackCommandAudit, TokenStats,
+    TokenStats,
 };
 pub use epic::{BmadPhase, Epic, EpicStatus, Story, StoryStatus};
 pub use error::{Error, Result};
@@ -162,7 +158,7 @@ pub use pattern_export::{
 pub use learning_automation::{
     predict_task_outcome, ActionType, AreaForImprovement, AutomationAction, AutomationResults,
     AutomationRun, AutomationRunStatus, AutomationTrigger, DurationEstimate, Improvement,
-    ImprovementCategory, LearningAutomationConfig, LearningReport, ReportSummary, RiskFactor,
+    ImprovementCategory, LearningAutomationConfig, LearningAutomationEngine, LearningReport, ReportSummary, RiskFactor,
     RiskSeverity, TaskPrediction, TokenEstimate,
 };
 
@@ -172,12 +168,6 @@ pub use documentation::{
     ApiParameter, ApiServer, Changelog, ChangelogEntry, ChangelogRelease, ChangeType, DocItemType,
     DocIssueType, DocType, DocValidationIssue, DocValidationResult, ParameterLocation, PropertyInfo,
     ReadmeContent, ReadmeSection, ReadmeSectionContent, SchemaInfo,
-};
-
-// Re-export doc_generator functions
-pub use doc_generator::{
-    generate_readme_content, parse_api_endpoints_from_rust, parse_git_commits,
-    validate_rust_doc_coverage,
 };
 
 // Re-export requirements types
@@ -243,19 +233,6 @@ pub use slack::{
     SlackText, SlashCommand, SlashCommandResponse, TextType, UserMapping,
     ApprovalDecision as SlackApprovalDecision,
 };
-
-// Re-export Slack interaction types
-pub use slack_interactions::{
-    ApprovalButtonHandler, ApprovalResponse, PrThreadManager, SlashCommandHandler,
-};
-
-// Re-export Slack service types
-pub use slack_service::{
-    AgentLifecycleEvent, PrNotificationEvent, RateLimitConfig, SlackService,
-};
-
-// Re-export Slack user service types
-pub use slack_user_service::{CodeOwner, SlackUserService};
 
 // Re-export security types
 pub use security::{
