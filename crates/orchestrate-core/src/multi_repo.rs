@@ -323,6 +323,21 @@ impl LinkedPrStatus {
     }
 }
 
+impl std::str::FromStr for LinkedPrStatus {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "ready_to_merge" => Ok(Self::ReadyToMerge),
+            "partially_merged" => Ok(Self::PartiallyMerged),
+            "merged" => Ok(Self::Merged),
+            "blocked" => Ok(Self::Blocked),
+            _ => Err(crate::Error::Other(format!("Invalid LinkedPrStatus: {}", s))),
+        }
+    }
+}
+
 /// Coordinated release
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatedRelease {
@@ -363,6 +378,21 @@ impl ReleaseStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::RolledBack => "rolled_back",
+        }
+    }
+}
+
+impl std::str::FromStr for ReleaseStatus {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "in_progress" => Ok(Self::InProgress),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "rolled_back" => Ok(Self::RolledBack),
+            _ => Err(crate::Error::Other(format!("Invalid ReleaseStatus: {}", s))),
         }
     }
 }

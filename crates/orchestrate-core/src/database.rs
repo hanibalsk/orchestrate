@@ -149,24 +149,8 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/011_success_patterns.sql"))
             .execute(&self.pool)
             .await?;
-        // Feedback migration
-        sqlx::query(include_str!("../../../migrations/012_feedback.sql"))
-            .execute(&self.pool)
-            .await?;
-        // Experiments migration
-        sqlx::query(include_str!("../../../migrations/013_experiments.sql"))
-            .execute(&self.pool)
-            .await?;
-        // Model selection migration
-        sqlx::query(include_str!("../../../migrations/014_model_selection.sql"))
-            .execute(&self.pool)
-            .await?;
-        // Prompt optimization migration
-        sqlx::query(include_str!("../../../migrations/015_prompt_optimization.sql"))
-            .execute(&self.pool)
-            .await?;
-        // Requirements capture migration
-        sqlx::query(include_str!("../../../migrations/016_requirements.sql"))
+        // Multi-repository orchestration migration
+        sqlx::query(include_str!("../../../migrations/012_multi_repo.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -4962,419 +4946,6 @@ impl Database {
 
         rows.into_iter().map(|r| r.try_into()).collect()
     }
-
-    // ==================== Requirements Operations ====================
-
-    /// Create a new requirement
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn create_requirement(&self, requirement: &crate::Requirement) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO requirements (
-                id, title, description, requirement_type, priority, status,
-                stakeholders, actors, acceptance_criteria, dependencies,
-                related_requirements, tags, source, created_at, updated_at, version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&requirement.id)
-        .bind(&requirement.title)
-        .bind(&requirement.description)
-        .bind(requirement.requirement_type.as_str())
-        .bind(requirement.priority.as_str())
-        .bind(requirement.status.as_str())
-        .bind(serde_json::to_string(&requirement.stakeholders)?)
-        .bind(serde_json::to_string(&requirement.actors)?)
-        .bind(serde_json::to_string(&requirement.acceptance_criteria)?)
-        .bind(serde_json::to_string(&requirement.dependencies)?)
-        .bind(serde_json::to_string(&requirement.related_requirements)?)
-        .bind(serde_json::to_string(&requirement.tags)?)
-        .bind(&requirement.source)
-        .bind(requirement.created_at.to_rfc3339())
-        .bind(requirement.updated_at.to_rfc3339())
-        .bind(requirement.version as i64)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get a requirement by ID
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_requirement(&self, id: &str) -> Result<Option<crate::Requirement>> {
-        let row = sqlx::query_as::<_, RequirementRow>(
-            r#"
-            SELECT id, title, description, requirement_type, priority, status,
-                   stakeholders, actors, acceptance_criteria, dependencies,
-                   related_requirements, tags, source, created_at, updated_at, version
-            FROM requirements
-            WHERE id = ?
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|r| r.try_into()).transpose()
-    }
-
-    /// Update a requirement
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn update_requirement(&self, requirement: &crate::Requirement) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE requirements
-            SET title = ?, description = ?, requirement_type = ?, priority = ?,
-                status = ?, stakeholders = ?, actors = ?, acceptance_criteria = ?,
-                dependencies = ?, related_requirements = ?, tags = ?, source = ?,
-                updated_at = ?, version = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&requirement.title)
-        .bind(&requirement.description)
-        .bind(requirement.requirement_type.as_str())
-        .bind(requirement.priority.as_str())
-        .bind(requirement.status.as_str())
-        .bind(serde_json::to_string(&requirement.stakeholders)?)
-        .bind(serde_json::to_string(&requirement.actors)?)
-        .bind(serde_json::to_string(&requirement.acceptance_criteria)?)
-        .bind(serde_json::to_string(&requirement.dependencies)?)
-        .bind(serde_json::to_string(&requirement.related_requirements)?)
-        .bind(serde_json::to_string(&requirement.tags)?)
-        .bind(&requirement.source)
-        .bind(requirement.updated_at.to_rfc3339())
-        .bind(requirement.version as i64)
-        .bind(&requirement.id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// List requirements with optional filters
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn list_requirements(
-        &self,
-        requirement_type: Option<crate::RequirementType>,
-        status: Option<crate::RequirementStatus>,
-    ) -> Result<Vec<crate::Requirement>> {
-        let mut query = String::from(
-            "SELECT id, title, description, requirement_type, priority, status,
-                    stakeholders, actors, acceptance_criteria, dependencies,
-                    related_requirements, tags, source, created_at, updated_at, version
-             FROM requirements WHERE 1=1",
-        );
-
-        if requirement_type.is_some() {
-            query.push_str(" AND requirement_type = ?");
-        }
-        if status.is_some() {
-            query.push_str(" AND status = ?");
-        }
-        query.push_str(" ORDER BY created_at DESC");
-
-        let mut query_builder = sqlx::query_as::<_, RequirementRow>(&query);
-
-        if let Some(req_type) = requirement_type {
-            query_builder = query_builder.bind(req_type.as_str());
-        }
-        if let Some(st) = status {
-            query_builder = query_builder.bind(st.as_str());
-        }
-
-        let rows = query_builder.fetch_all(&self.pool).await?;
-
-        rows.into_iter().map(|r| r.try_into()).collect()
-    }
-
-    /// Delete a requirement
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn delete_requirement(&self, id: &str) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM requirements WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Create a clarifying question
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn create_clarifying_question(
-        &self,
-        question: &crate::ClarifyingQuestion,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO clarifying_questions (
-                id, requirement_id, question, context, options, answer, answered_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&question.id)
-        .bind(&question.requirement_id)
-        .bind(&question.question)
-        .bind(&question.context)
-        .bind(serde_json::to_string(&question.options)?)
-        .bind(&question.answer)
-        .bind(question.answered_at.map(|dt| dt.to_rfc3339()))
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get a clarifying question by ID
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_clarifying_question(
-        &self,
-        id: &str,
-    ) -> Result<Option<crate::ClarifyingQuestion>> {
-        let row = sqlx::query_as::<_, ClarifyingQuestionRow>(
-            r#"
-            SELECT id, requirement_id, question, context, options, answer, answered_at
-            FROM clarifying_questions
-            WHERE id = ?
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|r| r.try_into()).transpose()
-    }
-
-    /// Answer a clarifying question
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn answer_clarifying_question(&self, id: &str, answer: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE clarifying_questions
-            SET answer = ?, answered_at = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(answer)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get unanswered questions for a requirement
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_unanswered_questions(
-        &self,
-        requirement_id: &str,
-    ) -> Result<Vec<crate::ClarifyingQuestion>> {
-        let rows = sqlx::query_as::<_, ClarifyingQuestionRow>(
-            r#"
-            SELECT id, requirement_id, question, context, options, answer, answered_at
-            FROM clarifying_questions
-            WHERE requirement_id = ? AND answer IS NULL
-            ORDER BY id
-            "#,
-        )
-        .bind(requirement_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(|r| r.try_into()).collect()
-    }
-
-    /// Create a generated story
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn create_generated_story(
-        &self,
-        story: &crate::GeneratedStory,
-        requirement_id: &str,
-    ) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
-
-        sqlx::query(
-            r#"
-            INSERT INTO generated_stories (
-                id, requirement_id, title, user_type, goal, benefit,
-                acceptance_criteria, complexity, related_requirements,
-                suggested_epic, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&id)
-        .bind(requirement_id)
-        .bind(&story.title)
-        .bind(&story.user_type)
-        .bind(&story.goal)
-        .bind(&story.benefit)
-        .bind(serde_json::to_string(&story.acceptance_criteria)?)
-        .bind(story.complexity.as_str())
-        .bind(serde_json::to_string(&story.related_requirements)?)
-        .bind(&story.suggested_epic)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(id)
-    }
-
-    /// Get a generated story by ID
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_generated_story(&self, id: &str) -> Result<Option<crate::GeneratedStory>> {
-        let row = sqlx::query_as::<_, GeneratedStoryRow>(
-            r#"
-            SELECT id, requirement_id, title, user_type, goal, benefit,
-                   acceptance_criteria, complexity, related_requirements,
-                   suggested_epic, created_at
-            FROM generated_stories
-            WHERE id = ?
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|r| r.try_into()).transpose()
-    }
-
-    /// Get all generated stories for a requirement
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_stories_for_requirement(
-        &self,
-        requirement_id: &str,
-    ) -> Result<Vec<crate::GeneratedStory>> {
-        let rows = sqlx::query_as::<_, GeneratedStoryRow>(
-            r#"
-            SELECT id, requirement_id, title, user_type, goal, benefit,
-                   acceptance_criteria, complexity, related_requirements,
-                   suggested_epic, created_at
-            FROM generated_stories
-            WHERE requirement_id = ?
-            ORDER BY created_at
-            "#,
-        )
-        .bind(requirement_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(|r| r.try_into()).collect()
-    }
-
-    /// Create a traceability link
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn create_traceability_link(&self, link: &crate::TraceabilityLink) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO traceability_links (
-                source_type, source_id, target_type, target_id, link_type, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(link.source_type.as_str())
-        .bind(&link.source_id)
-        .bind(link.target_type.as_str())
-        .bind(&link.target_id)
-        .bind(link.link_type.as_str())
-        .bind(link.created_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get traceability links for a requirement
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_traceability_links_for_requirement(
-        &self,
-        requirement_id: &str,
-    ) -> Result<Vec<crate::TraceabilityLink>> {
-        let rows = sqlx::query_as::<_, TraceabilityLinkRow>(
-            r#"
-            SELECT source_type, source_id, target_type, target_id, link_type, created_at
-            FROM traceability_links
-            WHERE source_id = ?
-            ORDER BY created_at
-            "#,
-        )
-        .bind(requirement_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(|r| r.try_into()).collect()
-    }
-
-    /// Build a traceability matrix for given requirements
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn build_traceability_matrix(
-        &self,
-        requirement_ids: Vec<String>,
-    ) -> Result<crate::TraceabilityMatrix> {
-        let mut matrix = crate::TraceabilityMatrix::new();
-        matrix.requirements = requirement_ids.clone();
-
-        // Get all links for these requirements
-        for req_id in &requirement_ids {
-            let links = self.get_traceability_links_for_requirement(req_id).await?;
-            for link in links {
-                matrix.add_link(link);
-            }
-        }
-
-        // Calculate coverage
-        matrix.calculate_coverage();
-
-        Ok(matrix)
-    }
-
-    /// Create an impact analysis
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn create_impact_analysis(&self, analysis: &crate::ImpactAnalysis) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO impact_analyses (
-                requirement_id, affected_stories, affected_code_files, affected_tests,
-                estimated_effort, risk_level, recommendations, generated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&analysis.requirement_id)
-        .bind(serde_json::to_string(&analysis.affected_stories)?)
-        .bind(serde_json::to_string(&analysis.affected_code_files)?)
-        .bind(serde_json::to_string(&analysis.affected_tests)?)
-        .bind(analysis.estimated_effort.as_str())
-        .bind(analysis.risk_level.as_str())
-        .bind(serde_json::to_string(&analysis.recommendations)?)
-        .bind(analysis.generated_at.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get the latest impact analysis for a requirement
-    #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn get_impact_analysis(
-        &self,
-        requirement_id: &str,
-    ) -> Result<Option<crate::ImpactAnalysis>> {
-        let row = sqlx::query_as::<_, ImpactAnalysisRow>(
-            r#"
-            SELECT requirement_id, affected_stories, affected_code_files, affected_tests,
-                   estimated_effort, risk_level, recommendations, generated_at
-            FROM impact_analyses
-            WHERE requirement_id = ?
-            ORDER BY generated_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(requirement_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|r| r.try_into()).transpose()
-    }
 }
 
 // Database row types for approval
@@ -5891,238 +5462,792 @@ impl From<ModelSelectionConfigRow> for ModelSelectionConfig {
     }
 }
 
-// Database row types for requirements
+// ==================== Multi-Repository Operations ====================
 
-#[derive(sqlx::FromRow)]
-struct RequirementRow {
-    id: String,
-    title: String,
-    description: String,
-    requirement_type: String,
-    priority: String,
-    status: String,
-    stakeholders: String,
-    actors: String,
-    acceptance_criteria: String,
-    dependencies: String,
-    related_requirements: String,
-    tags: String,
-    source: Option<String>,
-    created_at: String,
-    updated_at: String,
-    version: i64,
+impl Database {
+    /// Insert a new repository
+    pub async fn insert_repository(&self, repo: &crate::Repository) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO repositories (name, url, local_path, default_branch, provider, status, last_synced, config)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&repo.name)
+        .bind(&repo.url)
+        .bind(&repo.local_path)
+        .bind(&repo.default_branch)
+        .bind(repo.provider.as_str())
+        .bind(repo.status.as_str())
+        .bind(repo.last_synced.map(|dt| dt.to_rfc3339()))
+        .bind(serde_json::to_string(&repo.config)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get repository by name
+    pub async fn get_repository_by_name(&self, name: &str) -> Result<Option<crate::Repository>> {
+        let row = sqlx::query_as::<_, RepositoryRow>("SELECT * FROM repositories WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update repository
+    pub async fn update_repository(&self, repo: &crate::Repository) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE repositories SET
+                url = ?, local_path = ?, default_branch = ?, provider = ?,
+                status = ?, last_synced = ?, config = ?, updated_at = datetime('now')
+            WHERE name = ?
+            "#,
+        )
+        .bind(&repo.url)
+        .bind(&repo.local_path)
+        .bind(&repo.default_branch)
+        .bind(repo.provider.as_str())
+        .bind(repo.status.as_str())
+        .bind(repo.last_synced.map(|dt| dt.to_rfc3339()))
+        .bind(serde_json::to_string(&repo.config)?)
+        .bind(&repo.name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List all repositories
+    pub async fn list_repositories(&self) -> Result<Vec<crate::Repository>> {
+        let rows = sqlx::query_as::<_, RepositoryRow>("SELECT * FROM repositories ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Delete repository by name
+    pub async fn delete_repository(&self, name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM repositories WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Add repository dependency
+    pub async fn add_repository_dependency(&self, repo_name: &str, depends_on: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO repository_dependencies (repo_id, depends_on_id)
+            SELECT r1.id, r2.id FROM repositories r1, repositories r2
+            WHERE r1.name = ? AND r2.name = ?
+            "#,
+        )
+        .bind(repo_name)
+        .bind(depends_on)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get repository dependencies
+    pub async fn get_repository_dependencies(&self, repo_name: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT r2.name FROM repository_dependencies rd
+            JOIN repositories r1 ON rd.repo_id = r1.id
+            JOIN repositories r2 ON rd.depends_on_id = r2.id
+            WHERE r1.name = ?
+            "#,
+        )
+        .bind(repo_name)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Remove repository dependency
+    pub async fn remove_repository_dependency(
+        &self,
+        repo_name: &str,
+        depends_on: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM repository_dependencies
+            WHERE repo_id = (SELECT id FROM repositories WHERE name = ?)
+            AND depends_on_id = (SELECT id FROM repositories WHERE name = ?)
+            "#,
+        )
+        .bind(repo_name)
+        .bind(depends_on)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get full dependency graph
+    pub async fn get_dependency_graph(&self) -> Result<crate::RepoDependencyGraph> {
+        let repos = self.list_repositories().await?;
+        let mut graph = crate::RepoDependencyGraph::new();
+
+        for repo in repos {
+            let deps = self.get_repository_dependencies(&repo.name).await?;
+            graph.add_repo(&repo.name, deps);
+        }
+
+        graph.detect_circular();
+        Ok(graph)
+    }
+
+    /// Insert cross-repository branch
+    pub async fn insert_cross_repo_branch(&self, branch: &crate::CrossRepoBranch) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO cross_repo_branches (name, created_at, updated_at)
+            VALUES (?, ?, ?)
+            "#,
+        )
+        .bind(&branch.name)
+        .bind(branch.created_at.to_rfc3339())
+        .bind(branch.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get cross-repository branch by name
+    pub async fn get_cross_repo_branch(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::CrossRepoBranch>> {
+        let row = sqlx::query_as::<_, CrossRepoBranchRow>(
+            "SELECT * FROM cross_repo_branches WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(branch_row) = row {
+            // Fetch status for all repos
+            let status_rows = sqlx::query_as::<_, RepoBranchStatusRow>(
+                r#"
+                SELECT rbs.*, r.name as repo_name
+                FROM repo_branch_status rbs
+                JOIN repositories r ON rbs.repo_id = r.id
+                WHERE rbs.cross_branch_id = ?
+                "#,
+            )
+            .bind(branch_row.id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let repos = status_rows
+                .into_iter()
+                .map(|r| r.into())
+                .collect::<Vec<crate::RepoBranchStatus>>();
+
+            Ok(Some(crate::CrossRepoBranch {
+                name: branch_row.name,
+                repos,
+                created_at: chrono::DateTime::parse_from_rfc3339(&branch_row.created_at)
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .into(),
+                updated_at: chrono::DateTime::parse_from_rfc3339(&branch_row.updated_at)
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .into(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update repository branch status
+    pub async fn update_repo_branch_status(
+        &self,
+        branch_name: &str,
+        status: &crate::RepoBranchStatus,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO repo_branch_status (cross_branch_id, repo_id, branch_exists, commits_ahead, commits_behind, has_conflicts, pr_number, pr_status, updated_at)
+            SELECT cb.id, r.id, ?, ?, ?, ?, ?, ?, datetime('now')
+            FROM cross_repo_branches cb, repositories r
+            WHERE cb.name = ? AND r.name = ?
+            ON CONFLICT(cross_branch_id, repo_id) DO UPDATE SET
+                branch_exists = excluded.branch_exists,
+                commits_ahead = excluded.commits_ahead,
+                commits_behind = excluded.commits_behind,
+                has_conflicts = excluded.has_conflicts,
+                pr_number = excluded.pr_number,
+                pr_status = excluded.pr_status,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(status.branch_exists)
+        .bind(status.commits_ahead)
+        .bind(status.commits_behind)
+        .bind(status.has_conflicts)
+        .bind(status.pr_number)
+        .bind(&status.pr_status)
+        .bind(branch_name)
+        .bind(&status.repo_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List all cross-repository branches
+    pub async fn list_cross_repo_branches(&self) -> Result<Vec<crate::CrossRepoBranch>> {
+        let rows = sqlx::query_as::<_, CrossRepoBranchRow>(
+            "SELECT * FROM cross_repo_branches ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut branches = Vec::new();
+        for row in rows {
+            if let Some(branch) = self.get_cross_repo_branch(&row.name).await? {
+                branches.push(branch);
+            }
+        }
+
+        Ok(branches)
+    }
+
+    /// Insert linked PR group
+    pub async fn insert_linked_pr_group(&self, group: &crate::LinkedPrGroup) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO linked_pr_groups (id, name, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&group.id)
+        .bind(&group.name)
+        .bind(group.status.as_str())
+        .bind(group.created_at.to_rfc3339())
+        .bind(group.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get linked PR group by ID
+    pub async fn get_linked_pr_group(&self, id: &str) -> Result<Option<crate::LinkedPrGroup>> {
+        let row = sqlx::query_as::<_, LinkedPrGroupRow>(
+            "SELECT * FROM linked_pr_groups WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(group_row) = row {
+            // Fetch all PRs
+            let pr_rows = sqlx::query_as::<_, LinkedPrRow>(
+                r#"
+                SELECT lp.*, r.name as repo_name
+                FROM linked_prs lp
+                JOIN repositories r ON lp.repo_id = r.id
+                WHERE lp.group_id = ?
+                ORDER BY lp.merge_order
+                "#,
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let prs = pr_rows.into_iter().map(|r| r.into()).collect::<Vec<_>>();
+            let merge_order = prs.iter().map(|pr: &crate::LinkedPr| pr.repo_name.clone()).collect();
+
+            Ok(Some(crate::LinkedPrGroup {
+                id: group_row.id,
+                name: group_row.name,
+                prs,
+                merge_order,
+                status: group_row.status.parse().unwrap_or(crate::LinkedPrStatus::Open),
+                created_at: chrono::DateTime::parse_from_rfc3339(&group_row.created_at)
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .into(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Add linked PR to group
+    pub async fn add_linked_pr(
+        &self,
+        group_id: &str,
+        pr: &crate::LinkedPr,
+        merge_order: i32,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO linked_prs (group_id, repo_id, pr_number, title, status, mergeable, merge_order)
+            SELECT ?, r.id, ?, ?, ?, ?, ?
+            FROM repositories r
+            WHERE r.name = ?
+            "#,
+        )
+        .bind(group_id)
+        .bind(pr.pr_number as i32)
+        .bind(&pr.title)
+        .bind(&pr.status)
+        .bind(pr.mergeable)
+        .bind(merge_order)
+        .bind(&pr.repo_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update linked PR group status
+    pub async fn update_linked_pr_group_status(
+        &self,
+        group_id: &str,
+        status: crate::LinkedPrStatus,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE linked_pr_groups SET status = ?, updated_at = datetime('now')
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(group_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List linked PR groups with optional status filter
+    pub async fn list_linked_pr_groups(
+        &self,
+        status: Option<crate::LinkedPrStatus>,
+    ) -> Result<Vec<crate::LinkedPrGroup>> {
+        let rows = if let Some(status) = status {
+            sqlx::query_as::<_, LinkedPrGroupRow>(
+                "SELECT * FROM linked_pr_groups WHERE status = ? ORDER BY created_at DESC",
+            )
+            .bind(status.as_str())
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, LinkedPrGroupRow>(
+                "SELECT * FROM linked_pr_groups ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let mut groups = Vec::new();
+        for row in rows {
+            if let Some(group) = self.get_linked_pr_group(&row.id).await? {
+                groups.push(group);
+            }
+        }
+
+        Ok(groups)
+    }
+
+    /// Insert coordinated release
+    pub async fn insert_coordinated_release(
+        &self,
+        release: &crate::CoordinatedRelease,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO coordinated_releases (version, status, changelog, created_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(&release.version)
+        .bind(release.status.as_str())
+        .bind(&release.changelog)
+        .bind(release.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get coordinated release by ID
+    pub async fn get_coordinated_release(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::CoordinatedRelease>> {
+        let row = sqlx::query_as::<_, CoordinatedReleaseRow>(
+            "SELECT * FROM coordinated_releases WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(release_row) = row {
+            // Fetch repo releases
+            let repo_rows = sqlx::query_as::<_, RepoReleaseRow>(
+                r#"
+                SELECT rr.*, r.name as repo_name
+                FROM repo_releases rr
+                JOIN repositories r ON rr.repo_id = r.id
+                WHERE rr.release_id = ?
+                "#,
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let repos = repo_rows.into_iter().map(|r| r.into()).collect();
+
+            Ok(Some(crate::CoordinatedRelease {
+                version: release_row.version,
+                repos,
+                status: release_row
+                    .status
+                    .parse()
+                    .unwrap_or(crate::ReleaseStatus::Pending),
+                changelog: release_row.changelog,
+                created_at: chrono::DateTime::parse_from_rfc3339(&release_row.created_at)
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .into(),
+                completed_at: release_row
+                    .completed_at
+                    .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                    .transpose()
+                    .map_err(|e| crate::Error::Other(e.to_string()))?
+                    .map(Into::into),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Add repository release
+    pub async fn add_repo_release(
+        &self,
+        release_id: i64,
+        repo_release: &crate::RepoRelease,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (release_id, repo_id, version, status, tag, release_url)
+            SELECT ?, r.id, ?, ?, ?, ?
+            FROM repositories r
+            WHERE r.name = ?
+            "#,
+        )
+        .bind(release_id)
+        .bind(&repo_release.version)
+        .bind(repo_release.status.as_str())
+        .bind(&repo_release.tag)
+        .bind(&repo_release.release_url)
+        .bind(&repo_release.repo_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update repository release status
+    pub async fn update_repo_release_status(
+        &self,
+        release_id: i64,
+        repo_name: &str,
+        status: crate::ReleaseStatus,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE repo_releases SET status = ?, updated_at = datetime('now')
+            WHERE release_id = ? AND repo_id = (SELECT id FROM repositories WHERE name = ?)
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(release_id)
+        .bind(repo_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update coordinated release status
+    pub async fn update_coordinated_release_status(
+        &self,
+        release_id: i64,
+        status: crate::ReleaseStatus,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE coordinated_releases SET status = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(release_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Complete coordinated release
+    pub async fn complete_coordinated_release(&self, release_id: i64) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE coordinated_releases SET status = ?, completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(crate::ReleaseStatus::Completed.as_str())
+        .bind(&now)
+        .bind(release_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List coordinated releases
+    pub async fn list_coordinated_releases(
+        &self,
+        status: Option<crate::ReleaseStatus>,
+    ) -> Result<Vec<crate::CoordinatedRelease>> {
+        let rows = if let Some(status) = status {
+            sqlx::query_as::<_, CoordinatedReleaseRow>(
+                "SELECT * FROM coordinated_releases WHERE status = ? ORDER BY created_at DESC",
+            )
+            .bind(status.as_str())
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, CoordinatedReleaseRow>(
+                "SELECT * FROM coordinated_releases ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let mut releases = Vec::new();
+        for row in rows {
+            if let Some(release) = self.get_coordinated_release(row.id).await? {
+                releases.push(release);
+            }
+        }
+
+        Ok(releases)
+    }
+
+    /// Detect dependencies from package files
+    pub async fn detect_dependencies_from_packages(
+        &self,
+        repo_name: &str,
+        package_deps: &[String],
+    ) -> Result<()> {
+        // Match package names to repository names
+        let repos = self.list_repositories().await?;
+
+        for dep in package_deps {
+            // Try to match package name to repo name
+            for repo in &repos {
+                if dep.contains(&repo.name) || repo.url.contains(dep) {
+                    // Add dependency if not already exists
+                    let _ = self.add_repository_dependency(repo_name, &repo.name).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
-impl TryFrom<RequirementRow> for crate::Requirement {
+// ==================== Multi-Repository Row Types ====================
+
+#[derive(sqlx::FromRow)]
+struct RepositoryRow {
+    #[allow(dead_code)]
+    id: i64,
+    name: String,
+    url: String,
+    local_path: Option<String>,
+    default_branch: String,
+    provider: String,
+    status: String,
+    last_synced: Option<String>,
+    config: String,
+    #[allow(dead_code)]
+    created_at: String,
+    #[allow(dead_code)]
+    updated_at: String,
+}
+
+impl TryFrom<RepositoryRow> for crate::Repository {
     type Error = crate::Error;
 
-    fn try_from(row: RequirementRow) -> Result<Self> {
+    fn try_from(row: RepositoryRow) -> Result<Self> {
         use std::str::FromStr;
 
-        Ok(crate::Requirement {
-            id: row.id,
-            title: row.title,
-            description: row.description,
-            requirement_type: match row.requirement_type.as_str() {
-                "functional" => crate::RequirementType::Functional,
-                "non_functional" => crate::RequirementType::NonFunctional,
-                "constraint" => crate::RequirementType::Constraint,
-                "interface" => crate::RequirementType::Interface,
-                "security" => crate::RequirementType::Security,
-                "performance" => crate::RequirementType::Performance,
-                "usability" => crate::RequirementType::Usability,
-                _ => crate::RequirementType::Functional,
-            },
-            priority: match row.priority.as_str() {
-                "critical" => crate::RequirementPriority::Critical,
-                "high" => crate::RequirementPriority::High,
-                "medium" => crate::RequirementPriority::Medium,
-                "low" => crate::RequirementPriority::Low,
-                _ => crate::RequirementPriority::Medium,
-            },
-            status: crate::RequirementStatus::from_str(&row.status)
-                .map_err(|e| crate::Error::Other(e))?,
-            stakeholders: serde_json::from_str(&row.stakeholders)?,
-            actors: serde_json::from_str(&row.actors)?,
-            acceptance_criteria: serde_json::from_str(&row.acceptance_criteria)?,
-            dependencies: serde_json::from_str(&row.dependencies)?,
-            related_requirements: serde_json::from_str(&row.related_requirements)?,
-            tags: serde_json::from_str(&row.tags)?,
-            source: row.source,
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+        let provider = match row.provider.as_str() {
+            "github" => crate::RepoProvider::GitHub,
+            "gitlab" => crate::RepoProvider::GitLab,
+            "bitbucket" => crate::RepoProvider::Bitbucket,
+            _ => crate::RepoProvider::Other,
+        };
+
+        let status = match row.status.as_str() {
+            "active" => crate::RepoStatus::Active,
+            "inactive" => crate::RepoStatus::Inactive,
+            "error" => crate::RepoStatus::Error,
+            "syncing" => crate::RepoStatus::Syncing,
+            _ => crate::RepoStatus::Inactive,
+        };
+
+        Ok(crate::Repository {
+            name: row.name,
+            url: row.url,
+            local_path: row.local_path,
+            default_branch: row.default_branch,
+            dependencies: vec![], // Loaded separately
+            provider,
+            status,
+            last_synced: row
+                .last_synced
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
                 .map_err(|e| crate::Error::Other(e.to_string()))?
-                .into(),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
-                .map_err(|e| crate::Error::Other(e.to_string()))?
-                .into(),
-            version: row.version as u32,
-        })
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct ClarifyingQuestionRow {
-    id: String,
-    requirement_id: String,
-    question: String,
-    context: String,
-    options: String,
-    answer: Option<String>,
-    answered_at: Option<String>,
-}
-
-impl TryFrom<ClarifyingQuestionRow> for crate::ClarifyingQuestion {
-    type Error = crate::Error;
-
-    fn try_from(row: ClarifyingQuestionRow) -> Result<Self> {
-        Ok(crate::ClarifyingQuestion {
-            id: row.id,
-            requirement_id: row.requirement_id,
-            question: row.question,
-            context: row.context,
-            options: serde_json::from_str(&row.options)?,
-            answer: row.answer,
-            answered_at: row
-                .answered_at
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                 .map(Into::into),
+            config: serde_json::from_str(&row.config).unwrap_or_default(),
         })
     }
 }
 
 #[derive(sqlx::FromRow)]
-struct GeneratedStoryRow {
+struct CrossRepoBranchRow {
+    id: i64,
+    name: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct RepoBranchStatusRow {
     #[allow(dead_code)]
+    id: i64,
+    #[allow(dead_code)]
+    cross_branch_id: i64,
+    #[allow(dead_code)]
+    repo_id: i64,
+    repo_name: String,
+    branch_exists: bool,
+    commits_ahead: Option<i32>,
+    commits_behind: Option<i32>,
+    has_conflicts: bool,
+    pr_number: Option<i32>,
+    pr_status: Option<String>,
+    #[allow(dead_code)]
+    updated_at: String,
+}
+
+impl From<RepoBranchStatusRow> for crate::RepoBranchStatus {
+    fn from(row: RepoBranchStatusRow) -> Self {
+        crate::RepoBranchStatus {
+            repo_name: row.repo_name,
+            branch_exists: row.branch_exists,
+            commits_ahead: row.commits_ahead.map(|v| v as u32),
+            commits_behind: row.commits_behind.map(|v| v as u32),
+            has_conflicts: row.has_conflicts,
+            pr_number: row.pr_number.map(|v| v as u32),
+            pr_status: row.pr_status,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct LinkedPrGroupRow {
     id: String,
+    name: String,
+    status: String,
+    created_at: String,
     #[allow(dead_code)]
-    requirement_id: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LinkedPrRow {
+    #[allow(dead_code)]
+    id: i64,
+    #[allow(dead_code)]
+    group_id: String,
+    #[allow(dead_code)]
+    repo_id: i64,
+    repo_name: String,
+    pr_number: i32,
     title: String,
-    user_type: String,
-    goal: String,
-    benefit: String,
-    acceptance_criteria: String,
-    complexity: String,
-    related_requirements: String,
-    suggested_epic: Option<String>,
+    status: String,
+    mergeable: bool,
+    #[allow(dead_code)]
+    merge_order: i32,
     #[allow(dead_code)]
     created_at: String,
+    #[allow(dead_code)]
+    updated_at: String,
 }
 
-impl TryFrom<GeneratedStoryRow> for crate::GeneratedStory {
-    type Error = crate::Error;
-
-    fn try_from(row: GeneratedStoryRow) -> Result<Self> {
-        Ok(crate::GeneratedStory {
+impl From<LinkedPrRow> for crate::LinkedPr {
+    fn from(row: LinkedPrRow) -> Self {
+        crate::LinkedPr {
+            repo_name: row.repo_name,
+            pr_number: row.pr_number as u32,
             title: row.title,
-            user_type: row.user_type,
-            goal: row.goal,
-            benefit: row.benefit,
-            acceptance_criteria: serde_json::from_str(&row.acceptance_criteria)?,
-            complexity: match row.complexity.as_str() {
-                "simple" => crate::StoryComplexity::Simple,
-                "medium" => crate::StoryComplexity::Medium,
-                "complex" => crate::StoryComplexity::Complex,
-                "epic" => crate::StoryComplexity::Epic,
-                _ => crate::StoryComplexity::Medium,
-            },
-            related_requirements: serde_json::from_str(&row.related_requirements)?,
-            suggested_epic: row.suggested_epic,
-        })
+            status: row.status,
+            mergeable: row.mergeable,
+        }
     }
 }
 
 #[derive(sqlx::FromRow)]
-struct TraceabilityLinkRow {
-    source_type: String,
-    source_id: String,
-    target_type: String,
-    target_id: String,
-    link_type: String,
+struct CoordinatedReleaseRow {
+    id: i64,
+    version: String,
+    status: String,
+    changelog: String,
     created_at: String,
-}
-
-impl TryFrom<TraceabilityLinkRow> for crate::TraceabilityLink {
-    type Error = crate::Error;
-
-    fn try_from(row: TraceabilityLinkRow) -> Result<Self> {
-        Ok(crate::TraceabilityLink {
-            source_type: match row.source_type.as_str() {
-                "requirement" => crate::ArtifactType::Requirement,
-                "epic" => crate::ArtifactType::Epic,
-                "story" => crate::ArtifactType::Story,
-                "task" => crate::ArtifactType::Task,
-                "commit" => crate::ArtifactType::Commit,
-                "test" => crate::ArtifactType::Test,
-                "code_file" => crate::ArtifactType::CodeFile,
-                _ => crate::ArtifactType::Requirement,
-            },
-            source_id: row.source_id,
-            target_type: match row.target_type.as_str() {
-                "requirement" => crate::ArtifactType::Requirement,
-                "epic" => crate::ArtifactType::Epic,
-                "story" => crate::ArtifactType::Story,
-                "task" => crate::ArtifactType::Task,
-                "commit" => crate::ArtifactType::Commit,
-                "test" => crate::ArtifactType::Test,
-                "code_file" => crate::ArtifactType::CodeFile,
-                _ => crate::ArtifactType::Story,
-            },
-            target_id: row.target_id,
-            link_type: match row.link_type.as_str() {
-                "derived_from" => crate::LinkType::DerivedFrom,
-                "implemented_by" => crate::LinkType::ImplementedBy,
-                "tested_by" => crate::LinkType::TestedBy,
-                "depends_on" => crate::LinkType::DependsOn,
-                "related_to" => crate::LinkType::RelatedTo,
-                _ => crate::LinkType::RelatedTo,
-            },
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
-                .map_err(|e| crate::Error::Other(e.to_string()))?
-                .into(),
-        })
-    }
+    completed_at: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
-struct ImpactAnalysisRow {
-    requirement_id: String,
-    affected_stories: String,
-    affected_code_files: String,
-    affected_tests: String,
-    estimated_effort: String,
-    risk_level: String,
-    recommendations: String,
-    generated_at: String,
+struct RepoReleaseRow {
+    #[allow(dead_code)]
+    id: i64,
+    #[allow(dead_code)]
+    release_id: i64,
+    #[allow(dead_code)]
+    repo_id: i64,
+    repo_name: String,
+    version: String,
+    status: String,
+    tag: Option<String>,
+    release_url: Option<String>,
+    #[allow(dead_code)]
+    created_at: String,
+    #[allow(dead_code)]
+    updated_at: String,
 }
 
-impl TryFrom<ImpactAnalysisRow> for crate::ImpactAnalysis {
-    type Error = crate::Error;
+impl From<RepoReleaseRow> for crate::RepoRelease {
+    fn from(row: RepoReleaseRow) -> Self {
+        use std::str::FromStr;
 
-    fn try_from(row: ImpactAnalysisRow) -> Result<Self> {
-        Ok(crate::ImpactAnalysis {
-            requirement_id: row.requirement_id,
-            affected_stories: serde_json::from_str(&row.affected_stories)?,
-            affected_code_files: serde_json::from_str(&row.affected_code_files)?,
-            affected_tests: serde_json::from_str(&row.affected_tests)?,
-            estimated_effort: match row.estimated_effort.as_str() {
-                "minimal" => crate::EffortEstimate::Minimal,
-                "low" => crate::EffortEstimate::Low,
-                "medium" => crate::EffortEstimate::Medium,
-                "high" => crate::EffortEstimate::High,
-                "very_high" => crate::EffortEstimate::VeryHigh,
-                _ => crate::EffortEstimate::Medium,
-            },
-            risk_level: match row.risk_level.as_str() {
-                "low" => crate::RiskLevel::Low,
-                "medium" => crate::RiskLevel::Medium,
-                "high" => crate::RiskLevel::High,
-                "critical" => crate::RiskLevel::Critical,
-                _ => crate::RiskLevel::Medium,
-            },
-            recommendations: serde_json::from_str(&row.recommendations)?,
-            generated_at: chrono::DateTime::parse_from_rfc3339(&row.generated_at)
-                .map_err(|e| crate::Error::Other(e.to_string()))?
-                .into(),
-        })
+        crate::RepoRelease {
+            repo_name: row.repo_name,
+            version: row.version,
+            status: row
+                .status
+                .parse()
+                .unwrap_or(crate::ReleaseStatus::Pending),
+            tag: row.tag,
+            release_url: row.release_url,
+        }
     }
 }
