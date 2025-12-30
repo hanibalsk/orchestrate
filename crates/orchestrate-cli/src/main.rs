@@ -8558,16 +8558,47 @@ async fn handle_epic_stuck_agents(db: &Database) -> Result<()> {
     Ok(())
 }
 
-async fn handle_epic_unblock(_db: &Database, epic_id: &str) -> Result<()> {
-    println!("Unblocking epic: {}", epic_id);
+async fn handle_epic_unblock(db: &Database, session_id: &str) -> Result<()> {
+    use orchestrate_core::AutonomousSessionState;
+
+    println!("Attempting to unblock session: {}", session_id);
     println!();
 
-    // TODO: Implement epic unblock when get_epic database method is added
-    // For now, show what would happen
-    println!("Would unblock epic {} and set status to InProgress.", epic_id);
+    // Get the session
+    let session = db.get_autonomous_session(session_id).await?;
+
+    let Some(mut session) = session else {
+        eprintln!("Error: Session '{}' not found.", session_id);
+        eprintln!();
+        eprintln!("Use 'orchestrate epic sessions' to list available sessions.");
+        return Err(anyhow::anyhow!("Session not found"));
+    };
+
+    // Check if session is blocked
+    if session.state != AutonomousSessionState::Blocked {
+        eprintln!("Error: Session '{}' is not blocked.", session_id);
+        eprintln!("  Current state: {}", session.state.as_str());
+        eprintln!();
+        eprintln!("Only blocked sessions can be unblocked.");
+        return Err(anyhow::anyhow!("Session is not blocked"));
+    }
+
+    // Display blocked reason if available
+    if let Some(reason) = &session.blocked_reason {
+        println!("Blocked reason: {}", reason);
+        println!();
+    }
+
+    // Unblock the session
+    session.unblock().map_err(|e| anyhow::anyhow!("Failed to unblock: {}", e))?;
+
+    // Save to database
+    db.update_autonomous_session(&session).await?;
+
+    println!("Session '{}' has been unblocked.", session_id);
+    println!("  New state: {}", session.state.as_str());
     println!();
-    println!("Note: Epic unblock requires additional database methods.");
-    println!("Processing will resume automatically once unblocked.");
+    println!("Processing will resume automatically.");
 
     Ok(())
 }
