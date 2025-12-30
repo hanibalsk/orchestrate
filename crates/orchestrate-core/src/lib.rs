@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod autonomous_session;
+pub mod decision_engine;
 pub mod approval;
 pub mod approval_service;
 pub mod condition_evaluator;
@@ -272,4 +273,10 @@ pub use test_stubs::{
 pub use autonomous_session::{
     AutonomousSession, AutonomousSessionState, CompletedItem, SessionConfig, SessionMetrics,
     SessionStateHistory, WorkItem, WorkItemType,
+};
+
+// Re-export decision engine types (Epic 016)
+pub use decision_engine::{
+    AgentStatus, Decision, DecisionEngine, DecisionEngineConfig, EscalationSeverity,
+    EvaluationResult as DecisionEvaluationResult, ReviewType, StatusSignal, WaitType,
 };
