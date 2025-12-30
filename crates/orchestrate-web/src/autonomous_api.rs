@@ -608,12 +608,12 @@ async fn list_edge_cases(
             .await
             .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
     } else {
-        // Return all recent edge cases
+        // Return all recent edge cases (default to unresolved)
         state
             .db
             .get_unresolved_edge_case_events()
             .await
-            .unwrap_or_default()
+            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
     };
 
     let responses: Vec<EdgeCaseResponse> = events
