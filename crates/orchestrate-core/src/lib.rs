@@ -20,13 +20,12 @@ mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
 #[cfg(test)]
-mod database_multi_repo_tests;
+mod database_incident_tests;
 pub mod documentation;
 pub mod epic;
 pub mod requirements;
 pub mod multi_repo;
 pub mod ci_integration;
-pub mod ci;
 pub mod incident;
 pub mod test_generation;
 pub mod deployment;
