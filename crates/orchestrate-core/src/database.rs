@@ -1,5 +1,6 @@
 //! Database layer for SQLite
 
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 use std::time::Duration;
@@ -184,6 +185,12 @@ impl Database {
         // Work evaluations and stuck detection migration (Epic 016 - Story 6)
         sqlx::query(include_str!(
             "../../../migrations/022_work_evaluations.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
+        // Recovery attempts migration (Epic 016 - Story 7)
+        sqlx::query(include_str!(
+            "../../../migrations/023_recovery_attempts.sql"
         ))
         .execute(&self.pool)
         .await?;
@@ -7795,4 +7802,218 @@ impl Database {
 
         Ok(rows.into_iter().collect())
     }
+
+    // ==================== Recovery Attempt Operations (Epic 016 - Story 7) ====================
+
+    /// Create a new recovery attempt
+    pub async fn create_recovery_attempt(
+        &self,
+        attempt: &crate::recovery::RecoveryAttempt,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO recovery_attempts
+                (agent_id, session_id, stuck_detection_id, action_type, outcome,
+                 details, attempt_number, started_at, completed_at, error_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&attempt.agent_id)
+        .bind(&attempt.session_id)
+        .bind(attempt.stuck_detection_id)
+        .bind(attempt.action_type.as_str())
+        .bind(attempt.outcome.as_str())
+        .bind(serde_json::to_string(&attempt.details)?)
+        .bind(attempt.attempt_number as i64)
+        .bind(attempt.started_at.to_rfc3339())
+        .bind(attempt.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(&attempt.error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get a recovery attempt by ID
+    pub async fn get_recovery_attempt(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::recovery::RecoveryAttempt>> {
+        let row = sqlx::query_as::<_, RecoveryAttemptRow>(
+            "SELECT * FROM recovery_attempts WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_attempt()).transpose()
+    }
+
+    /// Update a recovery attempt
+    pub async fn update_recovery_attempt(
+        &self,
+        attempt: &crate::recovery::RecoveryAttempt,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE recovery_attempts
+            SET outcome = ?, completed_at = ?, error_message = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(attempt.outcome.as_str())
+        .bind(attempt.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(&attempt.error_message)
+        .bind(attempt.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get recovery attempts for an agent
+    pub async fn get_recovery_attempts_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::recovery::RecoveryAttempt>> {
+        let rows = sqlx::query_as::<_, RecoveryAttemptRow>(
+            r#"
+            SELECT * FROM recovery_attempts
+            WHERE agent_id = ?
+            ORDER BY started_at DESC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_attempt()).collect()
+    }
+
+    /// Get in-progress recovery attempts for an agent
+    pub async fn get_in_progress_recovery_attempts(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<crate::recovery::RecoveryAttempt>> {
+        let rows = sqlx::query_as::<_, RecoveryAttemptRow>(
+            r#"
+            SELECT * FROM recovery_attempts
+            WHERE agent_id = ? AND outcome = 'in_progress'
+            ORDER BY started_at DESC
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_attempt()).collect()
+    }
+
+    /// Count recovery attempts by action type for an agent
+    pub async fn count_recovery_attempts_by_type(
+        &self,
+        agent_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT action_type, COUNT(*) as count
+            FROM recovery_attempts
+            WHERE agent_id = ?
+            GROUP BY action_type
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(k, v)| (k, v as u32))
+            .collect())
+    }
+
+    /// Get recovery statistics for an agent
+    pub async fn get_recovery_stats(
+        &self,
+        agent_id: &str,
+    ) -> Result<RecoveryStats> {
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM recovery_attempts WHERE agent_id = ?",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let successful: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM recovery_attempts WHERE agent_id = ? AND outcome = 'success'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let failed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM recovery_attempts WHERE agent_id = ? AND outcome = 'failed'",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(RecoveryStats {
+            total_attempts: total.0 as u32,
+            successful: successful.0 as u32,
+            failed: failed.0 as u32,
+            success_rate: if total.0 > 0 {
+                successful.0 as f64 / total.0 as f64
+            } else {
+                0.0
+            },
+        })
+    }
+}
+
+// ==================== Recovery Attempt Row (Epic 016 - Story 7) ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct RecoveryAttemptRow {
+    id: i64,
+    agent_id: String,
+    session_id: Option<String>,
+    stuck_detection_id: Option<i64>,
+    action_type: String,
+    outcome: String,
+    details: String,
+    attempt_number: i64,
+    started_at: String,
+    completed_at: Option<String>,
+    error_message: Option<String>,
+}
+
+impl RecoveryAttemptRow {
+    fn into_attempt(self) -> Result<crate::recovery::RecoveryAttempt> {
+        use crate::recovery::{RecoveryActionType, RecoveryOutcome};
+        use std::str::FromStr;
+
+        Ok(crate::recovery::RecoveryAttempt {
+            id: self.id,
+            agent_id: self.agent_id,
+            session_id: self.session_id,
+            stuck_detection_id: self.stuck_detection_id,
+            action_type: RecoveryActionType::from_str(&self.action_type)?,
+            outcome: RecoveryOutcome::from_str(&self.outcome)?,
+            details: serde_json::from_str(&self.details)?,
+            attempt_number: self.attempt_number as u32,
+            started_at: parse_datetime(&self.started_at)?,
+            completed_at: self.completed_at.map(|s| parse_datetime(&s)).transpose()?,
+            error_message: self.error_message,
+        })
+    }
+}
+
+/// Recovery statistics for an agent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryStats {
+    pub total_attempts: u32,
+    pub successful: u32,
+    pub failed: u32,
+    pub success_rate: f64,
 }

@@ -69,8 +69,11 @@ pub mod webhook_config;
 pub mod worktree;
 pub mod test_stubs;
 pub mod stuck_detection;
+pub mod recovery;
 #[cfg(test)]
 mod database_stuck_detection_tests;
+#[cfg(test)]
+mod database_recovery_tests;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
@@ -305,4 +308,10 @@ pub use context_summary::{
 pub use stuck_detection::{
     AgentProgress, EvaluationStatus, EvaluationType, RateLimitBackoff, StuckDetection,
     StuckDetectionConfig, StuckDetector, StuckSeverity, StuckType, WorkEvaluation,
+};
+
+// Re-export recovery types (Epic 016)
+pub use recovery::{
+    FixerAgentType, FixerRequest, PlannedRecoveryAction, RecoveryActionType, RecoveryAttempt,
+    RecoveryConfig, RecoveryOutcome, RecoverySelector,
 };
