@@ -359,10 +359,10 @@ impl StuckDetector {
     fn check_no_progress(&self, agent_id: &str, progress: &AgentProgress) -> Option<StuckDetection> {
         if let Some(last_output) = progress.last_meaningful_output {
             let now = Utc::now();
-            let turns_since_progress = progress.turn_count; // Simplified - in real impl, track turns since last output
+            // Note: In a real implementation, we would track turns since last output
+            // For now, we use time as a proxy (each turn is ~1 minute average)
 
-            // Check if enough turns have passed without meaningful output
-            // Using time as a proxy (each turn is ~1 minute average)
+            // Check if enough time has passed without meaningful output
             let minutes_since = (now - last_output).num_minutes() as u32;
             if minutes_since >= self.config.no_progress_turn_threshold {
                 let severity = if minutes_since >= self.config.no_progress_turn_threshold * 3 {

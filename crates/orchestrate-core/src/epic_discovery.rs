@@ -813,8 +813,8 @@ impl EpicDiscoveryService {
         let epic_ids: Vec<_> = epics.iter().map(|e| e.id.clone()).collect();
         let (queue, _graph) = self.build_work_queue(epics);
 
-        // Estimate duration (5 mins per story + complexity)
-        let _estimated = queue.len() as u32 * 5;
+        // Note: Duration estimation could be improved by using complexity metrics
+        // For now, we use a simple 5 minutes per story baseline
 
         ExecutionPlan::new()
             .with_epics(epic_ids)
