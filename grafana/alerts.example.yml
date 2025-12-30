@@ -1,0 +1,231 @@
+# Prometheus Alert Rules for Orchestrate
+# This file defines alerting conditions for the Orchestrate system
+
+groups:
+  - name: orchestrate_agents
+    interval: 30s
+    rules:
+      # Alert when agent failure rate is high
+      - alert: HighAgentFailureRate
+        expr: |
+          (
+            sum(orchestrate_agents_total{state="failed"}) /
+            sum(orchestrate_agents_total)
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: agents
+        annotations:
+          summary: "High agent failure rate detected"
+          description: "More than 10% of agents are failing (current: {{ $value | humanizePercentage }})"
+
+      # Alert when agents are stuck in running state
+      - alert: AgentsStuckRunning
+        expr: |
+          sum(orchestrate_agents_total{state="running"}) > 10
+        for: 30m
+        labels:
+          severity: warning
+          component: agents
+        annotations:
+          summary: "Many agents stuck in running state"
+          description: "{{ $value }} agents have been running for over 30 minutes"
+
+      # Alert when agent success rate drops
+      - alert: LowAgentSuccessRate
+        expr: |
+          orchestrate_agent_success_rate < 0.8
+        for: 10m
+        labels:
+          severity: warning
+          component: agents
+        annotations:
+          summary: "Low agent success rate for {{ $labels.agent_type }}"
+          description: "Agent success rate is {{ $value | humanizePercentage }} (threshold: 80%)"
+
+  - name: orchestrate_errors
+    interval: 30s
+    rules:
+      # Alert on high error rate
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(orchestrate_errors_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: errors
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanize }} errors/sec"
+
+      # Alert on critical error rate
+      - alert: CriticalErrorRate
+        expr: |
+          sum(rate(orchestrate_errors_total[5m])) > 5
+        for: 2m
+        labels:
+          severity: critical
+          component: errors
+        annotations:
+          summary: "CRITICAL: Very high error rate"
+          description: "Error rate is {{ $value | humanize }} errors/sec (threshold: 5/sec)"
+
+      # Alert on specific error types
+      - alert: DatabaseErrors
+        expr: |
+          rate(orchestrate_errors_total{error_type=~".*database.*"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Database errors detected"
+          description: "Database error rate: {{ $value | humanize }} errors/sec"
+
+  - name: orchestrate_queue
+    interval: 30s
+    rules:
+      # Alert when queue depth is too high
+      - alert: HighQueueDepth
+        expr: |
+          orchestrate_queue_depth > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: queue
+        annotations:
+          summary: "High queue depth in {{ $labels.queue }}"
+          description: "Queue depth is {{ $value }} (threshold: 100)"
+
+      # Critical queue depth
+      - alert: CriticalQueueDepth
+        expr: |
+          orchestrate_queue_depth > 500
+        for: 5m
+        labels:
+          severity: critical
+          component: queue
+        annotations:
+          summary: "CRITICAL: Very high queue depth in {{ $labels.queue }}"
+          description: "Queue depth is {{ $value }} (threshold: 500)"
+
+  - name: orchestrate_costs
+    interval: 1h
+    rules:
+      # Alert when daily costs exceed budget
+      - alert: DailyCostBudgetExceeded
+        expr: |
+          (
+            (sum(increase(orchestrate_tokens_total{direction="input"}[24h])) * 3 / 1000000) +
+            (sum(increase(orchestrate_tokens_total{direction="output"}[24h])) * 15 / 1000000)
+          ) > 20
+        for: 1h
+        labels:
+          severity: warning
+          component: costs
+        annotations:
+          summary: "Daily cost budget exceeded"
+          description: "Daily cost is ${{ $value | humanize }} (budget: $20)"
+
+      # Alert when projected monthly costs are too high
+      - alert: MonthlyProjectedCostHigh
+        expr: |
+          (
+            (sum(increase(orchestrate_tokens_total{direction="input"}[24h])) * 3 / 1000000) +
+            (sum(increase(orchestrate_tokens_total{direction="output"}[24h])) * 15 / 1000000)
+          ) * 30 > 500
+        for: 6h
+        labels:
+          severity: warning
+          component: costs
+        annotations:
+          summary: "Projected monthly cost exceeds budget"
+          description: "Projected monthly cost is ${{ $value | humanize }} (budget: $500)"
+
+  - name: orchestrate_performance
+    interval: 1m
+    rules:
+      # Alert on slow agent execution
+      - alert: SlowAgentExecution
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(orchestrate_agent_execution_seconds_bucket[10m])) by (le, type)
+          ) > 600
+        for: 15m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "Slow agent execution for {{ $labels.type }}"
+          description: "P95 execution time is {{ $value | humanizeDuration }} (threshold: 10 minutes)"
+
+      # Alert on high API latency
+      - alert: HighAPILatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(orchestrate_http_request_duration_seconds_bucket[5m])) by (le, path)
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "High API latency on {{ $labels.path }}"
+          description: "P95 latency is {{ $value | humanizeDuration }} (threshold: 5s)"
+
+  - name: orchestrate_business_metrics
+    interval: 1h
+    rules:
+      # Alert when story completion rate is low
+      - alert: LowStoryCompletionRate
+        expr: |
+          orchestrate_story_completion_rate < 0.5
+        for: 24h
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: "Low story completion rate for {{ $labels.epic_id }}"
+          description: "Completion rate is {{ $value | humanizePercentage }} (threshold: 50%)"
+
+      # Alert on high PR cycle time
+      - alert: HighPRCycleTime
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(orchestrate_pr_cycle_time_seconds_bucket[24h])) by (le)
+          ) > 172800
+        for: 12h
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: "High PR cycle time"
+          description: "P95 PR cycle time is {{ $value | humanizeDuration }} (threshold: 48 hours)"
+
+  - name: orchestrate_system_health
+    interval: 1m
+    rules:
+      # Alert when metrics endpoint is down
+      - alert: MetricsEndpointDown
+        expr: |
+          up{job="orchestrate"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Orchestrate metrics endpoint is down"
+          description: "Cannot scrape metrics from {{ $labels.instance }}"
+
+      # Alert when no metrics are being collected
+      - alert: NoMetricsCollected
+        expr: |
+          absent(orchestrate_agents_total)
+        for: 5m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "No metrics are being collected"
+          description: "Orchestrate metrics are not available"

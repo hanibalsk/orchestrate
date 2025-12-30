@@ -8,8 +8,7 @@ import { PipelineDetail } from './pages/PipelineDetail';
 import { PipelineRunDetail } from './pages/PipelineRunDetail';
 import { PipelineNew } from './pages/PipelineNew';
 import { ScheduleList } from './pages/ScheduleList';
-import { Deployments } from './pages/Deployments';
-import { Releases } from './pages/Releases';
+import { Monitoring } from './pages/Monitoring';
 
 function App() {
   return (
@@ -26,8 +25,7 @@ function App() {
             <Route path="/pipelines/:name" element={<PipelineDetail />} />
             <Route path="/pipelines/:name/runs/:runId" element={<PipelineRunDetail />} />
             <Route path="/schedules" element={<ScheduleList />} />
-            <Route path="/deployments" element={<Deployments />} />
-            <Route path="/releases" element={<Releases />} />
+            <Route path="/monitoring" element={<Monitoring />} />
           </Routes>
         </main>
       </div>

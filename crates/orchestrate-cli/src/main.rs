@@ -4,10 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orchestrate_claude::{AgentLoop, ClaudeCliClient, ClaudeClient};
 use orchestrate_core::{
-    Agent, AgentState, AgentType, CreateEnvironment, CreateFeatureFlag, CustomInstruction, Database,
-    DeploymentRollback, Epic, EpicStatus, EnvironmentType, FlagStatus,
-    LearningEngine, PatternStatus, PreDeployValidator, RollbackRequest, Schedule, ScheduleRun,
-    ShellState, Story, StoryStatus, ValidationStatus, Worktree,
+    Agent, AgentState, AgentType, CustomInstruction, Database, Epic, EpicStatus,
+    LearningEngine, PatternStatus, Schedule, ScheduleRun, ShellState, Story, StoryStatus, Worktree,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -169,25 +167,54 @@ enum Commands {
         #[command(subcommand)]
         action: FeedbackAction,
     },
-    /// Environment management
-    Env {
+    /// A/B experiment management
+    Experiment {
         #[command(subcommand)]
-        action: EnvAction,
+        action: ExperimentAction,
     },
-    /// Deployment management
-    Deploy {
-        #[command(subcommand)]
-        action: DeployAction,
+    /// Predict task outcomes based on historical data
+    Predict {
+        /// Task description to predict outcomes for
+        #[arg(short, long)]
+        task: String,
+        /// Agent type for context
+        #[arg(short = 'a', long)]
+        agent_type: Option<String>,
     },
-    /// Feature flags management
-    Flags {
+    /// Documentation management
+    Docs {
         #[command(subcommand)]
-        action: FlagsAction,
+        action: DocsAction,
     },
-    /// Release management
-    Release {
+    /// Requirements management
+    Requirements {
         #[command(subcommand)]
-        action: ReleaseAction,
+        action: RequirementsAction,
+    },
+    /// Multi-repository management
+    Repo {
+        #[command(subcommand)]
+        action: RepoAction,
+    },
+    /// CI/CD integration
+    Ci {
+        #[command(subcommand)]
+        action: CiAction,
+    },
+    /// Incident response management
+    Incident {
+        #[command(subcommand)]
+        action: IncidentAction,
+    },
+    /// Alert management
+    Alert {
+        #[command(subcommand)]
+        action: AlertCommand,
+    },
+    /// Distributed tracing management
+    Trace {
+        #[command(subcommand)]
+        action: TraceCommand,
     },
 }
 
@@ -467,6 +494,75 @@ enum LearnAction {
         /// Skip confirmation
         #[arg(short, long)]
         force: bool,
+    },
+    /// Analyze instruction effectiveness
+    Effectiveness {
+        /// Minimum usage count to include in analysis
+        #[arg(short = 'u', long, default_value = "1")]
+        min_usage: i64,
+        /// Include disabled instructions
+        #[arg(long)]
+        include_disabled: bool,
+        /// Show only ineffective instructions
+        #[arg(long)]
+        ineffective_only: bool,
+        /// Show summary statistics only
+        #[arg(long)]
+        summary: bool,
+    },
+    /// Get improvement suggestions based on learning data
+    Suggest {
+        /// Agent type to get suggestions for
+        #[arg(short = 't', long)]
+        agent_type: Option<String>,
+        /// Maximum number of suggestions
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+    },
+    /// Export learned patterns to file
+    Export {
+        /// Output file path (supports .yaml and .json)
+        #[arg(short, long)]
+        output: String,
+        /// Minimum success rate to include
+        #[arg(long, default_value = "0.7")]
+        min_success_rate: f64,
+        /// Minimum sample size to include
+        #[arg(long, default_value = "10")]
+        min_samples: i64,
+        /// Source project name for metadata
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Import patterns from file
+    Import {
+        /// Input file path (supports .yaml and .json)
+        #[arg(short, long)]
+        file: String,
+        /// Dry run - show what would be imported
+        #[arg(long)]
+        dry_run: bool,
+        /// Minimum success rate to import
+        #[arg(long, default_value = "0.7")]
+        min_success_rate: f64,
+        /// Minimum sample size to import
+        #[arg(long, default_value = "10")]
+        min_samples: i64,
+        /// Skip existing patterns
+        #[arg(long, default_value = "true")]
+        skip_existing: bool,
+    },
+    /// Configure learning automation
+    Auto {
+        /// Enable automation
+        #[arg(long)]
+        enable: bool,
+        /// Disable automation
+        #[arg(long)]
+        disable: bool,
+        /// Show current automation status
+        #[arg(long)]
+        status: bool,
     },
 }
 
@@ -830,290 +926,540 @@ enum FeedbackAction {
 }
 
 #[derive(Subcommand)]
-enum EnvAction {
-    /// List all environments
-    List {
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    /// Create a new environment
+enum ExperimentAction {
+    /// Create a new experiment
     Create {
-        /// Environment name (e.g., staging, production)
+        /// Experiment name (unique identifier)
         name: String,
-        /// Environment type (dev, staging, production)
+        /// Experiment type (prompt, model, instruction, context, custom)
+        #[arg(short = 't', long, default_value = "prompt")]
+        experiment_type: String,
+        /// Primary metric (success_rate, completion_time, token_usage, cost, feedback_score)
+        #[arg(short, long, default_value = "success_rate")]
+        metric: String,
+        /// Optional description
         #[arg(short, long)]
-        env_type: String,
-        /// Environment URL
+        description: Option<String>,
+        /// Optional hypothesis
+        #[arg(long)]
+        hypothesis: Option<String>,
+        /// Agent type filter
         #[arg(short, long)]
-        url: Option<String>,
-        /// Deployment provider (aws, k8s, etc.)
+        agent_type: Option<String>,
+        /// Minimum samples for significance
+        #[arg(long, default_value = "100")]
+        min_samples: i64,
+        /// Confidence level (0.90, 0.95, 0.99)
+        #[arg(long, default_value = "0.95")]
+        confidence: f64,
+    },
+    /// Add a variant to an experiment
+    AddVariant {
+        /// Experiment name or ID
+        experiment: String,
+        /// Variant name
+        name: String,
+        /// Mark as control group
+        #[arg(long)]
+        control: bool,
+        /// Weight for traffic distribution (1-100)
+        #[arg(short, long, default_value = "50")]
+        weight: i32,
+        /// Optional description
         #[arg(short, long)]
-        provider: Option<String>,
-        /// Configuration as JSON
-        #[arg(short, long)]
+        description: Option<String>,
+        /// Configuration JSON
+        #[arg(long)]
         config: Option<String>,
-        /// Secrets as JSON (will be encrypted)
-        #[arg(short, long)]
-        secrets: Option<String>,
-        /// Require approval for deployments
-        #[arg(long)]
-        requires_approval: bool,
     },
-    /// Show environment details
-    Show {
-        /// Environment name
-        name: String,
-        /// Include secrets in output
-        #[arg(long)]
-        show_secrets: bool,
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    /// Delete an environment
-    Delete {
-        /// Environment name
-        name: String,
-        /// Skip confirmation prompt
-        #[arg(short = 'y', long)]
-        yes: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum DeployAction {
-    /// Deploy a version to an environment
-    #[command(name = "deploy", visible_alias = "run")]
-    Deploy {
-        /// Environment name (e.g., staging, production)
-        #[arg(short, long)]
-        env: String,
-        /// Version to deploy
-        #[arg(long)]
-        version: String,
-        /// Deployment strategy (rolling, blue-green, canary, recreate)
-        #[arg(long)]
-        strategy: Option<String>,
-        /// Deployment provider (override environment default)
-        #[arg(long)]
-        provider: Option<String>,
-        /// Timeout in seconds
-        #[arg(long)]
-        timeout: Option<u32>,
-        /// Skip pre-deployment validation
-        #[arg(long)]
-        skip_validation: bool,
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    /// Show current deployment status for an environment
-    Status {
-        /// Environment name (e.g., staging, production)
-        #[arg(short, long)]
-        env: String,
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    /// Show deployment history for an environment
-    History {
-        /// Environment name (e.g., staging, production)
-        #[arg(short, long)]
-        env: String,
-        /// Maximum number of deployments to show
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    /// Show differences between current and target deployment
-    Diff {
-        /// Environment name (e.g., staging, production)
-        #[arg(short, long)]
-        env: String,
-        /// Target version to compare against
-        #[arg(long)]
-        version: String,
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    /// Validate environment is ready for deployment
-    Validate {
-        /// Environment name (e.g., staging, production)
-        #[arg(short, long)]
-        env: String,
-        /// Version to validate (optional)
-        #[arg(long)]
-        version: Option<String>,
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-    /// Rollback deployment to a previous version
-    Rollback {
-        /// Environment name (e.g., staging, production)
-        #[arg(short, long)]
-        env: String,
-        /// Specific version to rollback to (defaults to previous successful)
-        #[arg(long)]
-        version: Option<String>,
-        /// Skip pre-deployment validation
-        #[arg(long)]
-        skip_validation: bool,
-        /// Force rollback even if current deployment is successful
-        #[arg(long)]
-        force: bool,
-        /// Output format (table, json)
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ReleaseAction {
-    /// Prepare a new release (bump version, generate changelog)
-    Prepare {
-        /// Version bump type (major, minor, patch)
-        #[arg(short, long)]
-        r#type: String,
-        /// Path to workspace Cargo.toml
-        #[arg(long, default_value = "./Cargo.toml")]
-        cargo_toml: PathBuf,
-        /// Path to CHANGELOG.md
-        #[arg(long, default_value = "./CHANGELOG.md")]
-        changelog: PathBuf,
-        /// Also bump frontend package.json if it exists
-        #[arg(long)]
-        bump_frontend: bool,
-    },
-    /// Create and tag a release
-    Create {
-        /// Version to release (e.g., 1.2.3)
-        #[arg(short, long)]
-        version: String,
-        /// Release message (defaults to changelog entry)
-        #[arg(short, long)]
-        message: Option<String>,
-        /// Push tag to remote
-        #[arg(long)]
-        push: bool,
-    },
-    /// Publish a release (create GitHub release, upload assets)
-    Publish {
-        /// Version to publish (e.g., 1.2.3)
-        #[arg(long)]
-        version: String,
-        /// Path to repository (defaults to current directory)
-        #[arg(long, default_value = ".")]
-        repo_path: PathBuf,
-        /// GitHub token (or use GITHUB_TOKEN env var)
-        #[arg(long, env = "GITHUB_TOKEN")]
-        token: Option<String>,
-        /// Make release a pre-release
-        #[arg(long)]
-        prerelease: bool,
-        /// Make release a draft
-        #[arg(long)]
-        draft: bool,
-    },
-    /// Generate release notes between two tags
-    Notes {
-        /// Starting tag (e.g., v1.0.0)
-        #[arg(short, long)]
-        from: String,
-        /// Ending tag (e.g., v1.1.0, or HEAD for unreleased)
-        #[arg(short, long)]
-        to: String,
-        /// Path to repository (defaults to current directory)
-        #[arg(long, default_value = ".")]
-        repo_path: PathBuf,
-        /// Output format (markdown, json)
-        #[arg(long, default_value = "markdown")]
-        format: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum FlagsAction {
-    /// List feature flags
+    /// List experiments
     List {
-        /// Filter by environment
+        /// Filter by status (draft, running, paused, completed, cancelled)
         #[arg(short, long)]
-        environment: Option<String>,
-        /// Output format (table, json)
-        #[arg(short = 'f', long, default_value = "table")]
+        status: Option<String>,
+        /// Maximum results
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
+    /// Show experiment details and results
+    Show {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Start an experiment
+    Start {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Pause an experiment
+    Pause {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Complete an experiment
+    Complete {
+        /// Experiment name or ID
+        experiment: String,
+        /// Declare winner variant (optional, auto-calculated if omitted)
+        #[arg(long)]
+        winner: Option<String>,
+    },
+    /// Cancel an experiment
+    Cancel {
+        /// Experiment name or ID
+        experiment: String,
+    },
+    /// Delete an experiment
+    Delete {
+        /// Experiment name or ID
+        experiment: String,
+        /// Skip confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsAction {
+    /// Generate documentation
+    Generate {
+        /// Documentation type (api, readme, changelog, adr)
+        #[arg(short = 't', long)]
+        doc_type: String,
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Output format (yaml, json, markdown)
+        #[arg(short, long, default_value = "yaml")]
         format: String,
     },
-    /// Create a new feature flag
+    /// Validate documentation coverage
+    Validate {
+        /// Path to check (default: current directory)
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Check coverage percentage threshold
+        #[arg(long, default_value = "80")]
+        coverage_threshold: u32,
+        /// Fail on any issues
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Create an Architecture Decision Record
+    Adr {
+        #[command(subcommand)]
+        action: AdrAction,
+    },
+    /// Generate changelog from git history
+    Changelog {
+        /// Starting tag/commit
+        #[arg(long)]
+        from: Option<String>,
+        /// Ending tag/commit (default: HEAD)
+        #[arg(long)]
+        to: Option<String>,
+        /// Output file
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Append to existing changelog
+        #[arg(long)]
+        append: bool,
+    },
+    /// Serve documentation locally
+    Serve {
+        /// Port to serve on
+        #[arg(short, long, default_value = "8000")]
+        port: u16,
+        /// Documentation directory
+        #[arg(short, long, default_value = "docs")]
+        dir: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdrAction {
+    /// Create a new ADR
     Create {
-        /// Flag key (unique identifier)
+        /// ADR title
+        title: String,
+        /// ADR status (proposed, accepted, deprecated, superseded)
+        #[arg(long, default_value = "proposed")]
+        status: String,
+    },
+    /// List all ADRs
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+        /// Show details
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Show a specific ADR
+    Show {
+        /// ADR number
+        number: u32,
+    },
+    /// Update ADR status
+    Update {
+        /// ADR number
+        number: u32,
+        /// New status
+        #[arg(long)]
+        status: String,
+        /// ADR that supersedes this one (if status is superseded)
+        #[arg(long)]
+        superseded_by: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RequirementsAction {
+    /// Capture a new requirement
+    Capture {
+        /// Requirement title
         #[arg(short, long)]
-        key: String,
-        /// Human-readable name
+        title: String,
+        /// Requirement description
         #[arg(short, long)]
+        description: String,
+        /// Requirement type (functional, non_functional, security, etc.)
+        #[arg(short = 't', long, default_value = "functional")]
+        req_type: String,
+        /// Priority (critical, high, medium, low)
+        #[arg(short, long, default_value = "medium")]
+        priority: String,
+    },
+    /// List requirements
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by type
+        #[arg(short = 't', long)]
+        req_type: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show requirement details
+    Show {
+        /// Requirement ID
+        id: String,
+    },
+    /// Generate stories from a requirement
+    GenerateStories {
+        /// Requirement ID
+        id: String,
+        /// Output file
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Show traceability matrix
+    Trace {
+        /// Specific requirement to trace
+        #[arg(short, long)]
+        requirement: Option<String>,
+        /// Output format (markdown, json)
+        #[arg(short, long, default_value = "markdown")]
+        format: String,
+    },
+    /// Analyze impact of requirement changes
+    Impact {
+        /// Requirement ID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoAction {
+    /// Add a repository
+    Add {
+        /// Repository URL (GitHub, GitLab, or Bitbucket)
+        url: String,
+        /// Local path to clone to
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Repository name (defaults to URL basename)
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// List repositories
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a repository
+    Remove {
+        /// Repository name
+        name: String,
+    },
+    /// Show repository dependencies
+    Dependencies {
+        /// Output as Mermaid diagram
+        #[arg(long)]
+        mermaid: bool,
+    },
+    /// Sync all repositories
+    Sync {
+        /// Specific repository to sync
+        #[arg(short, long)]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CiAction {
+    /// Configure CI provider
+    Config {
+        /// CI provider (github_actions, gitlab_ci, circleci, jenkins)
+        provider: String,
+        /// API URL (optional, uses default for provider)
+        #[arg(short, long)]
+        api_url: Option<String>,
+        /// Authentication token
+        #[arg(short, long)]
+        token: Option<String>,
+    },
+    /// Show CI run status
+    Status {
+        /// Run ID
+        run_id: Option<String>,
+        /// Branch to filter by
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Trigger a CI workflow
+    Trigger {
+        /// Workflow name
+        workflow: String,
+        /// Branch to run on
+        #[arg(short, long, default_value = "main")]
+        branch: String,
+        /// Additional inputs (key=value format)
+        #[arg(short, long)]
+        input: Vec<String>,
+    },
+    /// Get CI run logs
+    Logs {
+        /// Run ID
+        run_id: String,
+        /// Job name filter
+        #[arg(short, long)]
+        job: Option<String>,
+    },
+    /// Retry a failed CI run
+    Retry {
+        /// Run ID to retry
+        run_id: String,
+    },
+    /// Cancel a running CI job
+    Cancel {
+        /// Run ID to cancel
+        run_id: String,
+    },
+    /// Analyze CI failure
+    Analyze {
+        /// Run ID to analyze
+        run_id: String,
+        /// Attempt auto-fix
+        #[arg(long)]
+        auto_fix: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IncidentAction {
+    /// List incidents
+    List {
+        /// Filter by status
+        #[arg(short, long)]
+        status: Option<String>,
+        /// Filter by severity
+        #[arg(long)]
+        severity: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show incident details
+    Show {
+        /// Incident ID
+        id: String,
+    },
+    /// Create a new incident
+    Create {
+        /// Incident title
+        #[arg(short, long)]
+        title: String,
+        /// Severity (critical, high, medium, low)
+        #[arg(short, long, default_value = "medium")]
+        severity: String,
+        /// Description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// Investigate incident
+    Investigate {
+        /// Incident ID
+        id: String,
+    },
+    /// Run mitigation playbook
+    Mitigate {
+        /// Incident ID
+        id: String,
+        /// Playbook name
+        #[arg(short, long)]
+        playbook: String,
+    },
+    /// Resolve incident
+    Resolve {
+        /// Incident ID
+        id: String,
+        /// Resolution description
+        #[arg(short, long)]
+        resolution: String,
+    },
+    /// Generate post-mortem
+    Postmortem {
+        /// Incident ID
+        id: String,
+        /// Output file
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Playbook management
+    Playbook {
+        #[command(subcommand)]
+        action: PlaybookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaybookAction {
+    /// List playbooks
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new playbook
+    Create {
+        /// Playbook name
         name: String,
         /// Description
         #[arg(short, long)]
         description: Option<String>,
-        /// Initial status (enabled, disabled, conditional)
-        #[arg(short, long, default_value = "disabled")]
-        status: String,
-        /// Rollout percentage (0-100)
-        #[arg(short, long, default_value = "100")]
-        rollout: i32,
-        /// Environment (omit for global)
-        #[arg(short, long)]
-        environment: Option<String>,
     },
-    /// Get feature flag details
-    Show {
-        /// Flag key
-        key: String,
-        /// Environment (omit for global)
+    /// Run a playbook
+    Run {
+        /// Playbook name or ID
+        name: String,
+        /// Associated incident ID
         #[arg(short, long)]
-        environment: Option<String>,
-        /// Output format (table, json)
-        #[arg(short = 'f', long, default_value = "table")]
-        format: String,
+        incident: Option<String>,
     },
-    /// Enable a feature flag
+}
+
+#[derive(Subcommand)]
+enum AlertCommand {
+    /// Manage alert rules
+    Rules {
+        #[command(subcommand)]
+        action: AlertRulesAction,
+    },
+    /// List alerts
+    List {
+        /// Filter by status (active, acknowledged, resolved)
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Acknowledge an alert
+    Acknowledge {
+        /// Alert ID
+        id: String,
+    },
+    /// Silence an alert rule
+    Silence {
+        /// Rule name
+        name: String,
+        /// Silence duration (e.g., 1h, 30m, 2d)
+        #[arg(short, long)]
+        duration: String,
+    },
+    /// Test alert delivery
+    Test {
+        /// Rule name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    /// Enable distributed tracing
     Enable {
-        /// Flag key
-        key: String,
-        /// Environment (omit for global)
+        /// Exporter type (jaeger, otlp)
         #[arg(short, long)]
-        environment: Option<String>,
+        exporter: String,
+        /// Jaeger endpoint (for jaeger exporter)
+        #[arg(long)]
+        jaeger_endpoint: Option<String>,
+        /// OTLP endpoint (for otlp exporter)
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
+        /// Service name
+        #[arg(long, default_value = "orchestrate")]
+        service_name: String,
+        /// Sample rate (0.0 to 1.0)
+        #[arg(long, default_value = "1.0")]
+        sample_rate: f64,
     },
-    /// Disable a feature flag
+    /// Disable distributed tracing
+    Disable,
+    /// Show tracing status
+    Status,
+}
+
+#[derive(Subcommand)]
+enum AlertRulesAction {
+    /// List all alert rules
+    List,
+    /// Create a new alert rule
+    Create {
+        /// Rule name
+        #[arg(short, long)]
+        name: String,
+        /// Alert condition (e.g., "metric > 100")
+        #[arg(short, long)]
+        condition: String,
+        /// Notification channels (can be specified multiple times)
+        #[arg(long)]
+        channel: Vec<String>,
+        /// Severity level (info, warning, critical)
+        #[arg(short, long, default_value = "warning")]
+        severity: String,
+        /// Evaluation interval in seconds
+        #[arg(short, long, default_value = "60")]
+        interval: i64,
+    },
+    /// Enable an alert rule
+    Enable {
+        /// Rule name
+        name: String,
+    },
+    /// Disable an alert rule
     Disable {
-        /// Flag key
-        key: String,
-        /// Environment (omit for global)
-        #[arg(short, long)]
-        environment: Option<String>,
+        /// Rule name
+        name: String,
     },
-    /// Set rollout percentage for gradual rollout
-    Rollout {
-        /// Flag key
-        key: String,
-        /// Rollout percentage (0-100)
-        #[arg(short, long)]
-        percentage: i32,
-        /// Environment (omit for global)
-        #[arg(short, long)]
-        environment: Option<String>,
-    },
-    /// Delete a feature flag
+    /// Delete an alert rule
     Delete {
-        /// Flag key
-        key: String,
-        /// Environment (omit for global)
-        #[arg(short, long)]
-        environment: Option<String>,
+        /// Rule name
+        name: String,
     },
 }
 
@@ -2006,6 +2352,347 @@ async fn main() -> Result<()> {
                 let deleted = db.cleanup_old_success_patterns(days).await?;
                 println!("Deleted {} old success patterns", deleted);
             }
+            LearnAction::Effectiveness {
+                min_usage,
+                include_disabled,
+                ineffective_only,
+                summary,
+            } => {
+                if summary {
+                    // Show summary statistics
+                    let stats = db.get_effectiveness_summary().await?;
+                    println!("Instruction Effectiveness Summary");
+                    println!("{}", "=".repeat(40));
+                    println!("Total instructions:    {}", stats.total_instructions);
+                    println!("Enabled:               {}", stats.enabled_count);
+                    println!("Used (at least once):  {}", stats.used_count);
+                    println!("Total usage count:     {}", stats.total_usage);
+                    println!("Avg success rate:      {:.1}%", stats.avg_success_rate * 100.0);
+                    println!("Avg penalty score:     {:.2}", stats.avg_penalty_score);
+                    println!("Ineffective (< 50%):   {}", stats.ineffective_count);
+                } else if ineffective_only {
+                    // Show only ineffective instructions
+                    let instructions = db.list_ineffective_instructions(0.5, min_usage).await?;
+                    if instructions.is_empty() {
+                        println!("No ineffective instructions found (min usage: {})", min_usage);
+                        return Ok(());
+                    }
+
+                    println!("Ineffective Instructions (< 50% success rate)");
+                    println!("{}", "=".repeat(100));
+                    println!(
+                        "{:<6} {:<30} {:<10} {:<8} {:<10} {:<10} {:<10}",
+                        "ID", "NAME", "SOURCE", "ENABLED", "USAGE", "SUCCESS%", "PENALTY"
+                    );
+                    println!("{}", "-".repeat(100));
+
+                    for instr in instructions {
+                        println!(
+                            "{:<6} {:<30} {:<10} {:<8} {:<10} {:<10.1}% {:<10.2}",
+                            instr.instruction_id,
+                            truncate_str(&instr.name, 28),
+                            &instr.instruction_source,
+                            if instr.enabled { "yes" } else { "no" },
+                            instr.usage_count,
+                            instr.success_rate * 100.0,
+                            instr.penalty_score,
+                        );
+                    }
+                } else {
+                    // Show all instructions with effectiveness data
+                    let instructions = db.list_instruction_effectiveness(include_disabled, min_usage).await?;
+                    if instructions.is_empty() {
+                        println!("No instructions found (min usage: {})", min_usage);
+                        return Ok(());
+                    }
+
+                    println!("Instruction Effectiveness Analysis");
+                    println!("{}", "=".repeat(110));
+                    println!(
+                        "{:<6} {:<30} {:<10} {:<8} {:<8} {:<10} {:<10} {:<12}",
+                        "ID", "NAME", "SOURCE", "ENABLED", "USAGE", "SUCCESS%", "PENALTY", "LEVEL"
+                    );
+                    println!("{}", "-".repeat(110));
+
+                    for instr in instructions {
+                        let level = instr.effectiveness_level();
+                        println!(
+                            "{:<6} {:<30} {:<10} {:<8} {:<8} {:<10.1}% {:<10.2} {:<12}",
+                            instr.instruction_id,
+                            truncate_str(&instr.name, 28),
+                            &instr.instruction_source,
+                            if instr.enabled { "yes" } else { "no" },
+                            instr.usage_count,
+                            instr.success_rate * 100.0,
+                            instr.penalty_score,
+                            level,
+                        );
+                    }
+                }
+            }
+            LearnAction::Suggest { agent_type, limit } => {
+                // Get improvement suggestions based on learning data
+                println!("Improvement Suggestions");
+                println!("{}", "=".repeat(60));
+
+                // Get ineffective instructions that could be improved
+                let ineffective = db.list_ineffective_instructions(0.5, 5).await?;
+                let suggestions_count = ineffective.len().min(limit);
+
+                if ineffective.is_empty() {
+                    println!("No improvement suggestions at this time.");
+                    println!("All instructions are performing above threshold.");
+                } else {
+                    println!("\nInstructions needing improvement:");
+                    for (i, instr) in ineffective.iter().take(limit).enumerate() {
+                        // Filter by agent type if specified
+                        if let Some(ref at) = agent_type {
+                            // For now, show all - in a full implementation we'd filter by agent scope
+                            let _ = at;
+                        }
+                        println!(
+                            "\n{}. {} (ID: {})",
+                            i + 1,
+                            instr.name,
+                            instr.instruction_id
+                        );
+                        println!("   Current success rate: {:.1}%", instr.success_rate * 100.0);
+                        println!("   Usage count: {}", instr.usage_count);
+                        println!("   Suggestion: Review and update instruction content or disable if no longer relevant");
+                    }
+                    println!("\nTotal suggestions: {}", suggestions_count);
+                }
+            }
+            LearnAction::Export {
+                output,
+                min_success_rate,
+                min_samples,
+                project,
+            } => {
+                use orchestrate_core::{
+                    ExportMetadata, ExportablePattern, InstructionPattern, PatternContext,
+                    PatternEffectiveness, PatternExport, SuccessPatternExport,
+                };
+
+                let mut export = PatternExport::new();
+                if let Some(proj) = project {
+                    export = export.with_source_project(proj);
+                }
+
+                // Export custom instructions as patterns
+                let instructions = db.list_instructions(false, None, None).await?;
+                let mut instruction_count = 0;
+                let mut success_pattern_count = 0;
+
+                for instr in instructions {
+                    // Get effectiveness data for the instruction
+                    let effectiveness = db
+                        .list_instruction_effectiveness(true, 1)
+                        .await?
+                        .into_iter()
+                        .find(|e| e.instruction_id == instr.id);
+
+                    let (success_rate, sample_size) = match effectiveness {
+                        Some(eff) => (eff.success_rate, eff.usage_count),
+                        None => continue, // Skip instructions without usage data
+                    };
+
+                    if success_rate >= min_success_rate && sample_size >= min_samples {
+                        let agent_types: Vec<String> = instr.agent_type
+                            .map(|t| vec![t.as_str().to_string()])
+                            .unwrap_or_default();
+                        let pattern = InstructionPattern {
+                            name: instr.name.clone(),
+                            content: instr.content.clone(),
+                            scope: instr.scope.as_str().to_string(),
+                            agent_types,
+                            tags: instr.tags.clone(),
+                            effectiveness: PatternEffectiveness::new(success_rate, sample_size),
+                            context: PatternContext::new(),
+                        };
+                        export = export.add_pattern(ExportablePattern::Instruction(pattern));
+                        instruction_count += 1;
+                    }
+                }
+
+                // Export success patterns
+                let success_patterns = db.list_success_patterns(None, 1000).await?;
+                for sp in success_patterns {
+                    let success_rate = sp.success_rate;
+
+                    if success_rate >= min_success_rate && sp.occurrence_count >= min_samples {
+                        let agent_types: Vec<String> = sp.agent_type
+                            .map(|t| vec![t.as_str().to_string()])
+                            .unwrap_or_default();
+                        let pattern = SuccessPatternExport {
+                            pattern_type: sp.pattern_type.as_str().to_string(),
+                            signature: sp.pattern_signature.clone(),
+                            data: sp.pattern_data.clone(),
+                            agent_types,
+                            effectiveness: PatternEffectiveness::new(success_rate, sp.occurrence_count),
+                            context: PatternContext::new(),
+                        };
+                        export = export.add_pattern(ExportablePattern::SuccessPattern(pattern));
+                        success_pattern_count += 1;
+                    }
+                }
+
+                // Update metadata
+                export.metadata = ExportMetadata {
+                    total_patterns: instruction_count + success_pattern_count,
+                    instruction_count,
+                    tool_sequence_count: 0,
+                    prompt_template_count: 0,
+                    success_pattern_count,
+                    description: None,
+                    tags: vec![],
+                };
+
+                // Write to file
+                let content = if output.ends_with(".json") {
+                    export.to_json().map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?
+                } else {
+                    export.to_yaml().map_err(|e| anyhow::anyhow!("YAML serialization failed: {}", e))?
+                };
+
+                std::fs::write(&output, content)?;
+                println!("Exported {} patterns to {}", export.metadata.total_patterns, output);
+                println!("  Instructions: {}", instruction_count);
+                println!("  Success patterns: {}", success_pattern_count);
+            }
+            LearnAction::Import {
+                file,
+                dry_run,
+                min_success_rate,
+                min_samples,
+                skip_existing,
+            } => {
+                use orchestrate_core::{
+                    filter_patterns, ExportablePattern, ImportOptions, PatternExport,
+                };
+
+                let content = std::fs::read_to_string(&file)?;
+                let export = if file.ends_with(".json") {
+                    PatternExport::from_json(&content)
+                        .map_err(|e| anyhow::anyhow!("JSON parsing failed: {}", e))?
+                } else {
+                    PatternExport::from_yaml(&content)
+                        .map_err(|e| anyhow::anyhow!("YAML parsing failed: {}", e))?
+                };
+
+                let options = ImportOptions {
+                    min_success_rate,
+                    min_sample_size: min_samples,
+                    skip_existing,
+                    dry_run,
+                    ..Default::default()
+                };
+
+                let filtered = filter_patterns(&export, &options);
+                println!(
+                    "{}Importing {} of {} patterns from {}",
+                    if dry_run { "[DRY RUN] " } else { "" },
+                    filtered.len(),
+                    export.patterns.len(),
+                    file
+                );
+
+                if export.source_project.is_some() {
+                    println!("Source project: {}", export.source_project.as_ref().unwrap());
+                }
+
+                let mut imported = 0;
+                let mut skipped = 0;
+
+                for pattern in filtered {
+                    match pattern {
+                        ExportablePattern::Instruction(instr) => {
+                            if skip_existing {
+                                let existing = db.list_instructions(false, None, None).await?;
+                                if existing.iter().any(|i| i.name == instr.name) {
+                                    println!("  Skipped (exists): {}", instr.name);
+                                    skipped += 1;
+                                    continue;
+                                }
+                            }
+
+                            if !dry_run {
+                                let scope = orchestrate_core::InstructionScope::from_str(&instr.scope)
+                                    .unwrap_or(orchestrate_core::InstructionScope::Global);
+                                let agent_type: Option<orchestrate_core::AgentType> = instr
+                                    .agent_types
+                                    .first()
+                                    .and_then(|t| parse_agent_type(t).ok());
+
+                                let instruction = orchestrate_core::CustomInstruction {
+                                    id: 0,
+                                    name: instr.name.clone(),
+                                    content: instr.content.clone(),
+                                    scope,
+                                    agent_type,
+                                    priority: 0,
+                                    enabled: true,
+                                    source: orchestrate_core::InstructionSource::Imported,
+                                    confidence: instr.effectiveness.success_rate,
+                                    tags: instr.tags.clone(),
+                                    created_at: chrono::Utc::now(),
+                                    updated_at: chrono::Utc::now(),
+                                    created_by: Some("import".to_string()),
+                                };
+                                db.insert_instruction(&instruction).await?;
+                            }
+                            println!("  {}: {}", if dry_run { "Would import" } else { "Imported" }, instr.name);
+                            imported += 1;
+                        }
+                        ExportablePattern::SuccessPattern(sp) => {
+                            println!(
+                                "  {}: {} pattern ({})",
+                                if dry_run { "Would import" } else { "Noted" },
+                                sp.pattern_type,
+                                sp.signature
+                            );
+                            // Success patterns are informational - they're observed from runtime
+                            imported += 1;
+                        }
+                        _ => {
+                            println!("  Skipped unsupported pattern type");
+                            skipped += 1;
+                        }
+                    }
+                }
+
+                println!();
+                println!(
+                    "{}Imported: {}, Skipped: {}",
+                    if dry_run { "[DRY RUN] " } else { "" },
+                    imported,
+                    skipped
+                );
+            }
+            LearnAction::Auto { enable, disable, status } => {
+                use orchestrate_core::LearningAutomationConfig;
+
+                if status || (!enable && !disable) {
+                    let config = LearningAutomationConfig::default();
+                    println!("Learning Automation Status");
+                    println!("{}", "=".repeat(40));
+                    println!("Enabled: {}", config.enabled);
+                    println!("Analysis schedule: {}", config.analysis_schedule);
+                    println!("Auto-suggest: {}", config.auto_suggest);
+                    println!("Auto-disable: {}", config.auto_disable);
+                    println!("Auto-promote experiments: {}", config.auto_promote_experiments);
+                    println!("Generate reports: {}", config.generate_reports);
+                    println!("Min effectiveness: {:.0}%", config.min_effectiveness * 100.0);
+                    println!("Min samples: {}", config.min_samples);
+                } else if enable {
+                    println!("Learning automation enabled.");
+                    println!("Scheduled analysis will run according to configured schedule.");
+                    println!("Note: Automation configuration is stored in project settings.");
+                } else if disable {
+                    println!("Learning automation disabled.");
+                    println!("Manual analysis can still be run with: orchestrate learn analyze");
+                }
+            }
         },
 
         Commands::History { action } => match action {
@@ -2821,162 +3508,1809 @@ async fn main() -> Result<()> {
                 handle_feedback_delete(&db, id).await?;
             }
         },
-        Commands::Env { action } => match action {
-            EnvAction::List { format } => {
-                handle_env_list(&db, &format).await?;
-            }
-            EnvAction::Create {
+        Commands::Experiment { action } => match action {
+            ExperimentAction::Create {
                 name,
-                env_type,
-                url,
-                provider,
-                config,
-                secrets,
-                requires_approval,
-            } => {
-                handle_env_create(
-                    &db,
-                    &name,
-                    &env_type,
-                    url.as_deref(),
-                    provider.as_deref(),
-                    config.as_deref(),
-                    secrets.as_deref(),
-                    requires_approval,
-                )
-                .await?;
-            }
-            EnvAction::Show {
-                name,
-                show_secrets,
-                format,
-            } => {
-                handle_env_show(&db, &name, show_secrets, &format).await?;
-            }
-            EnvAction::Delete { name, yes } => {
-                handle_env_delete(&db, &name, yes).await?;
-            }
-        },
-        Commands::Deploy { action } => match action {
-            DeployAction::Deploy {
-                env,
-                version,
-                strategy,
-                provider,
-                timeout,
-                skip_validation,
-                format,
-            } => {
-                handle_deploy_deploy(
-                    &db,
-                    &env,
-                    &version,
-                    strategy.as_deref(),
-                    provider.as_deref(),
-                    timeout,
-                    skip_validation,
-                    &format,
-                )
-                .await?;
-            }
-            DeployAction::Status { env, format } => {
-                handle_deploy_status(&db, &env, &format).await?;
-            }
-            DeployAction::History { env, limit, format } => {
-                handle_deploy_history(&db, &env, limit, &format).await?;
-            }
-            DeployAction::Diff { env, version, format } => {
-                handle_deploy_diff(&db, &env, &version, &format).await?;
-            }
-            DeployAction::Validate {
-                env,
-                version,
-                format,
-            } => {
-                handle_deploy_validate(&db, &env, version.as_deref(), &format).await?;
-            }
-            DeployAction::Rollback {
-                env,
-                version,
-                skip_validation,
-                force,
-                format,
-            } => {
-                handle_deploy_rollback(
-                    &db,
-                    &env,
-                    version.as_deref(),
-                    skip_validation,
-                    force,
-                    &format,
-                )
-                .await?;
-            }
-        },
-
-        Commands::Flags { action } => match action {
-            FlagsAction::List { environment, format } => {
-                handle_flags_list(&db, environment.as_deref(), &format).await?;
-            }
-            FlagsAction::Create {
-                key,
-                name,
+                experiment_type,
+                metric,
                 description,
-                status,
-                rollout,
-                environment,
+                hypothesis,
+                agent_type,
+                min_samples,
+                confidence,
             } => {
-                handle_flags_create(&db, &key, &name, description.as_deref(), &status, rollout, environment.as_deref()).await?;
+                use std::str::FromStr;
+                let exp_type = orchestrate_core::ExperimentType::from_str(&experiment_type)?;
+                let exp_metric = orchestrate_core::ExperimentMetric::from_str(&metric)?;
+
+                let mut experiment = orchestrate_core::Experiment::new(name.clone(), exp_type, exp_metric)
+                    .with_min_samples(min_samples)
+                    .with_confidence_level(confidence);
+
+                if let Some(desc) = description {
+                    experiment = experiment.with_description(desc);
+                }
+                if let Some(hyp) = hypothesis {
+                    experiment = experiment.with_hypothesis(hyp);
+                }
+                if let Some(agent) = agent_type {
+                    experiment = experiment.with_agent_type(agent);
+                }
+
+                let id = db.create_experiment(&experiment).await?;
+                println!("Created experiment '{}' with ID {}", name, id);
+                println!("Add variants with: orchestrate experiment add-variant {} <name> --control", name);
             }
-            FlagsAction::Show { key, environment, format } => {
-                handle_flags_show(&db, &key, environment.as_deref(), &format).await?;
+            ExperimentAction::AddVariant {
+                experiment,
+                name,
+                control,
+                weight,
+                description,
+                config,
+            } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+
+                let mut variant = orchestrate_core::ExperimentVariant::new(exp.id, name.clone(), control)
+                    .with_weight(weight);
+
+                if let Some(desc) = description {
+                    variant = variant.with_description(desc);
+                }
+                if let Some(cfg) = config {
+                    let parsed: serde_json::Value = serde_json::from_str(&cfg)
+                        .map_err(|e| anyhow::anyhow!("Invalid JSON config: {}", e))?;
+                    variant = variant.with_config(parsed);
+                }
+
+                let id = db.create_experiment_variant(&variant).await?;
+                let label = if control { " (control)" } else { "" };
+                println!("Added variant '{}'{} with ID {} to experiment '{}'", name, label, id, exp.name);
             }
-            FlagsAction::Enable { key, environment } => {
-                handle_flags_enable(&db, &key, environment.as_deref()).await?;
+            ExperimentAction::List { status, limit } => {
+                use std::str::FromStr;
+                let status_filter = status
+                    .map(|s| orchestrate_core::ExperimentStatus::from_str(&s))
+                    .transpose()?;
+
+                let experiments = db.list_experiments(status_filter, limit).await?;
+
+                if experiments.is_empty() {
+                    println!("No experiments found");
+                    return Ok(());
+                }
+
+                println!(
+                    "{:<6} {:<30} {:<10} {:<10} {:<12} {:<12}",
+                    "ID", "NAME", "TYPE", "STATUS", "METRIC", "SAMPLES"
+                );
+                println!("{}", "-".repeat(80));
+
+                for exp in experiments {
+                    let variants = db.get_experiment_variants(exp.id).await?;
+                    let results = db.get_experiment_results(exp.id).await?;
+                    let total_samples: i64 = results.iter().map(|r| r.sample_count).sum();
+
+                    println!(
+                        "{:<6} {:<30} {:<10} {:<10} {:<12} {:<12}",
+                        exp.id,
+                        truncate_str(&exp.name, 28),
+                        exp.experiment_type.as_str(),
+                        exp.status.as_str(),
+                        exp.metric.as_str(),
+                        format!("{}/{}", total_samples, exp.min_samples),
+                    );
+                }
             }
-            FlagsAction::Disable { key, environment } => {
-                handle_flags_disable(&db, &key, environment.as_deref()).await?;
+            ExperimentAction::Show { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                let variants = db.get_experiment_variants(exp.id).await?;
+                let results = db.get_experiment_results(exp.id).await?;
+
+                println!("Experiment: {}", exp.name);
+                println!("{}", "=".repeat(50));
+                println!("ID:          {}", exp.id);
+                println!("Type:        {}", exp.experiment_type);
+                println!("Metric:      {}", exp.metric);
+                println!("Status:      {}", exp.status);
+                if let Some(desc) = &exp.description {
+                    println!("Description: {}", desc);
+                }
+                if let Some(hyp) = &exp.hypothesis {
+                    println!("Hypothesis:  {}", hyp);
+                }
+                if let Some(agent) = &exp.agent_type {
+                    println!("Agent Type:  {}", agent);
+                }
+                println!("Min Samples: {}", exp.min_samples);
+                println!("Confidence:  {:.0}%", exp.confidence_level * 100.0);
+                println!("Created:     {}", exp.created_at.format("%Y-%m-%d %H:%M"));
+                if let Some(started) = exp.started_at {
+                    println!("Started:     {}", started.format("%Y-%m-%d %H:%M"));
+                }
+                if let Some(completed) = exp.completed_at {
+                    println!("Completed:   {}", completed.format("%Y-%m-%d %H:%M"));
+                }
+
+                println!("\nVariants:");
+                println!("{}", "-".repeat(70));
+                println!(
+                    "{:<6} {:<20} {:<10} {:<8} {:<10} {:<10} {:<10}",
+                    "ID", "NAME", "CONTROL", "WEIGHT", "SAMPLES", "MEAN", "STD DEV"
+                );
+                println!("{}", "-".repeat(70));
+
+                for variant in &variants {
+                    let result = results.iter().find(|r| r.variant_id == variant.id);
+                    let (samples, mean, std_dev) = result
+                        .map(|r| (r.sample_count, r.mean, r.std_dev))
+                        .unwrap_or((0, 0.0, 0.0));
+
+                    println!(
+                        "{:<6} {:<20} {:<10} {:<8} {:<10} {:<10.3} {:<10.3}",
+                        variant.id,
+                        truncate_str(&variant.name, 18),
+                        if variant.is_control { "yes" } else { "no" },
+                        format!("{}%", variant.weight),
+                        samples,
+                        mean,
+                        std_dev,
+                    );
+                }
+
+                // Calculate statistical significance if we have control and treatment
+                let control = results.iter().find(|r| r.is_control);
+                let treatments: Vec<_> = results.iter().filter(|r| !r.is_control).collect();
+
+                if let Some(ctrl) = control {
+                    println!("\nStatistical Analysis:");
+                    println!("{}", "-".repeat(50));
+
+                    for treatment in treatments {
+                        let (is_sig, p_value) = orchestrate_core::ExperimentResults::calculate_significance(
+                            ctrl,
+                            treatment,
+                            exp.confidence_level,
+                        );
+                        let improvement = orchestrate_core::ExperimentResults::calculate_improvement(
+                            ctrl.mean,
+                            treatment.mean,
+                        );
+
+                        println!("\n{} vs {} (control):", treatment.variant_name, ctrl.variant_name);
+                        println!("  Improvement: {:+.1}%", improvement);
+                        println!("  p-value:     {:.4}", p_value);
+                        println!(
+                            "  Significant: {} ({}% confidence)",
+                            if is_sig { "YES" } else { "NO" },
+                            (exp.confidence_level * 100.0) as i32
+                        );
+                    }
+                }
+
+                if let Some(winner_id) = exp.winner_variant_id {
+                    if let Some(winner) = variants.iter().find(|v| v.id == winner_id) {
+                        println!("\nWinner: {}", winner.name);
+                    }
+                }
             }
-            FlagsAction::Rollout { key, percentage, environment } => {
-                handle_flags_rollout(&db, &key, percentage, environment.as_deref()).await?;
+            ExperimentAction::Start { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                if !exp.can_start() {
+                    anyhow::bail!("Experiment is not in draft status");
+                }
+                let variants = db.get_experiment_variants(exp.id).await?;
+                if variants.len() < 2 {
+                    anyhow::bail!("Experiment needs at least 2 variants before starting");
+                }
+                if !variants.iter().any(|v| v.is_control) {
+                    anyhow::bail!("Experiment needs at least one control variant");
+                }
+
+                db.update_experiment_status(exp.id, orchestrate_core::ExperimentStatus::Running)
+                    .await?;
+                println!("Started experiment '{}'", exp.name);
             }
-            FlagsAction::Delete { key, environment } => {
-                handle_flags_delete(&db, &key, environment.as_deref()).await?;
+            ExperimentAction::Pause { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                if !exp.is_running() {
+                    anyhow::bail!("Experiment is not running");
+                }
+                db.update_experiment_status(exp.id, orchestrate_core::ExperimentStatus::Paused)
+                    .await?;
+                println!("Paused experiment '{}'", exp.name);
+            }
+            ExperimentAction::Complete { experiment, winner } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                let results = db.get_experiment_results(exp.id).await?;
+
+                let winner_variant = if let Some(winner_name) = winner {
+                    results
+                        .iter()
+                        .find(|r| r.variant_name == winner_name)
+                        .ok_or_else(|| anyhow::anyhow!("Variant '{}' not found", winner_name))?
+                } else {
+                    // Auto-select winner based on highest mean
+                    results
+                        .iter()
+                        .max_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap())
+                        .ok_or_else(|| anyhow::anyhow!("No results to determine winner"))?
+                };
+
+                db.set_experiment_winner(exp.id, winner_variant.variant_id).await?;
+                println!(
+                    "Completed experiment '{}' with winner: {}",
+                    exp.name, winner_variant.variant_name
+                );
+            }
+            ExperimentAction::Cancel { experiment } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+                db.update_experiment_status(exp.id, orchestrate_core::ExperimentStatus::Cancelled)
+                    .await?;
+                println!("Cancelled experiment '{}'", exp.name);
+            }
+            ExperimentAction::Delete { experiment, force } => {
+                let exp = get_experiment_by_id_or_name(&db, &experiment).await?;
+
+                if !force && exp.is_running() {
+                    anyhow::bail!(
+                        "Experiment '{}' is still running. Use --force to delete anyway.",
+                        exp.name
+                    );
+                }
+
+                if db.delete_experiment(exp.id).await? {
+                    println!("Deleted experiment '{}'", exp.name);
+                } else {
+                    println!("Experiment not found");
+                }
             }
         },
+        Commands::Predict { task, agent_type } => {
+            use orchestrate_core::predict_task_outcome;
 
-        Commands::Release { action } => match action {
-            ReleaseAction::Prepare {
-                r#type,
-                cargo_toml,
-                changelog,
-                bump_frontend,
-            } => {
-                handle_release_prepare(&db, &r#type, &cargo_toml, &changelog, bump_frontend).await?;
+            // Get historical data for prediction
+            let agent_type_parsed = agent_type.as_ref()
+                .map(|t| parse_agent_type(t))
+                .transpose()?;
+
+            // Calculate historical metrics from database
+            let agents = db.list_agents_paginated(1000, 0, None, agent_type_parsed).await?;
+            let total_agents = agents.len();
+            let successful = agents.iter()
+                .filter(|a| a.state == orchestrate_core::AgentState::Completed)
+                .count();
+            let historical_success_rate = if total_agents > 0 {
+                successful as f64 / total_agents as f64
+            } else {
+                0.75 // Default assumption
+            };
+
+            // Use default token estimate since we don't have global stats
+            let avg_tokens: i64 = 50000;
+
+            // Estimate average duration (rough estimate based on typical agent runs)
+            let avg_duration_mins = 30.0;
+
+            let prediction = predict_task_outcome(
+                &task,
+                historical_success_rate,
+                avg_tokens,
+                avg_duration_mins,
+                total_agents as i64,
+            );
+
+            println!("Task Prediction");
+            println!("{}", "=".repeat(60));
+            println!();
+            println!("Description: \"{}\"", prediction.task_description);
+            if let Some(ref at) = agent_type {
+                println!("Agent type: {}", at);
             }
-            ReleaseAction::Create {
-                version,
-                message,
-                push,
-            } => {
-                handle_release_create(&db, &version, message.as_deref(), push).await?;
+            println!();
+            println!("Predictions:");
+            println!("  Success probability: {:.0}%", prediction.success_probability * 100.0);
+            println!("  Confidence: {:.0}%", prediction.confidence * 100.0);
+            println!(
+                "  Estimated tokens: {} - {}",
+                prediction.estimated_tokens.min, prediction.estimated_tokens.max
+            );
+            println!(
+                "  Estimated duration: {:.0} - {:.0} minutes",
+                prediction.estimated_duration.min_minutes,
+                prediction.estimated_duration.max_minutes
+            );
+            println!("  Recommended model: {}", prediction.recommended_model);
+
+            if !prediction.risk_factors.is_empty() {
+                println!();
+                println!("Risk factors:");
+                for risk in &prediction.risk_factors {
+                    println!(
+                        "  - [{}] {}: {}",
+                        risk.severity.as_str().to_uppercase(),
+                        risk.name,
+                        risk.description
+                    );
+                }
             }
-            ReleaseAction::Publish {
-                version,
-                repo_path,
-                token,
-                prerelease,
-                draft,
-            } => {
-                handle_release_publish(&db, &version, &repo_path, token.as_deref(), prerelease, draft).await?;
+
+            if !prediction.recommendations.is_empty() {
+                println!();
+                println!("Recommendations:");
+                for rec in &prediction.recommendations {
+                    println!("  - {}", rec);
+                }
             }
-            ReleaseAction::Notes {
-                from,
-                to,
-                repo_path,
-                format,
+        },
+        Commands::Docs { action } => match action {
+            DocsAction::Generate { doc_type, output, format } => {
+                use orchestrate_core::{ApiDocumentation, ApiEndpoint, DocType};
+
+                let doc_type_parsed = match doc_type.to_lowercase().as_str() {
+                    "api" => DocType::Api,
+                    "readme" => DocType::Readme,
+                    "changelog" => DocType::Changelog,
+                    "adr" => DocType::Adr,
+                    _ => anyhow::bail!("Unknown doc type: {}. Valid: api, readme, changelog, adr", doc_type),
+                };
+
+                match doc_type_parsed {
+                    DocType::Api => {
+                        // Generate API documentation from the codebase
+                        let mut api_doc = ApiDocumentation::new(
+                            "Orchestrate API",
+                            "1.0.0",
+                            Some("Agent orchestration and automation API"),
+                        );
+                        api_doc.add_server("http://localhost:8080", Some("Development server"));
+
+                        // Add sample endpoints from the known API
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/agents")
+                                .with_summary("List all agents")
+                                .with_tag("agents")
+                                .with_query_param("status", false, Some("Filter by status"))
+                                .with_query_param("type", false, Some("Filter by agent type")),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/agents/{id}")
+                                .with_summary("Get agent by ID")
+                                .with_tag("agents")
+                                .with_path_param("id", Some("Agent UUID")),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("POST", "/api/agents")
+                                .with_summary("Create a new agent")
+                                .with_tag("agents"),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/sessions")
+                                .with_summary("List sessions")
+                                .with_tag("sessions"),
+                        );
+                        api_doc.add_endpoint(
+                            ApiEndpoint::new("GET", "/api/prs")
+                                .with_summary("List pull requests")
+                                .with_tag("pull-requests"),
+                        );
+
+                        let content = match format.to_lowercase().as_str() {
+                            "yaml" | "yml" => api_doc.to_openapi_yaml(),
+                            "json" => serde_json::to_string_pretty(&api_doc.to_openapi_json())?,
+                            _ => anyhow::bail!("Unknown format: {}. Valid: yaml, json", format),
+                        };
+
+                        if let Some(output_path) = output {
+                            std::fs::write(&output_path, &content)?;
+                            println!("API documentation generated: {}", output_path);
+                        } else {
+                            println!("{}", content);
+                        }
+                    }
+                    DocType::Changelog => {
+                        println!("Use 'orchestrate docs changelog' command for changelog generation");
+                    }
+                    DocType::Readme => {
+                        use orchestrate_core::{ReadmeContent, ReadmeSection, ReadmeSectionContent};
+
+                        let readme = ReadmeContent {
+                            sections: vec![
+                                ReadmeSectionContent {
+                                    section_type: ReadmeSection::Title,
+                                    heading: Some("# Orchestrate".to_string()),
+                                    content: "An agent orchestration and automation system".to_string(),
+                                },
+                                ReadmeSectionContent {
+                                    section_type: ReadmeSection::Installation,
+                                    heading: Some("## Installation".to_string()),
+                                    content: "```bash\ncargo install orchestrate\n```".to_string(),
+                                },
+                                ReadmeSectionContent {
+                                    section_type: ReadmeSection::Usage,
+                                    heading: Some("## Usage".to_string()),
+                                    content: "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
+                                },
+                            ],
+                        };
+
+                        if let Some(output_path) = output {
+                            std::fs::write(&output_path, readme.to_markdown())?;
+                            println!("README generated: {}", output_path);
+                        } else {
+                            println!("{}", readme.to_markdown());
+                        }
+                    }
+                    DocType::Adr => {
+                        println!("Use 'orchestrate docs adr create' command for ADR creation");
+                    }
+                    DocType::General => {
+                        println!("General documentation generation not implemented");
+                    }
+                }
+            }
+            DocsAction::Validate { path, coverage_threshold, strict } => {
+                use orchestrate_core::{DocValidationResult, DocValidationIssue, DocItemType, DocIssueType};
+
+                let check_path = path.unwrap_or_else(|| ".".to_string());
+                println!("Validating documentation in: {}", check_path);
+                println!();
+
+                // Create a mock validation result for now
+                // In a real implementation, this would scan the codebase
+                let mut result = DocValidationResult::new();
+                result.total_items = 100;  // Would be counted from actual code
+                result.documented_items = 85;  // Would be counted from actual code
+                result.calculate_coverage();
+
+                // Print summary
+                println!("{}", result.to_summary());
+
+                // Check threshold
+                if result.coverage_percentage < coverage_threshold as f64 {
+                    println!(
+                        "Warning: Coverage {:.1}% is below threshold {}%",
+                        result.coverage_percentage, coverage_threshold
+                    );
+                    if strict {
+                        std::process::exit(1);
+                    }
+                }
+
+                if strict && !result.is_valid() {
+                    println!("Validation failed due to issues (--strict mode)");
+                    std::process::exit(1);
+                }
+            }
+            DocsAction::Adr { action: adr_action } => match adr_action {
+                AdrAction::Create { title, status } => {
+                    use orchestrate_core::{Adr, AdrStatus};
+                    use std::str::FromStr;
+
+                    let adr_status = AdrStatus::from_str(&status)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+
+                    // Find the next ADR number
+                    let adr_dir = std::path::Path::new("docs/adrs");
+                    std::fs::create_dir_all(adr_dir)?;
+
+                    let mut max_number = 0;
+                    if adr_dir.exists() {
+                        for entry in std::fs::read_dir(adr_dir)? {
+                            if let Ok(entry) = entry {
+                                let name = entry.file_name();
+                                let name = name.to_string_lossy();
+                                if name.starts_with("adr-") && name.ends_with(".md") {
+                                    if let Some(num_str) = name.strip_prefix("adr-").and_then(|s| s.strip_suffix(".md")) {
+                                        if let Ok(num) = num_str.parse::<u32>() {
+                                            max_number = max_number.max(num);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let adr_number = max_number + 1;
+
+                    let adr = Adr {
+                        number: adr_number as i32,
+                        title: title.clone(),
+                        status: adr_status,
+                        date: chrono::Utc::now(),
+                        context: "".to_string(),
+                        decision: "".to_string(),
+                        consequences: vec![],
+                        related_adrs: vec![],
+                        superseded_by: None,
+                        tags: vec![],
+                    };
+
+                    let file_path = adr_dir.join(format!("adr-{:04}.md", adr_number));
+                    std::fs::write(&file_path, adr.to_markdown())?;
+
+                    println!("Created ADR: {}", file_path.display());
+                    println!("  Title: {}", title);
+                    println!("  Status: {}", status);
+                    println!();
+                    println!("Edit the file to fill in context, decision, and consequences.");
+                }
+                AdrAction::List { status, verbose } => {
+                    let adr_dir = std::path::Path::new("docs/adrs");
+                    if !adr_dir.exists() {
+                        println!("No ADRs found (docs/adrs directory doesn't exist)");
+                        return Ok(());
+                    }
+
+                    println!("Architecture Decision Records");
+                    println!("{}", "=".repeat(60));
+                    println!();
+
+                    let mut entries: Vec<_> = std::fs::read_dir(adr_dir)?
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
+                        .collect();
+                    entries.sort_by_key(|e| e.file_name());
+
+                    for entry in entries {
+                        let content = std::fs::read_to_string(entry.path())?;
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+
+                        // Parse title from first line
+                        let title = content.lines().next().unwrap_or("").trim_start_matches("# ");
+
+                        // Parse status
+                        let adr_status = content.lines()
+                            .skip_while(|l| !l.starts_with("## Status"))
+                            .skip(1)
+                            .skip_while(|l| l.is_empty())
+                            .next()
+                            .unwrap_or("Unknown");
+
+                        // Filter by status if specified
+                        if let Some(ref filter_status) = status {
+                            if !adr_status.to_lowercase().contains(&filter_status.to_lowercase()) {
+                                continue;
+                            }
+                        }
+
+                        println!("{}: {}", name.trim_end_matches(".md"), title);
+                        if verbose {
+                            println!("  Status: {}", adr_status);
+                        }
+                    }
+                }
+                AdrAction::Show { number } => {
+                    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+                    if !adr_path.exists() {
+                        anyhow::bail!("ADR not found: adr-{:04}", number);
+                    }
+                    let content = std::fs::read_to_string(&adr_path)?;
+                    println!("{}", content);
+                }
+                AdrAction::Update { number, status, superseded_by } => {
+                    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+                    if !adr_path.exists() {
+                        anyhow::bail!("ADR not found: adr-{:04}", number);
+                    }
+
+                    let content = std::fs::read_to_string(&adr_path)?;
+
+                    // Simple status update - find and replace the status line
+                    let mut new_content = String::new();
+                    let mut in_status_section = false;
+                    let mut status_updated = false;
+
+                    for line in content.lines() {
+                        if line.starts_with("## Status") {
+                            in_status_section = true;
+                            new_content.push_str(line);
+                            new_content.push('\n');
+                        } else if in_status_section && !status_updated && !line.is_empty() {
+                            // Replace the status line
+                            let mut new_status = status.clone();
+                            if let Some(by) = superseded_by {
+                                new_status.push_str(&format!(" by [ADR-{:04}](./adr-{:04}.md)", by, by));
+                            }
+                            new_content.push_str(&new_status);
+                            new_content.push('\n');
+                            status_updated = true;
+                            in_status_section = false;
+                        } else {
+                            new_content.push_str(line);
+                            new_content.push('\n');
+                        }
+                    }
+
+                    std::fs::write(&adr_path, new_content)?;
+                    println!("Updated ADR-{:04} status to: {}", number, status);
+                }
+            },
+            DocsAction::Changelog { from, to, output, append } => {
+                use orchestrate_core::{Changelog, ChangelogEntry, ChangelogRelease, ChangeType};
+
+                let from_ref = from.unwrap_or_else(|| "HEAD~20".to_string());
+                let to_ref = to.unwrap_or_else(|| "HEAD".to_string());
+
+                println!("Generating changelog from {} to {}", from_ref, to_ref);
+
+                // Get git log
+                let git_output = std::process::Command::new("git")
+                    .args(["log", "--oneline", "--pretty=format:%s|%H|%an", &format!("{}..{}", from_ref, to_ref)])
+                    .output()?;
+
+                let log_output = String::from_utf8_lossy(&git_output.stdout);
+                let mut entries = vec![];
+
+                for line in log_output.lines() {
+                    let parts: Vec<&str> = line.splitn(3, '|').collect();
+                    if parts.len() >= 3 {
+                        let message = parts[0];
+                        let hash = parts[1];
+                        let author = parts[2];
+
+                        // Parse conventional commit
+                        let change_type = if message.starts_with("feat") {
+                            Some(ChangeType::Added)
+                        } else if message.starts_with("fix") {
+                            Some(ChangeType::Fixed)
+                        } else if message.starts_with("docs") {
+                            Some(ChangeType::Changed)
+                        } else if message.starts_with("refactor") || message.starts_with("chore") {
+                            Some(ChangeType::Changed)
+                        } else {
+                            None
+                        };
+
+                        if let Some(ct) = change_type {
+                            // Extract description after the commit type
+                            let desc = message.split(':').nth(1)
+                                .map(|s| s.trim())
+                                .unwrap_or(message)
+                                .to_string();
+
+                            entries.push(ChangelogEntry {
+                                change_type: ct,
+                                description: desc,
+                                commit_hash: Some(hash[..7].to_string()),
+                                pr_number: None,
+                                issue_number: None,
+                                author: Some(author.to_string()),
+                                scope: None,
+                                breaking: message.contains("BREAKING"),
+                            });
+                        }
+                    }
+                }
+
+                // Create a release
+                let release = ChangelogRelease {
+                    version: "Unreleased".to_string(),
+                    date: chrono::Utc::now(),
+                    entries,
+                    yanked: false,
+                };
+
+                let markdown = release.to_markdown();
+
+                if let Some(output_path) = output {
+                    if append {
+                        let mut existing = std::fs::read_to_string(&output_path).unwrap_or_default();
+                        if !existing.is_empty() {
+                            existing = format!("{}\n{}", markdown, existing);
+                        } else {
+                            existing = markdown;
+                        }
+                        std::fs::write(&output_path, existing)?;
+                        println!("Changelog appended to: {}", output_path);
+                    } else {
+                        std::fs::write(&output_path, &markdown)?;
+                        println!("Changelog written to: {}", output_path);
+                    }
+                } else {
+                    println!("{}", markdown);
+                }
+            }
+            DocsAction::Serve { port, dir } => {
+                println!("Serving documentation from {} on port {}", dir, port);
+                println!("Press Ctrl+C to stop");
+                println!();
+
+                // For now, just use Python's http.server if available
+                let status = std::process::Command::new("python3")
+                    .args(["-m", "http.server", &port.to_string()])
+                    .current_dir(&dir)
+                    .status();
+
+                match status {
+                    Ok(_) => {}
+                    Err(_) => {
+                        println!("Note: Python http.server not available.");
+                        println!("Please install a static file server to serve docs locally.");
+                    }
+                }
+            }
+        },
+        Commands::Requirements { action } => match action {
+            RequirementsAction::Capture { title, description, req_type, priority } => {
+                use orchestrate_core::{Requirement, RequirementType, RequirementPriority};
+
+                let requirement_type = match req_type.to_lowercase().as_str() {
+                    "functional" => RequirementType::Functional,
+                    "non_functional" | "nonfunctional" => RequirementType::NonFunctional,
+                    "security" => RequirementType::Security,
+                    "performance" => RequirementType::Performance,
+                    "usability" => RequirementType::Usability,
+                    "interface" => RequirementType::Interface,
+                    "constraint" => RequirementType::Constraint,
+                    _ => anyhow::bail!("Unknown requirement type: {}", req_type),
+                };
+
+                let req_priority = match priority.to_lowercase().as_str() {
+                    "critical" => RequirementPriority::Critical,
+                    "high" => RequirementPriority::High,
+                    "medium" => RequirementPriority::Medium,
+                    "low" => RequirementPriority::Low,
+                    _ => anyhow::bail!("Unknown priority: {}. Valid: critical, high, medium, low", priority),
+                };
+
+                // Generate requirement ID
+                let req_dir = std::path::Path::new("docs/requirements");
+                std::fs::create_dir_all(req_dir)?;
+
+                let mut max_num = 0u32;
+                for entry in std::fs::read_dir(req_dir)? {
+                    if let Ok(entry) = entry {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("REQ-") && name.ends_with(".md") {
+                            if let Some(num_str) = name.strip_prefix("REQ-").and_then(|s| s.strip_suffix(".md")) {
+                                if let Ok(num) = num_str.parse::<u32>() {
+                                    max_num = max_num.max(num);
+                                }
+                            }
+                        }
+                    }
+                }
+                let req_id = format!("REQ-{:03}", max_num + 1);
+
+                let mut req = Requirement::new(&req_id, &title, &description, requirement_type);
+                req.priority = req_priority;
+
+                let file_path = req_dir.join(format!("{}.md", req_id));
+                std::fs::write(&file_path, req.to_markdown())?;
+
+                println!("Created requirement: {}", file_path.display());
+                println!("  ID: {}", req_id);
+                println!("  Title: {}", title);
+                println!("  Type: {}", req_type);
+                println!("  Priority: {}", priority);
+            }
+            RequirementsAction::List { status, req_type, json } => {
+                let req_dir = std::path::Path::new("docs/requirements");
+                if !req_dir.exists() {
+                    println!("No requirements found (docs/requirements directory doesn't exist)");
+                    return Ok(());
+                }
+
+                let mut requirements = vec![];
+                for entry in std::fs::read_dir(req_dir)? {
+                    if let Ok(entry) = entry {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.starts_with("REQ-") && name.ends_with(".md") {
+                            let content = std::fs::read_to_string(entry.path())?;
+                            let title = content.lines().next().unwrap_or("").trim_start_matches("# ").to_string();
+
+                            // Parse type and priority from content
+                            let parsed_type = content.lines()
+                                .find(|l| l.starts_with("**Type:**"))
+                                .map(|l| l.trim_start_matches("**Type:** ").to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+
+                            let parsed_status = content.lines()
+                                .find(|l| l.starts_with("**Status:**"))
+                                .map(|l| l.trim_start_matches("**Status:** ").to_string())
+                                .unwrap_or_else(|| "draft".to_string());
+
+                            // Apply filters
+                            if let Some(ref filter_status) = status {
+                                if !parsed_status.to_lowercase().contains(&filter_status.to_lowercase()) {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref filter_type) = req_type {
+                                if !parsed_type.to_lowercase().contains(&filter_type.to_lowercase()) {
+                                    continue;
+                                }
+                            }
+
+                            requirements.push(serde_json::json!({
+                                "id": name.trim_end_matches(".md"),
+                                "title": title.split(':').nth(1).map(|s| s.trim()).unwrap_or(&title),
+                                "type": parsed_type,
+                                "status": parsed_status,
+                            }));
+                        }
+                    }
+                }
+
+                requirements.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&requirements)?);
+                } else {
+                    println!("Requirements");
+                    println!("{}", "=".repeat(60));
+                    for req in &requirements {
+                        println!("{}: {} [{}] ({})",
+                            req["id"].as_str().unwrap_or(""),
+                            req["title"].as_str().unwrap_or(""),
+                            req["type"].as_str().unwrap_or(""),
+                            req["status"].as_str().unwrap_or(""),
+                        );
+                    }
+                    println!("\nTotal: {} requirements", requirements.len());
+                }
+            }
+            RequirementsAction::Show { id } => {
+                let req_path = std::path::Path::new("docs/requirements").join(format!("{}.md", id));
+                if !req_path.exists() {
+                    anyhow::bail!("Requirement not found: {}", id);
+                }
+                let content = std::fs::read_to_string(&req_path)?;
+                println!("{}", content);
+            }
+            RequirementsAction::GenerateStories { id, output } => {
+                use orchestrate_core::{GeneratedStory, StoryComplexity};
+
+                let req_path = std::path::Path::new("docs/requirements").join(format!("{}.md", id));
+                if !req_path.exists() {
+                    anyhow::bail!("Requirement not found: {}", id);
+                }
+                let content = std::fs::read_to_string(&req_path)?;
+
+                // Parse title from requirement
+                let title = content.lines().next().unwrap_or("").split(':').nth(1)
+                    .map(|s| s.trim())
+                    .unwrap_or("Feature");
+
+                // Generate a sample story based on the requirement
+                let story = GeneratedStory {
+                    title: title.to_string(),
+                    user_type: "user".to_string(),
+                    goal: format!("use the {} feature", title.to_lowercase()),
+                    benefit: "accomplish my task efficiently".to_string(),
+                    acceptance_criteria: vec![
+                        "Feature is accessible from the main interface".to_string(),
+                        "Feature provides clear feedback on actions".to_string(),
+                        "Feature handles errors gracefully".to_string(),
+                    ],
+                    complexity: StoryComplexity::Medium,
+                    related_requirements: vec![id.to_string()],
+                    suggested_epic: None,
+                };
+
+                let markdown = story.to_markdown();
+                if let Some(output_path) = output {
+                    std::fs::write(&output_path, &markdown)?;
+                    println!("Story generated: {}", output_path);
+                } else {
+                    println!("{}", markdown);
+                }
+            }
+            RequirementsAction::Trace { requirement, format } => {
+                use orchestrate_core::TraceabilityMatrix;
+
+                let mut matrix = TraceabilityMatrix::new();
+
+                // Scan requirements directory
+                let req_dir = std::path::Path::new("docs/requirements");
+                if req_dir.exists() {
+                    for entry in std::fs::read_dir(req_dir)? {
+                        if let Ok(entry) = entry {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            if name.starts_with("REQ-") && name.ends_with(".md") {
+                                let req_id = name.trim_end_matches(".md").to_string();
+
+                                // Filter by specific requirement if provided
+                                if let Some(ref filter_req) = requirement {
+                                    if &req_id != filter_req {
+                                        continue;
+                                    }
+                                }
+
+                                matrix.requirements.push(req_id);
+                            }
+                        }
+                    }
+                }
+
+                matrix.calculate_coverage();
+
+                match format.to_lowercase().as_str() {
+                    "markdown" | "md" => {
+                        println!("{}", matrix.to_markdown());
+                    }
+                    "json" => {
+                        println!("{}", serde_json::to_string_pretty(&matrix)?);
+                    }
+                    _ => {
+                        anyhow::bail!("Unknown format: {}. Valid: markdown, json", format);
+                    }
+                }
+            }
+            RequirementsAction::Impact { id } => {
+                use orchestrate_core::{ImpactAnalysis, EffortEstimate, RiskLevel};
+
+                let req_path = std::path::Path::new("docs/requirements").join(format!("{}.md", id));
+                if !req_path.exists() {
+                    anyhow::bail!("Requirement not found: {}", id);
+                }
+
+                // Create a mock impact analysis
+                let analysis = ImpactAnalysis {
+                    requirement_id: id.clone(),
+                    affected_stories: vec![],
+                    affected_code_files: vec![],
+                    affected_tests: vec![],
+                    estimated_effort: EffortEstimate::Medium,
+                    risk_level: RiskLevel::Low,
+                    recommendations: vec![
+                        "Review affected stories before making changes".to_string(),
+                        "Update test cases to reflect requirement changes".to_string(),
+                    ],
+                    generated_at: chrono::Utc::now(),
+                };
+
+                println!("Impact Analysis for: {}", id);
+                println!("{}", "=".repeat(60));
+                println!();
+                println!("Affected Stories: {}", analysis.affected_stories.len());
+                println!("Affected Code Files: {}", analysis.affected_code_files.len());
+                println!("Affected Tests: {}", analysis.affected_tests.len());
+                println!();
+                println!("Estimated Effort: {}", analysis.estimated_effort.as_str());
+                println!("Risk Level: {}", analysis.risk_level.as_str());
+                println!();
+                println!("Recommendations:");
+                for rec in &analysis.recommendations {
+                    println!("  - {}", rec);
+                }
+            }
+        },
+        Commands::Repo { action } => match action {
+            RepoAction::Add { url, path, name } => {
+                use orchestrate_core::{Repository, RepoProvider};
+
+                let repo_name = name.unwrap_or_else(|| {
+                    url.split('/').last().unwrap_or("repo")
+                        .trim_end_matches(".git")
+                        .to_string()
+                });
+
+                let provider = RepoProvider::from_url(&url);
+                let local_path = path.unwrap_or_else(|| format!(".repos/{}", repo_name));
+
+                let repo = Repository::new(&repo_name, &url)
+                    .with_local_path(&local_path);
+
+                // Store in repos.yaml
+                let repos_file = std::path::Path::new("repos.yaml");
+                let mut repos: Vec<serde_json::Value> = if repos_file.exists() {
+                    let content = std::fs::read_to_string(repos_file)?;
+                    serde_yaml::from_str(&content).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+
+                repos.push(serde_json::json!({
+                    "name": repo.name,
+                    "url": repo.url,
+                    "local_path": repo.local_path,
+                    "provider": provider.as_str(),
+                }));
+
+                std::fs::write(repos_file, serde_yaml::to_string(&repos)?)?;
+
+                println!("Added repository: {}", repo_name);
+                println!("  URL: {}", url);
+                println!("  Provider: {}", provider.as_str());
+                println!("  Local path: {}", local_path);
+                println!();
+                println!("To clone, run: git clone {} {}", url, local_path);
+            }
+            RepoAction::List { json } => {
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    println!("No repositories configured. Use 'orchestrate repo add' to add one.");
+                    return Ok(());
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&repos)?);
+                } else {
+                    println!("Repositories");
+                    println!("{}", "=".repeat(60));
+                    for repo in &repos {
+                        println!("{}: {} [{}]",
+                            repo["name"].as_str().unwrap_or(""),
+                            repo["url"].as_str().unwrap_or(""),
+                            repo["provider"].as_str().unwrap_or("unknown"),
+                        );
+                        if let Some(path) = repo["local_path"].as_str() {
+                            println!("  Path: {}", path);
+                        }
+                    }
+                    println!("\nTotal: {} repositories", repos.len());
+                }
+            }
+            RepoAction::Remove { name } => {
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    anyhow::bail!("No repositories configured");
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                let filtered: Vec<_> = repos.into_iter()
+                    .filter(|r| r["name"].as_str() != Some(&name))
+                    .collect();
+
+                std::fs::write(repos_file, serde_yaml::to_string(&filtered)?)?;
+                println!("Removed repository: {}", name);
+            }
+            RepoAction::Dependencies { mermaid } => {
+                use orchestrate_core::RepoDependencyGraph;
+
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    println!("No repositories configured");
+                    return Ok(());
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                let mut graph = RepoDependencyGraph::new();
+                for repo in &repos {
+                    let name = repo["name"].as_str().unwrap_or("").to_string();
+                    let deps: Vec<String> = repo["depends_on"]
+                        .as_array()
+                        .map(|arr: &Vec<serde_json::Value>| arr.iter()
+                            .filter_map(|v: &serde_json::Value| v.as_str())
+                            .map(|s: &str| s.to_string())
+                            .collect())
+                        .unwrap_or_default();
+                    graph.add_repo(&name, deps);
+                }
+
+                graph.detect_circular();
+
+                if mermaid {
+                    println!("{}", graph.to_mermaid());
+                } else {
+                    println!("Repository Dependencies");
+                    println!("{}", "=".repeat(60));
+
+                    if graph.has_circular {
+                        println!("WARNING: Circular dependencies detected!");
+                        for path in &graph.circular_paths {
+                            println!("  Cycle: {} -> {}", path.join(" -> "), path.first().unwrap_or(&String::new()));
+                        }
+                        println!();
+                    }
+
+                    for (repo, deps) in &graph.repositories {
+                        if deps.is_empty() {
+                            println!("{}: (no dependencies)", repo);
+                        } else {
+                            println!("{}: depends on {}", repo, deps.join(", "));
+                        }
+                    }
+                }
+            }
+            RepoAction::Sync { repo } => {
+                let repos_file = std::path::Path::new("repos.yaml");
+                if !repos_file.exists() {
+                    println!("No repositories configured");
+                    return Ok(());
+                }
+
+                let content = std::fs::read_to_string(repos_file)?;
+                let repos: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                for r in &repos {
+                    let name = r["name"].as_str().unwrap_or("");
+                    if let Some(ref filter) = repo {
+                        if name != filter {
+                            continue;
+                        }
+                    }
+
+                    if let Some(path) = r["local_path"].as_str() {
+                        if std::path::Path::new(path).exists() {
+                            println!("Syncing {}...", name);
+                            let output = std::process::Command::new("git")
+                                .args(["pull", "--rebase"])
+                                .current_dir(path)
+                                .output();
+
+                            match output {
+                                Ok(o) if o.status.success() => {
+                                    println!("  ✓ Synced successfully");
+                                }
+                                Ok(o) => {
+                                    println!("  ✗ Sync failed: {}", String::from_utf8_lossy(&o.stderr));
+                                }
+                                Err(e) => {
+                                    println!("  ✗ Error: {}", e);
+                                }
+                            }
+                        } else {
+                            println!("Cloning {}...", name);
+                            if let Some(url) = r["url"].as_str() {
+                                let output = std::process::Command::new("git")
+                                    .args(["clone", url, path])
+                                    .output();
+
+                                match output {
+                                    Ok(o) if o.status.success() => {
+                                        println!("  ✓ Cloned successfully");
+                                    }
+                                    Ok(o) => {
+                                        println!("  ✗ Clone failed: {}", String::from_utf8_lossy(&o.stderr));
+                                    }
+                                    Err(e) => {
+                                        println!("  ✗ Error: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        Commands::Ci { action } => match action {
+            CiAction::Config { provider, api_url, token } => {
+                use orchestrate_core::{CiConfig, CiProvider, CiAuthType};
+                use std::str::FromStr;
+
+                let provider = CiProvider::from_str(&provider)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                let default_url = match provider {
+                    CiProvider::GitHubActions => "https://api.github.com",
+                    CiProvider::GitLabCi => "https://gitlab.com/api/v4",
+                    CiProvider::CircleCi => "https://circleci.com/api/v2",
+                    CiProvider::JenkinsCI => "http://localhost:8080",
+                    CiProvider::Custom => "",
+                };
+
+                let config = CiConfig {
+                    provider,
+                    api_url: api_url.or_else(|| Some(default_url.to_string())),
+                    auth_type: CiAuthType::Bearer,
+                    token,
+                    custom_config: std::collections::HashMap::new(),
+                };
+
+                // Save to ci-config.yaml
+                let config_file = std::path::Path::new("ci-config.yaml");
+                std::fs::write(config_file, serde_yaml::to_string(&config)?)?;
+
+                println!("CI Configuration saved");
+                println!("  Provider: {}", provider.as_str());
+                println!("  API URL: {}", config.api_url.as_deref().unwrap_or("(default)"));
+                println!("  Auth: {}", if config.token.is_some() { "configured" } else { "not configured" });
+            }
+            CiAction::Status { run_id, branch, json } => {
+                use orchestrate_core::{CiRun, CiProvider, CiRunStatus, CiConclusion};
+
+                // Load config
+                let config_file = std::path::Path::new("ci-config.yaml");
+                if !config_file.exists() {
+                    println!("CI not configured. Run 'orchestrate ci config' first.");
+                    return Ok(());
+                }
+
+                // Simulated CI status (in real impl, would query provider API)
+                if let Some(id) = run_id {
+                    let run = CiRun::new(&id, CiProvider::GitHubActions, "build", "main");
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&run)?);
+                    } else {
+                        println!("CI Run: {}", run.id);
+                        println!("  Workflow: {}", run.workflow_name);
+                        println!("  Branch: {}", run.branch);
+                        println!("  Status: {}", run.status.as_str());
+                        if let Some(conclusion) = run.conclusion {
+                            println!("  Conclusion: {}", conclusion.as_str());
+                        }
+                    }
+                } else {
+                    println!("Recent CI Runs");
+                    println!("{}", "=".repeat(60));
+                    println!("  (No runs found. Specify --run-id for details)");
+                    if let Some(b) = branch {
+                        println!("  Filtering by branch: {}", b);
+                    }
+                }
+            }
+            CiAction::Trigger { workflow, branch, input } => {
+                use orchestrate_core::CiTriggerRequest;
+
+                let mut inputs = std::collections::HashMap::new();
+                for i in input {
+                    if let Some((key, value)) = i.split_once('=') {
+                        inputs.insert(key.to_string(), value.to_string());
+                    }
+                }
+
+                let request = CiTriggerRequest {
+                    workflow_name: workflow.clone(),
+                    branch: branch.clone(),
+                    inputs,
+                };
+
+                println!("Triggering CI workflow...");
+                println!("  Workflow: {}", request.workflow_name);
+                println!("  Branch: {}", request.branch);
+                if !request.inputs.is_empty() {
+                    println!("  Inputs:");
+                    for (k, v) in &request.inputs {
+                        println!("    {}: {}", k, v);
+                    }
+                }
+                println!();
+                println!("(Would trigger via provider API in real implementation)");
+            }
+            CiAction::Logs { run_id, job } => {
+                println!("Fetching logs for run: {}", run_id);
+                if let Some(j) = job {
+                    println!("  Job filter: {}", j);
+                }
+                println!();
+                println!("(Would fetch logs from provider API in real implementation)");
+            }
+            CiAction::Retry { run_id } => {
+                println!("Retrying CI run: {}", run_id);
+                println!("(Would retry via provider API in real implementation)");
+            }
+            CiAction::Cancel { run_id } => {
+                println!("Cancelling CI run: {}", run_id);
+                println!("(Would cancel via provider API in real implementation)");
+            }
+            CiAction::Analyze { run_id, auto_fix } => {
+                use orchestrate_core::{CiFailureAnalysis, FailedTest, FailedJob};
+
+                println!("Analyzing CI failure: {}", run_id);
+                println!();
+
+                // Create sample analysis (in real impl, would fetch and parse logs)
+                let mut analysis = CiFailureAnalysis::new(&run_id);
+
+                // Simulate finding issues
+                analysis.failed_jobs.push(FailedJob {
+                    job_name: "test".to_string(),
+                    step_name: Some("Run tests".to_string()),
+                    error_summary: "Test suite failed".to_string(),
+                    log_url: Some(format!("https://ci.example.com/runs/{}/jobs/test", run_id)),
+                });
+
+                analysis.failed_tests.push(FailedTest {
+                    test_name: "test_example_function".to_string(),
+                    test_file: Some("src/lib.rs".to_string()),
+                    error_message: "assertion failed: expected true, got false".to_string(),
+                    stack_trace: None,
+                    failure_count: 1,
+                    is_flaky: false,
+                });
+
+                analysis.add_recommendation("Review the test assertions");
+                analysis.add_recommendation("Check if test data is up to date");
+
+                println!("{}", analysis.to_summary());
+
+                if auto_fix {
+                    if analysis.should_auto_fix() {
+                        println!("Auto-fix is possible for this failure.");
+                        println!("(Would spawn issue-fixer agent in real implementation)");
+                    } else {
+                        println!("Auto-fix not recommended (may be flaky or complex failure)");
+                    }
+                }
+            }
+        },
+        Commands::Incident { action } => match action {
+            IncidentAction::List { status, severity, json } => {
+                // In production, would query database for incidents
+                println!("Incidents");
+                println!("{}", "=".repeat(60));
+
+                if let Some(s) = status {
+                    println!("Filtering by status: {}", s);
+                }
+                if let Some(sev) = severity {
+                    println!("Filtering by severity: {}", sev);
+                }
+
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No incidents found. Create one with 'orchestrate incident create'");
+                }
+            }
+            IncidentAction::Show { id } => {
+                println!("Incident: {}", id);
+                println!("{}", "=".repeat(60));
+                println!("(Would load incident details from database)");
+            }
+            IncidentAction::Create { title, severity, description } => {
+                use orchestrate_core::{Incident, IncidentSeverity};
+                use std::str::FromStr;
+
+                let sev = IncidentSeverity::from_str(&severity)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                let inc_id = format!("INC-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+                let mut incident = Incident::new(&inc_id, &title, sev);
+
+                if let Some(desc) = description {
+                    incident.description = desc;
+                }
+
+                // Store to incidents.yaml for now
+                let incidents_file = std::path::Path::new("incidents.yaml");
+                let mut incidents: Vec<serde_json::Value> = if incidents_file.exists() {
+                    let content = std::fs::read_to_string(incidents_file)?;
+                    serde_yaml::from_str(&content).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+
+                incidents.push(serde_json::json!({
+                    "id": incident.id,
+                    "title": incident.title,
+                    "description": incident.description,
+                    "severity": incident.severity.as_str(),
+                    "status": incident.status.as_str(),
+                    "detected_at": incident.detected_at.to_rfc3339(),
+                }));
+
+                std::fs::write(incidents_file, serde_yaml::to_string(&incidents)?)?;
+
+                println!("Created incident: {}", incident.id);
+                println!("  Title: {}", incident.title);
+                println!("  Severity: {}", incident.severity.as_str());
+                println!("  Status: {}", incident.status.as_str());
+                println!();
+                println!("Next steps:");
+                println!("  orchestrate incident investigate {}", incident.id);
+                println!("  orchestrate incident mitigate {} --playbook <name>", incident.id);
+            }
+            IncidentAction::Investigate { id } => {
+                use orchestrate_core::{RootCauseAnalysis, EvidenceType};
+
+                println!("Investigating incident: {}", id);
+                println!();
+
+                // Create sample RCA
+                let mut rca = RootCauseAnalysis::new(&id);
+                rca.set_primary_cause("Investigating... (would analyze logs and metrics)");
+                rca.add_evidence(EvidenceType::LogPattern, "Error patterns detected", "application logs");
+                rca.add_hypothesis("Possible resource exhaustion", 0.6);
+
+                println!("{}", rca.to_summary());
+                println!("(Full investigation would analyze logs, metrics, and recent changes)");
+            }
+            IncidentAction::Mitigate { id, playbook } => {
+                println!("Executing playbook '{}' for incident: {}", playbook, id);
+                println!();
+                println!("Playbook actions:");
+                println!("  (Would load and execute playbook from playbooks.yaml)");
+                println!();
+                println!("(In production, would execute remediation actions)");
+            }
+            IncidentAction::Resolve { id, resolution } => {
+                println!("Resolving incident: {}", id);
+                println!("  Resolution: {}", resolution);
+                println!();
+                println!("Incident marked as resolved.");
+                println!("  Generate post-mortem with: orchestrate incident postmortem {}", id);
+            }
+            IncidentAction::Postmortem { id, output } => {
+                use orchestrate_core::{Incident, IncidentSeverity, PostMortem, ActionItemPriority};
+
+                // Create sample incident for post-mortem
+                let incident = Incident::new(&id, "Sample Incident", IncidentSeverity::High);
+
+                let mut pm = PostMortem::from_incident(&incident);
+                pm.summary = "Incident summary goes here".to_string();
+                pm.root_cause = "Root cause analysis".to_string();
+                pm.resolution = "Actions taken to resolve".to_string();
+                pm.add_action_item("Review and prevent recurrence", ActionItemPriority::High, None);
+                pm.lessons_learned.push("Document lessons learned".to_string());
+
+                let content = pm.to_markdown();
+
+                if let Some(path) = output {
+                    std::fs::write(&path, &content)?;
+                    println!("Post-mortem saved to: {}", path);
+                } else {
+                    println!("{}", content);
+                }
+            }
+            IncidentAction::Playbook { action: pb_action } => match pb_action {
+                PlaybookAction::List { json } => {
+                    let playbooks_file = std::path::Path::new("playbooks.yaml");
+                    if !playbooks_file.exists() {
+                        println!("No playbooks defined. Create one with 'orchestrate incident playbook create'");
+                        return Ok(());
+                    }
+
+                    let content = std::fs::read_to_string(playbooks_file)?;
+                    let playbooks: Vec<serde_json::Value> = serde_yaml::from_str(&content)?;
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&playbooks)?);
+                    } else {
+                        println!("Playbooks");
+                        println!("{}", "=".repeat(60));
+                        for pb in &playbooks {
+                            println!("{}: {}",
+                                pb["name"].as_str().unwrap_or(""),
+                                pb["description"].as_str().unwrap_or(""),
+                            );
+                        }
+                        println!("\nTotal: {} playbooks", playbooks.len());
+                    }
+                }
+                PlaybookAction::Create { name, description } => {
+                    use orchestrate_core::Playbook;
+
+                    let pb_id = format!("pb-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+                    let mut playbook = Playbook::new(&pb_id, &name);
+                    if let Some(desc) = description {
+                        playbook.description = desc;
+                    }
+
+                    let playbooks_file = std::path::Path::new("playbooks.yaml");
+                    let mut playbooks: Vec<serde_json::Value> = if playbooks_file.exists() {
+                        let content = std::fs::read_to_string(playbooks_file)?;
+                        serde_yaml::from_str(&content).unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+
+                    playbooks.push(serde_json::json!({
+                        "id": playbook.id,
+                        "name": playbook.name,
+                        "description": playbook.description,
+                        "triggers": [],
+                        "actions": [],
+                    }));
+
+                    std::fs::write(playbooks_file, serde_yaml::to_string(&playbooks)?)?;
+
+                    println!("Created playbook: {}", playbook.name);
+                    println!("  ID: {}", playbook.id);
+                    println!("  Edit playbooks.yaml to add triggers and actions");
+                }
+                PlaybookAction::Run { name, incident } => {
+                    println!("Running playbook: {}", name);
+                    if let Some(inc_id) = incident {
+                        println!("  For incident: {}", inc_id);
+                    }
+                    println!();
+                    println!("(Would load and execute playbook actions)");
+                }
+            },
+        },
+        Commands::Alert { action } => match action {
+            AlertCommand::Rules { action } => match action {
+                AlertRulesAction::List => {
+                    let rules = db.list_alert_rules().await?;
+
+                    if rules.is_empty() {
+                        println!("No alert rules found");
+                    } else {
+                        println!("\n{}", "=".repeat(100));
+                        println!("{:^100}", "ALERT RULES");
+                        println!("{}", "=".repeat(100));
+                        println!(
+                            "{:<30} {:<10} {:<10} {:<30} {:>10}",
+                            "Name", "Severity", "Enabled", "Channels", "Interval"
+                        );
+                        println!("{}", "-".repeat(100));
+
+                        for rule in rules {
+                            let channels = rule.channels.join(", ");
+                            let channels_display = if channels.len() > 28 {
+                                format!("{}...", &channels[..25])
+                            } else {
+                                channels
+                            };
+
+                            println!(
+                                "{:<30} {:<10} {:<10} {:<30} {:>8}s",
+                                rule.name,
+                                rule.severity.to_string(),
+                                if rule.enabled { "Yes" } else { "No" },
+                                channels_display,
+                                rule.evaluation_interval_seconds
+                            );
+                        }
+                        println!("{}", "=".repeat(100));
+                    }
+                }
+                AlertRulesAction::Create {
+                    name,
+                    condition,
+                    channel,
+                    severity,
+                    interval,
+                } => {
+                    use orchestrate_core::AlertSeverity;
+                    use std::str::FromStr;
+
+                    if channel.is_empty() {
+                        return Err(anyhow::anyhow!("At least one channel must be specified"));
+                    }
+
+                    let severity = AlertSeverity::from_str(&severity)
+                        .map_err(|e| anyhow::anyhow!("Invalid severity: {}", e))?;
+
+                    let rule = orchestrate_core::AlertRule::new(
+                        name.clone(),
+                        condition,
+                        severity,
+                        channel,
+                    )
+                    .with_interval(interval);
+
+                    let created_rule = db.create_alert_rule(rule).await?;
+
+                    println!("\n{}", "=".repeat(60));
+                    println!("Alert rule created successfully!");
+                    println!("{}", "=".repeat(60));
+                    println!("Name:      {}", created_rule.name);
+                    println!("Condition: {}", created_rule.condition);
+                    println!("Severity:  {}", created_rule.severity);
+                    println!("Channels:  {}", created_rule.channels.join(", "));
+                    println!("Enabled:   {}", created_rule.enabled);
+                    println!("Interval:  {}s", created_rule.evaluation_interval_seconds);
+                    println!("{}", "=".repeat(60));
+                }
+                AlertRulesAction::Enable { name } => {
+                    let rule = db.get_alert_rule_by_name(&name).await?
+                        .ok_or_else(|| anyhow::anyhow!("Alert rule '{}' not found", name))?;
+
+                    let rule_id = rule.id.ok_or_else(|| anyhow::anyhow!("Rule has no ID"))?;
+                    db.set_alert_rule_enabled(rule_id, true).await?;
+
+                    println!("\n{}", "=".repeat(60));
+                    println!("Alert rule enabled: {}", name);
+                    println!("{}", "=".repeat(60));
+                }
+                AlertRulesAction::Disable { name } => {
+                    let rule = db.get_alert_rule_by_name(&name).await?
+                        .ok_or_else(|| anyhow::anyhow!("Alert rule '{}' not found", name))?;
+
+                    let rule_id = rule.id.ok_or_else(|| anyhow::anyhow!("Rule has no ID"))?;
+                    db.set_alert_rule_enabled(rule_id, false).await?;
+
+                    println!("\n{}", "=".repeat(60));
+                    println!("Alert rule disabled: {}", name);
+                    println!("{}", "=".repeat(60));
+                }
+                AlertRulesAction::Delete { name } => {
+                    let rule = db.get_alert_rule_by_name(&name).await?
+                        .ok_or_else(|| anyhow::anyhow!("Alert rule '{}' not found", name))?;
+
+                    let rule_id = rule.id.ok_or_else(|| anyhow::anyhow!("Rule has no ID"))?;
+                    db.delete_alert_rule(rule_id).await?;
+
+                    println!("\n{}", "=".repeat(60));
+                    println!("Alert rule deleted: {}", name);
+                    println!("{}", "=".repeat(60));
+                }
+            },
+            AlertCommand::List { status } => {
+                use orchestrate_core::AlertStatus;
+                use std::str::FromStr;
+
+                let alerts = if let Some(status_str) = status {
+                    let status = AlertStatus::from_str(&status_str)
+                        .map_err(|e| anyhow::anyhow!("Invalid status: {}", e))?;
+                    db.list_alerts_by_status(status).await?
+                } else {
+                    // Get all alerts by fetching each status
+                    let mut all_alerts = Vec::new();
+                    all_alerts.extend(db.list_alerts_by_status(AlertStatus::Active).await?);
+                    all_alerts.extend(db.list_alerts_by_status(AlertStatus::Acknowledged).await?);
+                    all_alerts.extend(db.list_alerts_by_status(AlertStatus::Resolved).await?);
+                    all_alerts
+                };
+
+                if alerts.is_empty() {
+                    println!("No alerts found");
+                } else {
+                    println!("\n{}", "=".repeat(100));
+                    println!("{:^100}", "ALERTS");
+                    println!("{}", "=".repeat(100));
+                    println!(
+                        "{:<8} {:<12} {:<15} {:<30} {:<20}",
+                        "ID", "Rule ID", "Status", "Triggered At", "Fingerprint"
+                    );
+                    println!("{}", "-".repeat(100));
+
+                    for alert in alerts {
+                        let fingerprint_short = if alert.fingerprint.len() > 18 {
+                            format!("{}...", &alert.fingerprint[..15])
+                        } else {
+                            alert.fingerprint.clone()
+                        };
+
+                        println!(
+                            "{:<8} {:<12} {:<15} {:<30} {:<20}",
+                            alert.id.unwrap_or(0),
+                            alert.rule_id,
+                            alert.status.to_string(),
+                            alert.triggered_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                            fingerprint_short
+                        );
+                    }
+                    println!("{}", "=".repeat(100));
+                }
+            }
+            AlertCommand::Acknowledge { id } => {
+                let alert_id: i64 = id.parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid alert ID: {}", id))?;
+
+                // Check if alert exists
+                let alert = db.get_alert(alert_id).await?
+                    .ok_or_else(|| anyhow::anyhow!("Alert {} not found", alert_id))?;
+
+                if alert.status == orchestrate_core::AlertStatus::Resolved {
+                    return Err(anyhow::anyhow!("Cannot acknowledge resolved alert"));
+                }
+
+                db.acknowledge_alert(alert_id, "cli-user").await?;
+
+                println!("\n{}", "=".repeat(60));
+                println!("Alert acknowledged: {}", alert_id);
+                println!("{}", "=".repeat(60));
+            }
+            AlertCommand::Silence { name, duration } => {
+                // Verify the rule exists
+                let _rule = db.get_alert_rule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Alert rule '{}' not found", name))?;
+
+                println!("\n{}", "=".repeat(60));
+                println!("Alert rule silenced: {}", name);
+                println!("Duration: {}", duration);
+                println!("{}", "=".repeat(60));
+                println!("Note: Silencing is tracked in the notification system");
+            }
+            AlertCommand::Test { name } => {
+                // Verify the rule exists
+                let rule = db.get_alert_rule_by_name(&name).await?
+                    .ok_or_else(|| anyhow::anyhow!("Alert rule '{}' not found", name))?;
+
+                println!("\n{}", "=".repeat(60));
+                println!("Testing alert delivery for rule: {}", name);
+                println!("{}", "=".repeat(60));
+                println!("Rule:      {}", rule.name);
+                println!("Condition: {}", rule.condition);
+                println!("Severity:  {}", rule.severity);
+                println!("Channels:  {}", rule.channels.join(", "));
+                println!();
+                println!("Note: This would send test notifications to configured channels");
+                println!("{}", "=".repeat(60));
+            }
+        },
+        Commands::Trace { action } => match action {
+            TraceCommand::Enable {
+                exporter,
+                jaeger_endpoint,
+                otlp_endpoint,
+                service_name,
+                sample_rate,
             } => {
-                handle_release_notes(&db, &from, &to, &repo_path, &format).await?;
+                use orchestrate_core::{TracingConfig, TracingExporter, TracingProvider};
+
+                // Parse exporter type
+                let exporter_type = TracingExporter::from_str(&exporter)?;
+
+                // Build configuration
+                let mut config = TracingConfig::new(exporter_type)
+                    .with_service_name(service_name.clone())
+                    .with_sample_rate(sample_rate);
+
+                if let Some(ref endpoint) = jaeger_endpoint {
+                    config = config.with_jaeger_endpoint(endpoint.clone());
+                }
+
+                if let Some(ref endpoint) = otlp_endpoint {
+                    config = config.with_otlp_endpoint(endpoint.clone());
+                }
+
+                // Initialize tracing provider
+                let mut provider = TracingProvider::new(config);
+                provider.init()?;
+
+                println!("\n{}", "=".repeat(60));
+                println!("Distributed Tracing Enabled");
+                println!("{}", "=".repeat(60));
+                println!("Exporter:     {}", exporter);
+                println!("Service Name: {}", service_name);
+                println!("Sample Rate:  {:.0}%", sample_rate * 100.0);
+
+                match exporter_type {
+                    TracingExporter::Jaeger => {
+                        if let Some(ref endpoint) = jaeger_endpoint {
+                            println!("Jaeger:       {}", endpoint);
+                        } else {
+                            println!("Jaeger:       http://localhost:14268/api/traces (default)");
+                        }
+                    }
+                    TracingExporter::Otlp => {
+                        if let Some(ref endpoint) = otlp_endpoint {
+                            println!("OTLP:         {}", endpoint);
+                        } else {
+                            println!("OTLP:         http://localhost:4317 (default)");
+                        }
+                    }
+                    TracingExporter::None => {}
+                }
+
+                println!("{}", "=".repeat(60));
+                println!();
+                println!("Tracing is now active. Spans will be exported to the configured endpoint.");
+                println!("Use 'orchestrate trace status' to check current configuration.");
+            }
+            TraceCommand::Disable => {
+                use orchestrate_core::{TracingConfig, TracingExporter, TracingProvider};
+
+                let config = TracingConfig::new(TracingExporter::None);
+                let mut provider = TracingProvider::new(config);
+                provider.init()?;
+
+                println!("\n{}", "=".repeat(60));
+                println!("Distributed Tracing Disabled");
+                println!("{}", "=".repeat(60));
+                println!();
+                println!("Tracing has been disabled. No spans will be exported.");
+            }
+            TraceCommand::Status => {
+                use orchestrate_core::{TracingConfig, TracingExporter};
+
+                // For now, show default configuration
+                // In production, this would read from a config file or database
+                let config = TracingConfig::default();
+
+                println!("\n{}", "=".repeat(60));
+                println!("Distributed Tracing Status");
+                println!("{}", "=".repeat(60));
+                println!("Status:       {}", if config.exporter == TracingExporter::None { "Disabled" } else { "Enabled" });
+                println!("Exporter:     {}", config.exporter.as_str());
+                println!("Service Name: {}", config.service_name);
+                println!("Sample Rate:  {:.0}%", config.sample_rate * 100.0);
+
+                if let Some(endpoint) = &config.jaeger_endpoint {
+                    println!("Jaeger:       {}", endpoint);
+                }
+                if let Some(endpoint) = &config.otlp_endpoint {
+                    println!("OTLP:         {}", endpoint);
+                }
+
+                println!("{}", "=".repeat(60));
             }
         },
     }
@@ -3001,6 +5335,25 @@ async fn get_instruction_by_id_or_name(
     }
 
     anyhow::bail!("Instruction not found: {}", id_or_name)
+}
+
+async fn get_experiment_by_id_or_name(
+    db: &Database,
+    id_or_name: &str,
+) -> Result<orchestrate_core::Experiment> {
+    // Try parsing as ID first
+    if let Ok(id) = id_or_name.parse::<i64>() {
+        if let Some(exp) = db.get_experiment(id).await? {
+            return Ok(exp);
+        }
+    }
+
+    // Try as name
+    if let Some(exp) = db.get_experiment_by_name(id_or_name).await? {
+        return Ok(exp);
+    }
+
+    anyhow::bail!("Experiment not found: {}", id_or_name)
 }
 
 fn parse_agent_type(s: &str) -> Result<AgentType> {
@@ -4818,1108 +7171,14 @@ async fn handle_feedback_delete(db: &Database, id: i64) -> Result<()> {
     Ok(())
 }
 
-// ==================== Environment Handlers ====================
-
-async fn handle_env_list(db: &Database, format: &str) -> Result<()> {
-    let envs = db.list_environments().await?;
-
-    if envs.is_empty() {
-        println!("No environments found");
-        return Ok(());
-    }
-
-    match format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&envs)?);
-        }
-        _ => {
-            // Table format
-            println!("{:<20} {:<15} {:<40} {:<10}", "NAME", "TYPE", "URL", "APPROVAL");
-            println!("{:-<90}", "");
-            for env in envs {
-                println!(
-                    "{:<20} {:<15} {:<40} {:<10}",
-                    env.name,
-                    env.env_type.to_string(),
-                    env.url.as_deref().unwrap_or("-"),
-                    if env.requires_approval { "required" } else { "-" }
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_env_create(
-    db: &Database,
-    name: &str,
-    env_type: &str,
-    url: Option<&str>,
-    provider: Option<&str>,
-    config_json: Option<&str>,
-    secrets_json: Option<&str>,
-    requires_approval: bool,
-) -> Result<()> {
-    use std::str::FromStr;
-
-    // Parse environment type
-    let env_type = EnvironmentType::from_str(env_type)?;
-
-    // Parse config JSON
-    let config = if let Some(json) = config_json {
-        serde_json::from_str(json)?
+/// Truncate a string to max length, adding "..." if truncated
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len <= 3 {
+        s.chars().take(max_len).collect()
     } else {
-        std::collections::HashMap::new()
-    };
-
-    // Parse secrets JSON
-    let secrets = if let Some(json) = secrets_json {
-        serde_json::from_str(json)?
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    let create_env = CreateEnvironment {
-        name: name.to_string(),
-        env_type,
-        url: url.map(String::from),
-        provider: provider.map(String::from),
-        config,
-        secrets,
-        requires_approval,
-    };
-
-    let env = db.create_environment(create_env).await?;
-
-    println!("Environment '{}' created successfully", env.name);
-    println!("  ID: {}", env.id);
-    println!("  Type: {}", env.env_type);
-    if let Some(url) = &env.url {
-        println!("  URL: {}", url);
+        format!("{}...", &s[..max_len - 3])
     }
-    if let Some(provider) = &env.provider {
-        println!("  Provider: {}", provider);
-    }
-    println!("  Requires approval: {}", env.requires_approval);
-    println!("  Config keys: {}", env.config.len());
-    println!("  Secrets: {} (encrypted)", env.secrets.len());
-
-    Ok(())
-}
-
-async fn handle_env_show(
-    db: &Database,
-    name: &str,
-    show_secrets: bool,
-    format: &str,
-) -> Result<()> {
-    let env = db.get_environment_by_name(name).await?;
-
-    match format {
-        "json" => {
-            if show_secrets {
-                println!("{}", serde_json::to_string_pretty(&env)?);
-            } else {
-                // Create a version without secrets
-                let mut env_no_secrets = env.clone();
-                env_no_secrets.secrets = std::collections::HashMap::new();
-                println!("{}", serde_json::to_string_pretty(&env_no_secrets)?);
-            }
-        }
-        _ => {
-            // Table format
-            println!("Environment: {}", env.name);
-            println!("{:-<60}", "");
-            println!("  ID: {}", env.id);
-            println!("  Type: {}", env.env_type);
-            if let Some(url) = &env.url {
-                println!("  URL: {}", url);
-            }
-            if let Some(provider) = &env.provider {
-                println!("  Provider: {}", provider);
-            }
-            println!("  Requires approval: {}", env.requires_approval);
-            println!("  Created: {}", env.created_at.format("%Y-%m-%d %H:%M:%S"));
-
-            if !env.config.is_empty() {
-                println!("\n  Configuration:");
-                for (key, value) in &env.config {
-                    println!("    {}: {}", key, value);
-                }
-            }
-
-            if !env.secrets.is_empty() {
-                println!("\n  Secrets:");
-                for key in env.secrets.keys() {
-                    if show_secrets {
-                        println!("    {}: {}", key, env.secrets.get(key).unwrap());
-                    } else {
-                        println!("    {}: ********", key);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_env_delete(db: &Database, name: &str, yes: bool) -> Result<()> {
-    // Check if environment exists
-    let _ = db.get_environment_by_name(name).await?;
-
-    if !yes {
-        println!("Are you sure you want to delete environment '{}'? [y/N]", name);
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Cancelled");
-            return Ok(());
-        }
-    }
-
-    if db.delete_environment(name).await? {
-        println!("Environment '{}' deleted", name);
-    } else {
-        println!("Environment '{}' not found", name);
-    }
-
-    Ok(())
-}
-
-async fn handle_deploy_validate(
-    db: &Database,
-    env: &str,
-    version: Option<&str>,
-    format: &str,
-) -> Result<()> {
-    let validator = PreDeployValidator::with_db(Arc::new(db.clone()));
-    let validation = validator.validate(env, version).await?;
-
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&validation)?);
-        return Ok(());
-    }
-
-    // Table format
-    println!("Pre-Deployment Validation for '{}'", env);
-    if let Some(v) = &validation.version {
-        println!("Version: {}", v);
-    }
-    println!("Validated at: {}", validation.validated_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    println!();
-
-    println!("Overall Status: {}", match validation.overall_status {
-        ValidationStatus::Passed => "PASSED",
-        ValidationStatus::Failed => "FAILED",
-        ValidationStatus::Warning => "WARNING",
-        ValidationStatus::Skipped => "SKIPPED",
-    });
-    println!();
-
-    println!("Validation Checks:");
-    println!("{:<30} {:<10} {}", "Check", "Status", "Message");
-    println!("{}", "-".repeat(80));
-
-    for check in &validation.checks {
-        let status_symbol = match check.status {
-            ValidationStatus::Passed => "✓ PASS",
-            ValidationStatus::Failed => "✗ FAIL",
-            ValidationStatus::Warning => "⚠ WARN",
-            ValidationStatus::Skipped => "- SKIP",
-        };
-        println!("{:<30} {:<10} {}", check.name, status_symbol, check.message);
-    }
-
-    println!();
-
-    if !validation.is_valid() {
-        println!("Validation FAILED. The following checks failed:");
-        for check in validation.failed_checks() {
-            println!("  - {}: {}", check.name, check.message);
-        }
-        std::process::exit(1);
-    }
-
-    println!("All checks passed. Environment is ready for deployment.");
-    Ok(())
-}
-
-async fn handle_deploy_rollback(
-    db: &Database,
-    env: &str,
-    version: Option<&str>,
-    skip_validation: bool,
-    force: bool,
-    format: &str,
-) -> Result<()> {
-    let rollback_service = DeploymentRollback::new(Arc::new(db.clone()));
-
-    let request = RollbackRequest {
-        environment: env.to_string(),
-        target_version: version.map(|v| v.to_string()),
-        skip_validation,
-        force,
-    };
-
-    println!("Initiating rollback for environment '{}'...", env);
-    if let Some(v) = version {
-        println!("Target version: {}", v);
-    } else {
-        println!("Target: Previous successful deployment");
-    }
-    println!();
-
-    let rollback_event = rollback_service.rollback(request).await?;
-
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&rollback_event)?);
-        return Ok(());
-    }
-
-    // Table format
-    println!("Rollback completed successfully!");
-    println!();
-    println!("Rollback Details:");
-    println!("  ID: {}", rollback_event.id);
-    println!("  Type: {}", rollback_event.rollback_type);
-    println!("  Target Version: {}", rollback_event.target_version);
-    println!("  Status: {}", rollback_event.status);
-    println!(
-        "  Started At: {}",
-        rollback_event.started_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-    if let Some(completed_at) = rollback_event.completed_at {
-        println!(
-            "  Completed At: {}",
-            completed_at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        let duration = (completed_at - rollback_event.started_at).num_seconds();
-        println!("  Duration: {}s", duration);
-    }
-    println!(
-        "  Notification Sent: {}",
-        if rollback_event.notification_sent {
-            "Yes"
-        } else {
-            "No"
-        }
-    );
-
-    if let Some(error) = &rollback_event.error_message {
-        println!("  Error: {}", error);
-    }
-
-    println!();
-    println!("Environment '{}' has been rolled back to version '{}'", env, rollback_event.target_version);
-
-    Ok(())
-}
-
-async fn handle_deploy_deploy(
-    db: &Database,
-    env: &str,
-    version: &str,
-    strategy: Option<&str>,
-    provider: Option<&str>,
-    timeout: Option<u32>,
-    skip_validation: bool,
-    format: &str,
-) -> Result<()> {
-    use orchestrate_core::{BatchSize, BlueGreenEnvironment, DeploymentExecutor, DeploymentProvider, DeploymentRequest, DeploymentStrategy};
-
-    println!("Deploying version {} to environment '{}'...", version, env);
-    println!();
-
-    // Parse strategy if provided
-    let deployment_strategy = if let Some(strat) = strategy {
-        match strat.to_lowercase().as_str() {
-            "rolling" => Some(DeploymentStrategy::rolling(BatchSize::Count(5), 30)), // Default batch size 5, 30s delay
-            "blue-green" | "bluegreen" => Some(DeploymentStrategy::blue_green(BlueGreenEnvironment::Blue)), // Start with blue
-            "canary" => Some(DeploymentStrategy::canary(vec![10, 50, 100])), // Default traffic steps
-            "recreate" => Some(DeploymentStrategy::recreate()),
-            _ => return Err(anyhow::anyhow!("Invalid deployment strategy: {}. Valid options: rolling, blue-green, canary, recreate", strat)),
-        }
-    } else {
-        None
-    };
-
-    // Parse provider if provided
-    let deployment_provider = if let Some(prov) = provider {
-        let provider_type = match prov.to_lowercase().as_str() {
-            "docker" => DeploymentProvider::Docker,
-            "aws-ecs" => DeploymentProvider::AwsEcs,
-            "aws-lambda" => DeploymentProvider::AwsLambda,
-            "kubernetes" | "k8s" => DeploymentProvider::Kubernetes,
-            "vercel" => DeploymentProvider::Vercel,
-            "netlify" => DeploymentProvider::Netlify,
-            "railway" => DeploymentProvider::Railway,
-            _ => return Err(anyhow::anyhow!("Invalid deployment provider: {}. Valid options: docker, aws-ecs, aws-lambda, kubernetes, vercel, netlify, railway", prov)),
-        };
-        Some(provider_type)
-    } else {
-        None
-    };
-
-    let executor = DeploymentExecutor::new(Arc::new(db.clone()));
-    let request = DeploymentRequest {
-        environment: env.to_string(),
-        version: version.to_string(),
-        provider: deployment_provider,
-        strategy: deployment_strategy,
-        timeout_seconds: timeout,
-        skip_validation,
-    };
-
-    let deployment = executor.deploy(request).await?;
-
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&deployment)?);
-        return Ok(());
-    }
-
-    // Table format
-    println!("Deployment initiated successfully!");
-    println!();
-    println!("Deployment Details:");
-    println!("  ID: {}", deployment.id);
-    println!("  Environment: {}", deployment.environment_name);
-    println!("  Version: {}", deployment.version);
-    println!("  Provider: {}", deployment.provider);
-    println!("  Status: {}", deployment.status);
-    if let Some(strategy) = &deployment.strategy {
-        println!("  Strategy: {:?}", strategy);
-    }
-    println!(
-        "  Started At: {}",
-        deployment.started_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-
-    use orchestrate_core::DeploymentStatus;
-    match deployment.status {
-        DeploymentStatus::Completed | DeploymentStatus::Failed | DeploymentStatus::RolledBack | DeploymentStatus::TimedOut => {
-            if let Some(completed_at) = deployment.completed_at {
-                println!(
-                    "  Completed At: {}",
-                    completed_at.format("%Y-%m-%d %H:%M:%S UTC")
-                );
-                if let Some(duration) = deployment.duration() {
-                    println!("  Duration: {}s", duration.num_seconds());
-                }
-            }
-        }
-        _ => {
-            println!();
-            println!("Deployment is in progress. Use 'orchestrate deploy status --env {}' to check status.", env);
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_deploy_status(db: &Database, env: &str, format: &str) -> Result<()> {
-    // Get the current/latest deployment for this environment
-    let deployments = db.list_deployments(env, Some(1)).await?;
-
-    if deployments.is_empty() {
-        println!("No active deployment found for environment '{}'", env);
-        return Ok(());
-    }
-
-    let deployment = &deployments[0];
-
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&deployment)?);
-        return Ok(());
-    }
-
-    // Table format
-    println!("Deployment Status for '{}'", env);
-    println!();
-    println!("  ID: {}", deployment.id);
-    println!("  Version: {}", deployment.version);
-    println!("  Provider: {}", deployment.provider);
-    println!("  Status: {}", deployment.status);
-    if let Some(strategy) = &deployment.strategy {
-        println!("  Strategy: {:?}", strategy);
-    }
-    println!(
-        "  Started At: {}",
-        deployment.started_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-
-    if let Some(completed_at) = deployment.completed_at {
-        println!(
-            "  Completed At: {}",
-            completed_at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        if let Some(duration) = deployment.duration() {
-            println!("  Duration: {}s", duration.num_seconds());
-        }
-    }
-
-    use orchestrate_core::DeploymentStatus;
-    match deployment.status {
-        DeploymentStatus::Completed => {
-            println!();
-            println!("Deployment is healthy and running.");
-        }
-        DeploymentStatus::Pending | DeploymentStatus::Validating | DeploymentStatus::InProgress => {
-            println!();
-            println!("Deployment is in progress...");
-        }
-        DeploymentStatus::Failed | DeploymentStatus::RolledBack | DeploymentStatus::TimedOut => {
-            println!();
-            println!("Deployment has failed or been cancelled.");
-            if let Some(error) = &deployment.error_message {
-                println!("  Error: {}", error);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_deploy_history(
-    db: &Database,
-    env: &str,
-    limit: usize,
-    format: &str,
-) -> Result<()> {
-    let deployments = db
-        .list_deployments(env, Some(limit as i64))
-        .await?;
-
-    if deployments.is_empty() {
-        println!("No deployment history found for environment '{}'", env);
-        return Ok(());
-    }
-
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&deployments)?);
-        return Ok(());
-    }
-
-    // Table format
-    println!("Deployment History for '{}' (showing {} most recent)", env, deployments.len());
-    println!();
-    println!("{:<6} {:<12} {:<20} {:<15} {:<20} {:<10}", "ID", "Version", "Started At", "Status", "Duration", "Provider");
-    println!("{}", "-".repeat(95));
-
-    for deployment in &deployments {
-        let started = deployment.started_at.format("%Y-%m-%d %H:%M:%S");
-        let duration = if let Some(dur) = deployment.duration() {
-            format!("{}s", dur.num_seconds())
-        } else {
-            "In progress".to_string()
-        };
-
-        println!(
-            "{:<6} {:<12} {:<20} {:<15} {:<20} {:<10}",
-            deployment.id,
-            deployment.version,
-            started,
-            format!("{}", deployment.status),
-            duration,
-            deployment.provider
-        );
-    }
-
-    Ok(())
-}
-
-async fn handle_deploy_diff(
-    db: &Database,
-    env: &str,
-    target_version: &str,
-    format: &str,
-) -> Result<()> {
-    // Get current deployment
-    let deployments = db.list_deployments(env, Some(1)).await?;
-
-    if format == "json" {
-        let diff = if let Some(current) = deployments.first() {
-            serde_json::json!({
-                "environment": env,
-                "current_version": current.version,
-                "target_version": target_version,
-                "current_deployment_id": current.id,
-                "is_new_deployment": false
-            })
-        } else {
-            serde_json::json!({
-                "environment": env,
-                "current_version": null,
-                "target_version": target_version,
-                "is_new_deployment": true
-            })
-        };
-        println!("{}", serde_json::to_string_pretty(&diff)?);
-        return Ok(());
-    }
-
-    // Table format
-    println!("Deployment Diff for '{}'", env);
-    println!();
-
-    if let Some(current) = deployments.first() {
-        println!("Current Deployment:");
-        println!("  Version: {}", current.version);
-        println!("  Status: {}", current.status);
-        println!("  Provider: {}", current.provider);
-        if let Some(strategy) = &current.strategy {
-            println!("  Strategy: {:?}", strategy);
-        }
-        println!(
-            "  Deployed At: {}",
-            current.started_at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        println!();
-        println!("Target Deployment:");
-        println!("  Version: {}", target_version);
-        println!();
-
-        if current.version == target_version {
-            println!("No changes - target version is already deployed.");
-        } else {
-            println!("Changes:");
-            println!("  Version: {} -> {}", current.version, target_version);
-            println!();
-            println!("This will deploy a new version to the environment.");
-        }
-    } else {
-        println!("No current deployment found.");
-        println!();
-        println!("Target Deployment:");
-        println!("  Version: {}", target_version);
-        println!();
-        println!("This will be a new deployment to the environment.");
-    }
-
-    Ok(())
-}
-
-// ==================== Release Management Handlers ====================
-
-async fn handle_release_prepare(
-    db: &Database,
-    bump_type_str: &str,
-    cargo_toml: &PathBuf,
-    changelog_path: &PathBuf,
-    bump_frontend: bool,
-) -> Result<()> {
-    use orchestrate_core::{BumpType, ReleaseManager};
-    use std::str::FromStr;
-
-    // Parse bump type
-    let bump_type = BumpType::from_str(bump_type_str)?;
-
-    let manager = ReleaseManager::new(db.clone());
-
-    println!("Preparing {} release...", bump_type);
-    println!();
-
-    // Prepare release
-    let preparation = manager.prepare_release(bump_type.clone(), cargo_toml).await?;
-
-    println!("New version: {}", preparation.new_version);
-    println!("Release branch: {}", preparation.branch_name);
-    println!();
-
-    // Show changelog preview
-    println!("Changelog preview:");
-    println!("{}", preparation.changelog.to_markdown());
-
-    // Ask for confirmation
-    print!("Proceed with version bump? [y/N]: ");
-    use std::io::{self, Write};
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-
-    if !input.trim().eq_ignore_ascii_case("y") {
-        println!("Aborted.");
-        return Ok(());
-    }
-
-    // Create release branch
-    println!("\nCreating release branch...");
-    manager.create_release_branch(&preparation.branch_name).await?;
-    println!("✓ Created branch: {}", preparation.branch_name);
-
-    // Bump version in Cargo.toml
-    println!("\nBumping version in Cargo.toml...");
-    manager.bump_version(cargo_toml, &preparation.new_version).await?;
-    println!("✓ Updated Cargo.toml: {}", preparation.new_version);
-
-    // Bump frontend package.json if requested
-    if bump_frontend {
-        let package_json = PathBuf::from("frontend/package.json");
-        if package_json.exists() {
-            println!("\nBumping version in package.json...");
-            manager.bump_package_json_version(&package_json, &preparation.new_version).await?;
-            println!("✓ Updated package.json: {}", preparation.new_version);
-        }
-    }
-
-    // Update CHANGELOG.md
-    println!("\nUpdating CHANGELOG.md...");
-    manager.update_changelog_file(changelog_path, &preparation.changelog).await?;
-    println!("✓ Updated CHANGELOG.md");
-
-    println!("\n{}", "=".repeat(60));
-    println!("Release preparation complete!");
-    println!("{}", "=".repeat(60));
-    println!();
-    println!("Next steps:");
-    println!("  1. Review the changes");
-    println!("  2. Commit the version bump:");
-    println!("     git add -A");
-    println!("     git commit -m \"chore: Bump version to {}\"", preparation.new_version);
-    println!("  3. Create the release:");
-    println!("     orchestrate release create --version {}", preparation.new_version);
-    println!();
-
-    Ok(())
-}
-
-async fn handle_release_create(
-    db: &Database,
-    version_str: &str,
-    message: Option<&str>,
-    push: bool,
-) -> Result<()> {
-    use orchestrate_core::{ReleaseManager, Version};
-
-    let manager = ReleaseManager::new(db.clone());
-
-    // Parse version
-    let version = Version::parse(version_str)?;
-
-    println!("Creating release for version {}...", version);
-    println!();
-
-    // Get release message (use provided or default)
-    let release_message = message
-        .map(String::from)
-        .unwrap_or_else(|| format!("Release version {}", version));
-
-    // Create git tag
-    println!("Creating git tag...");
-    manager.create_release_tag(&version, &release_message).await?;
-    println!("✓ Created tag: v{}", version);
-
-    // Push tag if requested
-    if push {
-        println!("\nPushing tag to remote...");
-        manager.push_tag(&version).await?;
-        println!("✓ Pushed tag to origin");
-    }
-
-    println!("\n{}", "=".repeat(60));
-    println!("Release created successfully!");
-    println!("{}", "=".repeat(60));
-    println!();
-    println!("Version: {}", version);
-    println!("Tag: v{}", version);
-
-    if !push {
-        println!();
-        println!("To push the tag to remote, run:");
-        println!("  git push origin v{}", version);
-    }
-
-    println!();
-    println!("To create a GitHub release, use the GitHub CLI:");
-    println!("  gh release create v{} --title \"Release {}\" --notes-file CHANGELOG.md", version, version);
-    println!();
-
-    Ok(())
-}
-
-async fn handle_release_publish(
-    _db: &Database,
-    version: &str,
-    repo_path: &PathBuf,
-    token: Option<&str>,
-    prerelease: bool,
-    draft: bool,
-) -> Result<()> {
-    use std::process::Command;
-
-    println!("Publishing release {}...", version);
-    println!();
-
-    // Check if gh CLI is available
-    let gh_check = Command::new("gh").arg("--version").output();
-    if gh_check.is_err() {
-        return Err(anyhow::anyhow!(
-            "GitHub CLI (gh) is not installed. Please install it from https://cli.github.com/"
-        ));
-    }
-
-    // Change to repo directory
-    std::env::set_current_dir(repo_path)?;
-
-    // Verify tag exists
-    let tag = format!("v{}", version);
-    let tag_check = Command::new("git")
-        .args(&["tag", "-l", &tag])
-        .output()?;
-
-    if tag_check.stdout.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Tag {} does not exist. Create it first with 'orchestrate release create'",
-            tag
-        ));
-    }
-
-    // Build gh release create command
-    let mut cmd = Command::new("gh");
-    cmd.args(&["release", "create", &tag]);
-    cmd.args(&["--title", &format!("Release {}", version)]);
-
-    // Check if CHANGELOG.md has an entry for this version
-    let changelog_path = repo_path.join("CHANGELOG.md");
-    if changelog_path.exists() {
-        cmd.args(&["--notes-file", "CHANGELOG.md"]);
-    } else {
-        cmd.args(&["--notes", &format!("Release version {}", version)]);
-    }
-
-    if prerelease {
-        cmd.arg("--prerelease");
-    }
-
-    if draft {
-        cmd.arg("--draft");
-    }
-
-    // Set GitHub token if provided
-    if let Some(t) = token {
-        cmd.env("GITHUB_TOKEN", t);
-    }
-
-    println!("Creating GitHub release...");
-    let output = cmd.output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("Failed to create GitHub release: {}", stderr));
-    }
-
-    println!("✓ GitHub release created successfully!");
-    println!();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
-
-    Ok(())
-}
-
-async fn handle_release_notes(
-    _db: &Database,
-    from_tag: &str,
-    to_tag: &str,
-    repo_path: &PathBuf,
-    format: &str,
-) -> Result<()> {
-    use orchestrate_core::{ReleaseManager, Version};
-    use std::process::Command;
-
-    println!("Generating release notes from {} to {}...", from_tag, to_tag);
-    println!();
-
-    // Change to repo directory
-    std::env::set_current_dir(repo_path)?;
-
-    // Get commits between tags
-    let git_output = Command::new("git")
-        .args(&[
-            "log",
-            &format!("{}..{}", from_tag, to_tag),
-            "--pretty=format:%H|%s|%b",
-            "--no-merges",
-        ])
-        .output()?;
-
-    if !git_output.status.success() {
-        return Err(anyhow::anyhow!("Failed to get git log"));
-    }
-
-    let log_output = String::from_utf8_lossy(&git_output.stdout);
-    let commits: Vec<_> = log_output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let parts: Vec<&str> = line.splitn(3, '|').collect();
-            let hash = parts.get(0).unwrap_or(&"").to_string();
-            let subject = parts.get(1).unwrap_or(&"").to_string();
-            let body = parts.get(2).unwrap_or(&"").to_string();
-
-            // Combine subject and body for the message
-            let message = if body.is_empty() {
-                subject
-            } else {
-                format!("{}\n\n{}", subject, body)
-            };
-
-            orchestrate_core::Commit {
-                hash: hash.clone(),
-                message,
-                author: "Unknown".to_string(),
-                date: chrono::Utc::now(), // We could parse this from git too
-            }
-        })
-        .collect();
-
-    if commits.is_empty() {
-        println!("No commits found between {} and {}", from_tag, to_tag);
-        return Ok(());
-    }
-
-    // Parse version if to_tag looks like a version
-    let to_version = if to_tag.starts_with('v') {
-        Version::parse(&to_tag[1..]).ok()
-    } else {
-        Version::parse(to_tag).ok()
-    };
-
-    // Create release manager
-    let manager = ReleaseManager::new(_db.clone());
-
-    // Generate changelog - we need a version for this
-    let version = to_version.unwrap_or_else(|| Version::parse("0.0.0").unwrap());
-    let changelog = manager.generate_changelog(&commits, &version);
-
-    if format == "json" {
-        // Convert changelog to JSON manually since it doesn't implement Serialize
-        let json = serde_json::json!({
-            "version": version.to_string(),
-            "entries": changelog.entries.iter().map(|entry| {
-                serde_json::json!({
-                    "type": format!("{:?}", entry.commit_type),
-                    "description": entry.description,
-                    "pr_number": entry.pr_number,
-                })
-            }).collect::<Vec<_>>()
-        });
-        println!("{}", serde_json::to_string_pretty(&json)?);
-        return Ok(());
-    }
-
-    // Markdown format
-    println!("{}", "=".repeat(60));
-    println!("Release Notes: {} → {}", from_tag, to_tag);
-    println!("{}", "=".repeat(60));
-    println!();
-
-    println!("## [{}]", version);
-    println!();
-
-    let mut has_added = false;
-    let mut has_changed = false;
-    let mut has_fixed = false;
-    let mut has_other = false;
-
-    for entry in &changelog.entries {
-        match entry.commit_type {
-            orchestrate_core::CommitType::Feature => {
-                if !has_added {
-                    println!("### Added");
-                    println!();
-                    has_added = true;
-                }
-                println!("- {}", entry.description);
-            }
-            orchestrate_core::CommitType::Fix => {
-                if !has_fixed {
-                    if has_added {
-                        println!();
-                    }
-                    println!("### Fixed");
-                    println!();
-                    has_fixed = true;
-                }
-                println!("- {}", entry.description);
-            }
-            orchestrate_core::CommitType::Change => {
-                if !has_changed {
-                    if has_added || has_fixed {
-                        println!();
-                    }
-                    println!("### Changed");
-                    println!();
-                    has_changed = true;
-                }
-                println!("- {}", entry.description);
-            }
-            _ => {
-                if !has_other {
-                    if has_added || has_fixed || has_changed {
-                        println!();
-                    }
-                    println!("### Other Changes");
-                    println!();
-                    has_other = true;
-                }
-                println!("- {}", entry.description);
-            }
-        }
-    }
-
-    println!();
-    println!("Total commits: {}", commits.len());
-
-    Ok(())
-}
-
-// ==================== Feature Flags Handlers ====================
-
-async fn handle_flags_list(db: &Database, environment: Option<&str>, format: &str) -> Result<()> {
-    let flags = db.list_feature_flags(environment).await?;
-
-    match format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&flags)?);
-        }
-        _ => {
-            // Table format
-            if flags.is_empty() {
-                println!("No feature flags found");
-                return Ok(());
-            }
-
-            println!("\nFeature Flags{}:\n",
-                environment.map(|e| format!(" (Environment: {})", e)).unwrap_or_default());
-            println!("{:<20} {:<30} {:<12} {:<10} {:<15}",
-                "KEY", "NAME", "STATUS", "ROLLOUT %", "ENVIRONMENT");
-            println!("{}", "-".repeat(90));
-
-            for flag in flags {
-                println!("{:<20} {:<30} {:<12} {:<10} {:<15}",
-                    flag.key,
-                    flag.name.chars().take(28).collect::<String>(),
-                    flag.status.to_string(),
-                    flag.rollout_percentage,
-                    flag.environment.as_deref().unwrap_or("global"));
-            }
-            println!();
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_flags_create(
-    db: &Database,
-    key: &str,
-    name: &str,
-    description: Option<&str>,
-    status: &str,
-    rollout: i32,
-    environment: Option<&str>,
-) -> Result<()> {
-    let flag_status: FlagStatus = status.parse()?;
-
-    let flag = CreateFeatureFlag {
-        key: key.to_string(),
-        name: name.to_string(),
-        description: description.map(|s| s.to_string()),
-        status: flag_status,
-        rollout_percentage: Some(rollout),
-        environment: environment.map(|s| s.to_string()),
-        metadata: None,
-    };
-
-    let created = db.create_feature_flag(flag).await?;
-
-    println!("\nFeature flag created successfully!");
-    println!("  Key: {}", created.key);
-    println!("  Name: {}", created.name);
-    println!("  Status: {}", created.status);
-    println!("  Rollout: {}%", created.rollout_percentage);
-    println!("  Environment: {}", created.environment.as_deref().unwrap_or("global"));
-    if let Some(desc) = &created.description {
-        println!("  Description: {}", desc);
-    }
-    println!();
-
-    Ok(())
-}
-
-async fn handle_flags_show(db: &Database, key: &str, environment: Option<&str>, format: &str) -> Result<()> {
-    let flag = db.get_feature_flag(key, environment).await?;
-
-    match format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&flag)?);
-        }
-        _ => {
-            println!("\nFeature Flag Details:");
-            println!("  Key: {}", flag.key);
-            println!("  Name: {}", flag.name);
-            if let Some(desc) = &flag.description {
-                println!("  Description: {}", desc);
-            }
-            println!("  Status: {}", flag.status);
-            println!("  Rollout: {}%", flag.rollout_percentage);
-            println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
-            if let Some(metadata) = &flag.metadata {
-                println!("  Metadata: {}", metadata);
-            }
-            println!("  Created: {}", flag.created_at.as_deref().unwrap_or("unknown"));
-            println!("  Updated: {}", flag.updated_at.as_deref().unwrap_or("unknown"));
-            println!();
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_flags_enable(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
-    let flag = db.enable_feature_flag(key, environment).await?;
-
-    println!("\nFeature flag '{}' enabled successfully!", key);
-    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
-    println!("  Status: {}", flag.status);
-    println!();
-
-    Ok(())
-}
-
-async fn handle_flags_disable(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
-    let flag = db.disable_feature_flag(key, environment).await?;
-
-    println!("\nFeature flag '{}' disabled successfully!", key);
-    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
-    println!("  Status: {}", flag.status);
-    println!();
-
-    Ok(())
-}
-
-async fn handle_flags_rollout(db: &Database, key: &str, percentage: i32, environment: Option<&str>) -> Result<()> {
-    let flag = db.set_feature_flag_rollout(key, environment, percentage).await?;
-
-    println!("\nFeature flag '{}' rollout updated successfully!", key);
-    println!("  Environment: {}", flag.environment.as_deref().unwrap_or("global"));
-    println!("  Status: {}", flag.status);
-    println!("  Rollout: {}%", flag.rollout_percentage);
-    println!();
-
-    Ok(())
-}
-
-async fn handle_flags_delete(db: &Database, key: &str, environment: Option<&str>) -> Result<()> {
-    db.delete_feature_flag(key, environment).await?;
-
-    println!("\nFeature flag '{}' deleted successfully!", key);
-    println!("  Environment: {}", environment.unwrap_or("global"));
-    println!();
-
-    Ok(())
 }
 

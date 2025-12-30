@@ -9,8 +9,7 @@ export function Navbar() {
     { to: '/agents', label: 'Agents' },
     { to: '/pipelines', label: 'Pipelines' },
     { to: '/schedules', label: 'Schedules' },
-    { to: '/deployments', label: 'Deployments' },
-    { to: '/releases', label: 'Releases' },
+    { to: '/monitoring', label: 'Monitoring' },
   ];
 
   return (

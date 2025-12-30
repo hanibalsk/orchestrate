@@ -1,0 +1,43 @@
+# Prometheus Configuration for Orchestrate Monitoring
+# This file configures Prometheus to scrape metrics from the Orchestrate web service
+
+global:
+  scrape_interval: 15s # How frequently to scrape targets
+  evaluation_interval: 15s # How frequently to evaluate rules
+  external_labels:
+    cluster: 'orchestrate'
+    environment: 'production'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager:9093'
+
+# Load alerting rules
+rule_files:
+  - 'alerts.yml'
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Orchestrate web service
+  - job_name: 'orchestrate'
+    static_configs:
+      # Update this target to point to your Orchestrate web service
+      # For Docker: use service name (e.g., 'orchestrate-web:8080')
+      # For local: use 'host.docker.internal:8080' or 'localhost:8080'
+      - targets: ['host.docker.internal:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # Node Exporter (optional - for system metrics)
+  # - job_name: 'node'
+  #   static_configs:
+  #     - targets: ['node-exporter:9100']
