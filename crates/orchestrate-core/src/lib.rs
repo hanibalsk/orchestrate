@@ -20,7 +20,7 @@ mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
 #[cfg(test)]
-mod database_requirements_tests;
+mod database_multi_repo_tests;
 pub mod documentation;
 pub mod epic;
 pub mod requirements;
