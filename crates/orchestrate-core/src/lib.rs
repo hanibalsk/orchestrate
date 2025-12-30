@@ -73,6 +73,7 @@ pub mod recovery;
 pub mod work_evaluation;
 pub mod code_review;
 pub mod pr_workflow;
+pub mod epic_discovery;
 #[cfg(test)]
 mod database_stuck_detection_tests;
 #[cfg(test)]
@@ -339,4 +340,11 @@ pub use pr_workflow::{
     CiAggregateStatus, ConflictInfo, ConflictResolutionStrategy, MergeMethod, PrDescription,
     PrStateTransition, PrWorkflowAction, PrWorkflowConfig, PrWorkflowContext, PrWorkflowManager,
     PrWorkflowRecord, PrWorkflowState,
+};
+
+// Re-export epic discovery types (Epic 016 - Story 11)
+pub use epic_discovery::{
+    DiscoveredEpic, DiscoveredStory, EpicDiscoveryConfig, EpicDiscoveryService,
+    EpicProcessingStatus, ExecutionPlan, StoryDependencyGraph, StoryProcessingStatus,
+    WorkQueueItem,
 };
