@@ -748,6 +748,7 @@ If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <re
             AgentType::BackgroundController => "background-controller.md",
             AgentType::Scheduler => "scheduler.md",
             AgentType::RegressionTester => "regression-tester.md",
+            AgentType::TestGenerator => "test-generator.md",
             AgentType::IssueTriager => "issue-triager.md",
             AgentType::DocGenerator => "doc-generator.md",
             AgentType::RequirementsAnalyzer => "requirements-analyzer.md",

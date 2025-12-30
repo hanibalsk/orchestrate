@@ -133,6 +133,7 @@ pub enum AgentType {
 
     // Testing agents
     RegressionTester,
+    TestGenerator,
 
     // Issue management
     IssueTriager,
@@ -171,6 +172,7 @@ impl AgentType {
             AgentType::PrController => "pr_controller",
             AgentType::ConflictResolver => "conflict_resolver",
             AgentType::RegressionTester => "regression_tester",
+            AgentType::TestGenerator => "test_generator",
             AgentType::IssueTriager => "issue_triager",
             AgentType::BackgroundController => "background_controller",
             AgentType::Scheduler => "scheduler",
@@ -195,6 +197,7 @@ impl AgentType {
             "pr_controller" => Ok(AgentType::PrController),
             "conflict_resolver" => Ok(AgentType::ConflictResolver),
             "regression_tester" => Ok(AgentType::RegressionTester),
+            "test_generator" => Ok(AgentType::TestGenerator),
             "issue_triager" => Ok(AgentType::IssueTriager),
             "background_controller" => Ok(AgentType::BackgroundController),
             "scheduler" => Ok(AgentType::Scheduler),
@@ -236,6 +239,9 @@ impl AgentType {
             AgentType::RegressionTester => {
                 vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
             }
+            AgentType::TestGenerator => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+            }
             AgentType::IssueTriager => vec!["Bash", "Read", "Glob", "Grep"],
             AgentType::BackgroundController => {
                 vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
@@ -265,6 +271,7 @@ impl AgentType {
             AgentType::IssueFixer => 40,
             AgentType::ConflictResolver => 30,
             AgentType::RegressionTester => 50,
+            AgentType::TestGenerator => 50,
             AgentType::IssueTriager => 30,
             AgentType::DocGenerator => 50,
             AgentType::RequirementsAnalyzer => 40,
@@ -527,6 +534,58 @@ mod tests {
         assert_eq!(AgentType::Explorer.default_max_turns(), 20);
         assert_eq!(AgentType::CodeReviewer.default_max_turns(), 30);
         assert_eq!(AgentType::StoryDeveloper.default_max_turns(), 80);
+    }
+
+    // ==================== TestGenerator Agent Tests ====================
+
+    #[test]
+    fn test_test_generator_agent_type_exists() {
+        // TestGenerator should be a valid agent type
+        let agent = Agent::new(AgentType::TestGenerator, "Generate tests for user.rs");
+        assert_eq!(agent.agent_type, AgentType::TestGenerator);
+        assert_eq!(agent.task, "Generate tests for user.rs");
+    }
+
+    #[test]
+    fn test_test_generator_as_str() {
+        assert_eq!(AgentType::TestGenerator.as_str(), "test_generator");
+    }
+
+    #[test]
+    fn test_test_generator_from_str() {
+        assert_eq!(
+            AgentType::from_str("test_generator").unwrap(),
+            AgentType::TestGenerator
+        );
+    }
+
+    #[test]
+    fn test_test_generator_allowed_tools() {
+        let tools = AgentType::TestGenerator.allowed_tools();
+        // TestGenerator needs to read code, search patterns, run tests
+        assert!(tools.contains(&"Read"));
+        assert!(tools.contains(&"Glob"));
+        assert!(tools.contains(&"Grep"));
+        assert!(tools.contains(&"Bash"));
+        assert!(tools.contains(&"Write"));
+        assert!(tools.contains(&"Edit"));
+        // Should not have Task tool (focused agent)
+        assert!(!tools.contains(&"Task"));
+    }
+
+    #[test]
+    fn test_test_generator_default_model() {
+        // TestGenerator should use sonnet for code analysis
+        assert_eq!(
+            AgentType::TestGenerator.default_model(),
+            "claude-sonnet-4-20250514"
+        );
+    }
+
+    #[test]
+    fn test_test_generator_max_turns() {
+        // TestGenerator needs moderate turns for analyzing and writing tests
+        assert_eq!(AgentType::TestGenerator.default_max_turns(), 50);
     }
 
     // ==================== Agent Tests ====================
