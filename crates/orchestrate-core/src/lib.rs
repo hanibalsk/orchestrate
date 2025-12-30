@@ -8,6 +8,7 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
+pub mod autonomous_session;
 pub mod approval;
 pub mod approval_service;
 pub mod condition_evaluator;
@@ -19,6 +20,8 @@ mod database_approval_tests;
 mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
+#[cfg(test)]
+mod database_autonomous_session_tests;
 #[cfg(test)]
 mod database_incident_tests;
 pub mod documentation;
@@ -263,4 +266,10 @@ pub use test_stubs::{
     SlackService, SlackUserService,
     TestFramework, TestQualityIssue, TestQualityIssueType, TestQualityReport,
     TestResult, TestResultStatus, TestRun, TestRunStatus,
+};
+
+// Re-export autonomous session types (Epic 016)
+pub use autonomous_session::{
+    AutonomousSession, AutonomousSessionState, CompletedItem, SessionConfig, SessionMetrics,
+    SessionStateHistory, WorkItem, WorkItemType,
 };

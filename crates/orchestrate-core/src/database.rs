@@ -169,6 +169,12 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/016_incidents.sql"))
             .execute(&self.pool)
             .await?;
+        // Autonomous sessions migration (Epic 016)
+        sqlx::query(include_str!(
+            "../../../migrations/020_autonomous_sessions.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -6921,5 +6927,333 @@ impl TryFrom<AuditEntryRow> for crate::monitoring::AuditEntry {
             ip_address: None,
             user_agent: None,
         })
+    }
+}
+
+// ==================== Autonomous Session Row ====================
+
+#[derive(Debug, sqlx::FromRow)]
+struct AutonomousSessionRow {
+    id: String,
+    state: String,
+    started_at: String,
+    updated_at: String,
+    completed_at: Option<String>,
+    current_epic_id: Option<String>,
+    current_story_id: Option<String>,
+    current_agent_id: Option<String>,
+    config: String,
+    work_queue: String,
+    completed_items: String,
+    metrics: String,
+    error_message: Option<String>,
+    blocked_reason: Option<String>,
+    pause_reason: Option<String>,
+    created_at: String,
+}
+
+/// Parse datetime from either RFC3339 or SQLite format
+fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    // Try RFC3339 first
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.into());
+    }
+    // Try SQLite format (YYYY-MM-DD HH:MM:SS)
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            dt,
+            chrono::Utc,
+        ));
+    }
+    Err(crate::Error::Other(format!(
+        "Failed to parse datetime: {}",
+        s
+    )))
+}
+
+impl AutonomousSessionRow {
+    fn into_session(self) -> Result<crate::autonomous_session::AutonomousSession> {
+        Ok(crate::autonomous_session::AutonomousSession {
+            id: self.id,
+            state: crate::autonomous_session::AutonomousSessionState::from_str(&self.state)?,
+            started_at: parse_datetime(&self.started_at)?,
+            updated_at: parse_datetime(&self.updated_at)?,
+            completed_at: self.completed_at.map(|s| parse_datetime(&s)).transpose()?,
+            current_epic_id: self.current_epic_id,
+            current_story_id: self.current_story_id,
+            current_agent_id: self.current_agent_id,
+            config: serde_json::from_str(&self.config)?,
+            work_queue: serde_json::from_str(&self.work_queue)?,
+            completed_items: serde_json::from_str(&self.completed_items)?,
+            metrics: serde_json::from_str(&self.metrics)?,
+            error_message: self.error_message,
+            blocked_reason: self.blocked_reason,
+            pause_reason: self.pause_reason,
+            created_at: parse_datetime(&self.created_at)?,
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SessionHistoryRow {
+    id: i64,
+    session_id: String,
+    from_state: String,
+    to_state: String,
+    reason: Option<String>,
+    transitioned_at: String,
+    metadata: String,
+    created_at: String,
+}
+
+impl SessionHistoryRow {
+    fn into_history(self) -> Result<crate::autonomous_session::SessionStateHistory> {
+        Ok(crate::autonomous_session::SessionStateHistory {
+            id: self.id,
+            session_id: self.session_id,
+            from_state: crate::autonomous_session::AutonomousSessionState::from_str(
+                &self.from_state,
+            )?,
+            to_state: crate::autonomous_session::AutonomousSessionState::from_str(&self.to_state)?,
+            reason: self.reason,
+            transitioned_at: parse_datetime(&self.transitioned_at)?,
+            metadata: serde_json::from_str(&self.metadata)?,
+            created_at: parse_datetime(&self.created_at)?,
+        })
+    }
+}
+
+impl Database {
+    // ==================== Autonomous Session Operations ====================
+
+    /// Create a new autonomous session
+    pub async fn create_autonomous_session(
+        &self,
+        session: &crate::autonomous_session::AutonomousSession,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO autonomous_sessions (
+                id, state, started_at, updated_at, completed_at,
+                current_epic_id, current_story_id, current_agent_id,
+                config, work_queue, completed_items, metrics,
+                error_message, blocked_reason, pause_reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&session.id)
+        .bind(session.state.as_str())
+        .bind(session.started_at.to_rfc3339())
+        .bind(session.updated_at.to_rfc3339())
+        .bind(session.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(&session.current_epic_id)
+        .bind(&session.current_story_id)
+        .bind(&session.current_agent_id)
+        .bind(serde_json::to_string(&session.config)?)
+        .bind(serde_json::to_string(&session.work_queue)?)
+        .bind(serde_json::to_string(&session.completed_items)?)
+        .bind(serde_json::to_string(&session.metrics)?)
+        .bind(&session.error_message)
+        .bind(&session.blocked_reason)
+        .bind(&session.pause_reason)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update an autonomous session
+    pub async fn update_autonomous_session(
+        &self,
+        session: &crate::autonomous_session::AutonomousSession,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE autonomous_sessions SET
+                state = ?, updated_at = ?, completed_at = ?,
+                current_epic_id = ?, current_story_id = ?, current_agent_id = ?,
+                config = ?, work_queue = ?, completed_items = ?, metrics = ?,
+                error_message = ?, blocked_reason = ?, pause_reason = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(session.state.as_str())
+        .bind(session.updated_at.to_rfc3339())
+        .bind(session.completed_at.map(|dt| dt.to_rfc3339()))
+        .bind(&session.current_epic_id)
+        .bind(&session.current_story_id)
+        .bind(&session.current_agent_id)
+        .bind(serde_json::to_string(&session.config)?)
+        .bind(serde_json::to_string(&session.work_queue)?)
+        .bind(serde_json::to_string(&session.completed_items)?)
+        .bind(serde_json::to_string(&session.metrics)?)
+        .bind(&session.error_message)
+        .bind(&session.blocked_reason)
+        .bind(&session.pause_reason)
+        .bind(&session.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get an autonomous session by ID
+    pub async fn get_autonomous_session(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::autonomous_session::AutonomousSession>> {
+        let row = sqlx::query_as::<_, AutonomousSessionRow>(
+            r#"
+            SELECT id, state, started_at, updated_at, completed_at,
+                   current_epic_id, current_story_id, current_agent_id,
+                   config, work_queue, completed_items, metrics,
+                   error_message, blocked_reason, pause_reason, created_at
+            FROM autonomous_sessions
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_session()).transpose()
+    }
+
+    /// Get the current active autonomous session (if any)
+    pub async fn get_active_autonomous_session(
+        &self,
+    ) -> Result<Option<crate::autonomous_session::AutonomousSession>> {
+        let row = sqlx::query_as::<_, AutonomousSessionRow>(
+            r#"
+            SELECT id, state, started_at, updated_at, completed_at,
+                   current_epic_id, current_story_id, current_agent_id,
+                   config, work_queue, completed_items, metrics,
+                   error_message, blocked_reason, pause_reason, created_at
+            FROM autonomous_sessions
+            WHERE state NOT IN ('done', 'paused')
+            ORDER BY started_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.into_session()).transpose()
+    }
+
+    /// List autonomous sessions with optional state filter
+    pub async fn list_autonomous_sessions(
+        &self,
+        state: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<crate::autonomous_session::AutonomousSession>> {
+        let mut query = String::from(
+            r#"
+            SELECT id, state, started_at, updated_at, completed_at,
+                   current_epic_id, current_story_id, current_agent_id,
+                   config, work_queue, completed_items, metrics,
+                   error_message, blocked_reason, pause_reason, created_at
+            FROM autonomous_sessions
+            WHERE 1=1
+            "#,
+        );
+
+        if state.is_some() {
+            query.push_str(" AND state = ?");
+        }
+
+        query.push_str(" ORDER BY started_at DESC");
+
+        if let Some(limit) = limit {
+            query.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        let mut q = sqlx::query_as::<_, AutonomousSessionRow>(&query);
+        if let Some(s) = state {
+            q = q.bind(s);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter().map(|r| r.into_session()).collect()
+    }
+
+    /// Delete an autonomous session
+    pub async fn delete_autonomous_session(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM autonomous_sessions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record a state transition in the history
+    pub async fn record_session_state_transition(
+        &self,
+        session_id: &str,
+        from_state: crate::autonomous_session::AutonomousSessionState,
+        to_state: crate::autonomous_session::AutonomousSessionState,
+        reason: Option<&str>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO autonomous_session_history (
+                session_id, from_state, to_state, reason, transitioned_at, metadata
+            )
+            VALUES (?, ?, ?, ?, datetime('now'), ?)
+            "#,
+        )
+        .bind(session_id)
+        .bind(from_state.as_str())
+        .bind(to_state.as_str())
+        .bind(reason)
+        .bind(serde_json::to_string(&metadata.unwrap_or(serde_json::Value::Null))?)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get state transition history for a session
+    pub async fn get_session_state_history(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::autonomous_session::SessionStateHistory>> {
+        let rows = sqlx::query_as::<_, SessionHistoryRow>(
+            r#"
+            SELECT id, session_id, from_state, to_state, reason,
+                   transitioned_at, metadata, created_at
+            FROM autonomous_session_history
+            WHERE session_id = ?
+            ORDER BY transitioned_at ASC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_history()).collect()
+    }
+
+    /// Get sessions by state
+    pub async fn get_sessions_by_state(
+        &self,
+        state: crate::autonomous_session::AutonomousSessionState,
+    ) -> Result<Vec<crate::autonomous_session::AutonomousSession>> {
+        self.list_autonomous_sessions(Some(state.as_str()), None)
+            .await
+    }
+
+    /// Count sessions by state
+    pub async fn count_sessions_by_state(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT state, COUNT(*) as count FROM autonomous_sessions GROUP BY state",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().collect())
     }
 }
