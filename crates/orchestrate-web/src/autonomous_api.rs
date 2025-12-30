@@ -27,6 +27,11 @@ use std::sync::Arc;
 
 use crate::api::{ApiError, AppState};
 
+// Input validation constants
+const MAX_EPIC_PATTERN_LENGTH: usize = 256;
+const MAX_AGENTS_LIMIT: u32 = 100;
+const MAX_RETRIES_LIMIT: u32 = 10;
+
 /// Create the autonomous processing API router
 pub fn create_autonomous_router() -> Router<Arc<AppState>> {
     Router::new()
@@ -203,6 +208,63 @@ pub struct UnblockRequest {
     pub notes: Option<String>,
 }
 
+// ==================== Validation ====================
+
+/// Validate epic pattern input
+fn validate_epic_pattern(pattern: &Option<String>) -> Result<(), ApiError> {
+    if let Some(p) = pattern {
+        // Check length
+        if p.len() > MAX_EPIC_PATTERN_LENGTH {
+            return Err(ApiError::bad_request(format!(
+                "epic_pattern exceeds maximum length of {} characters",
+                MAX_EPIC_PATTERN_LENGTH
+            )));
+        }
+
+        // Check for path traversal attempts
+        if p.contains("..") || p.contains("//") || p.starts_with('/') || p.starts_with('\\') {
+            return Err(ApiError::bad_request(
+                "epic_pattern contains invalid path characters",
+            ));
+        }
+
+        // Check for null bytes
+        if p.contains('\0') {
+            return Err(ApiError::bad_request(
+                "epic_pattern contains null bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate auto process configuration
+fn validate_auto_process_config(config: &Option<AutoProcessConfig>) -> Result<(), ApiError> {
+    if let Some(c) = config {
+        if let Some(max_agents) = c.max_agents {
+            if max_agents == 0 {
+                return Err(ApiError::bad_request("max_agents must be at least 1"));
+            }
+            if max_agents > MAX_AGENTS_LIMIT {
+                return Err(ApiError::bad_request(format!(
+                    "max_agents exceeds maximum of {}",
+                    MAX_AGENTS_LIMIT
+                )));
+            }
+        }
+
+        if let Some(max_retries) = c.max_retries {
+            if max_retries > MAX_RETRIES_LIMIT {
+                return Err(ApiError::bad_request(format!(
+                    "max_retries exceeds maximum of {}",
+                    MAX_RETRIES_LIMIT
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ==================== Handlers ====================
 
 /// Start autonomous processing for an epic
@@ -210,6 +272,10 @@ async fn start_auto_process(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartAutoProcessRequest>,
 ) -> Result<Json<StartAutoProcessResponse>, ApiError> {
+    // Validate inputs
+    validate_epic_pattern(&req.epic_pattern)?;
+    validate_auto_process_config(&req.config)?;
+
     // Check if there's already an active session
     let active_session = state
         .db
@@ -760,5 +826,84 @@ mod tests {
         };
         // Just verify it creates without panic
         assert!(config.max_agents.is_none());
+    }
+
+    // ==================== Validation Tests ====================
+
+    #[test]
+    fn test_validate_epic_pattern_valid() {
+        assert!(validate_epic_pattern(&None).is_ok());
+        assert!(validate_epic_pattern(&Some("epic-016".to_string())).is_ok());
+        assert!(validate_epic_pattern(&Some("epic-*".to_string())).is_ok());
+        assert!(validate_epic_pattern(&Some("epic-016-story-1".to_string())).is_ok());
+    }
+
+    #[test]
+    fn test_validate_epic_pattern_too_long() {
+        let long_pattern = "a".repeat(MAX_EPIC_PATTERN_LENGTH + 1);
+        let result = validate_epic_pattern(&Some(long_pattern));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_epic_pattern_path_traversal() {
+        assert!(validate_epic_pattern(&Some("../etc/passwd".to_string())).is_err());
+        assert!(validate_epic_pattern(&Some("epic/../secret".to_string())).is_err());
+        assert!(validate_epic_pattern(&Some("/etc/passwd".to_string())).is_err());
+        assert!(validate_epic_pattern(&Some("\\windows\\system32".to_string())).is_err());
+        assert!(validate_epic_pattern(&Some("epic//double".to_string())).is_err());
+    }
+
+    #[test]
+    fn test_validate_epic_pattern_null_bytes() {
+        assert!(validate_epic_pattern(&Some("epic\0-016".to_string())).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_valid() {
+        assert!(validate_auto_process_config(&None).is_ok());
+        assert!(validate_auto_process_config(&Some(AutoProcessConfig {
+            max_agents: Some(5),
+            max_retries: Some(3),
+            dry_run: None,
+            auto_merge: None,
+            model: None,
+        })).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_max_agents_zero() {
+        let result = validate_auto_process_config(&Some(AutoProcessConfig {
+            max_agents: Some(0),
+            max_retries: None,
+            dry_run: None,
+            auto_merge: None,
+            model: None,
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_config_max_agents_exceeds_limit() {
+        let result = validate_auto_process_config(&Some(AutoProcessConfig {
+            max_agents: Some(MAX_AGENTS_LIMIT + 1),
+            max_retries: None,
+            dry_run: None,
+            auto_merge: None,
+            model: None,
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_config_max_retries_exceeds_limit() {
+        let result = validate_auto_process_config(&Some(AutoProcessConfig {
+            max_agents: None,
+            max_retries: Some(MAX_RETRIES_LIMIT + 1),
+            dry_run: None,
+            auto_merge: None,
+            model: None,
+        }));
+        assert!(result.is_err());
     }
 }
