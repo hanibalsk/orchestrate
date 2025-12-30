@@ -7012,7 +7012,7 @@ impl AutonomousSessionRow {
     fn into_session(self) -> Result<crate::autonomous_session::AutonomousSession> {
         Ok(crate::autonomous_session::AutonomousSession {
             id: self.id,
-            state: crate::autonomous_session::AutonomousSessionState::from_str(&self.state)?,
+            state: self.state.parse()?,
             started_at: parse_datetime(&self.started_at)?,
             updated_at: parse_datetime(&self.updated_at)?,
             completed_at: self.completed_at.map(|s| parse_datetime(&s)).transpose()?,
@@ -7048,10 +7048,8 @@ impl SessionHistoryRow {
         Ok(crate::autonomous_session::SessionStateHistory {
             id: self.id,
             session_id: self.session_id,
-            from_state: crate::autonomous_session::AutonomousSessionState::from_str(
-                &self.from_state,
-            )?,
-            to_state: crate::autonomous_session::AutonomousSessionState::from_str(&self.to_state)?,
+            from_state: self.from_state.parse()?,
+            to_state: self.to_state.parse()?,
             reason: self.reason,
             transitioned_at: parse_datetime(&self.transitioned_at)?,
             metadata: serde_json::from_str(&self.metadata)?,

@@ -63,29 +63,6 @@ impl AutonomousSessionState {
         }
     }
 
-    /// Parse from string representation
-    pub fn from_str(s: &str) -> crate::Result<Self> {
-        match s {
-            "idle" => Ok(Self::Idle),
-            "analyzing" => Ok(Self::Analyzing),
-            "discovering" => Ok(Self::Discovering),
-            "planning" => Ok(Self::Planning),
-            "executing" => Ok(Self::Executing),
-            "reviewing" => Ok(Self::Reviewing),
-            "pr_creation" => Ok(Self::PrCreation),
-            "pr_monitoring" => Ok(Self::PrMonitoring),
-            "pr_fixing" => Ok(Self::PrFixing),
-            "pr_merging" => Ok(Self::PrMerging),
-            "completing" => Ok(Self::Completing),
-            "done" => Ok(Self::Done),
-            "blocked" => Ok(Self::Blocked),
-            "paused" => Ok(Self::Paused),
-            _ => Err(crate::Error::Other(format!(
-                "Unknown autonomous session state: {}",
-                s
-            ))),
-        }
-    }
 
     /// Check if this state allows transition to another state
     pub fn can_transition_to(&self, target: AutonomousSessionState) -> bool {
@@ -155,6 +132,39 @@ impl AutonomousSessionState {
     /// Check if session can accept new work
     pub fn can_accept_work(&self) -> bool {
         matches!(self, Self::Idle | Self::Planning | Self::Executing)
+    }
+}
+
+impl std::str::FromStr for AutonomousSessionState {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "idle" => Ok(Self::Idle),
+            "analyzing" => Ok(Self::Analyzing),
+            "discovering" => Ok(Self::Discovering),
+            "planning" => Ok(Self::Planning),
+            "executing" => Ok(Self::Executing),
+            "reviewing" => Ok(Self::Reviewing),
+            "pr_creation" => Ok(Self::PrCreation),
+            "pr_monitoring" => Ok(Self::PrMonitoring),
+            "pr_fixing" => Ok(Self::PrFixing),
+            "pr_merging" => Ok(Self::PrMerging),
+            "completing" => Ok(Self::Completing),
+            "done" => Ok(Self::Done),
+            "blocked" => Ok(Self::Blocked),
+            "paused" => Ok(Self::Paused),
+            _ => Err(crate::Error::Other(format!(
+                "Unknown autonomous session state: {}",
+                s
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for AutonomousSessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -638,22 +648,22 @@ mod tests {
     #[test]
     fn test_state_from_str() {
         assert_eq!(
-            AutonomousSessionState::from_str("idle").unwrap(),
+            "idle".parse::<AutonomousSessionState>().unwrap(),
             AutonomousSessionState::Idle
         );
         assert_eq!(
-            AutonomousSessionState::from_str("analyzing").unwrap(),
+            "analyzing".parse::<AutonomousSessionState>().unwrap(),
             AutonomousSessionState::Analyzing
         );
         assert_eq!(
-            AutonomousSessionState::from_str("pr_creation").unwrap(),
+            "pr_creation".parse::<AutonomousSessionState>().unwrap(),
             AutonomousSessionState::PrCreation
         );
         assert_eq!(
-            AutonomousSessionState::from_str("done").unwrap(),
+            "done".parse::<AutonomousSessionState>().unwrap(),
             AutonomousSessionState::Done
         );
-        assert!(AutonomousSessionState::from_str("invalid").is_err());
+        assert!("invalid".parse::<AutonomousSessionState>().is_err());
     }
 
     #[test]
