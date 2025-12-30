@@ -246,6 +246,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 /// Create the full router with both API, UI routes, and optional webhook endpoint
 pub fn create_router_with_webhook(state: Arc<AppState>, webhook_secret: Option<String>) -> Router {
     let api_router = create_api_router(state.clone());
+    let autonomous_router = crate::autonomous_api::create_autonomous_router().with_state(state.clone());
     let ui_router = crate::ui::create_ui_router().with_state(state.clone());
     let monitoring_router = crate::monitoring::create_monitoring_router().with_state(state.clone());
 
@@ -254,6 +255,7 @@ pub fn create_router_with_webhook(state: Arc<AppState>, webhook_secret: Option<S
 
     let mut router = Router::new()
         .merge(api_router)
+        .merge(autonomous_router)
         .merge(monitoring_router)
         .merge(ui_router)
         .route(

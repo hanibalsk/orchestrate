@@ -7821,6 +7821,25 @@ impl Database {
         Ok(rows.into_iter().collect())
     }
 
+    /// Get stuck detections for a session
+    pub async fn get_stuck_detections_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::stuck_detection::StuckDetection>> {
+        let rows = sqlx::query_as::<_, StuckDetectionRow>(
+            r#"
+            SELECT * FROM stuck_agent_detections
+            WHERE session_id = ?
+            ORDER BY detected_at DESC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.into_detection()).collect()
+    }
+
     // ==================== Recovery Attempt Operations (Epic 016 - Story 7) ====================
 
     /// Create a new recovery attempt
