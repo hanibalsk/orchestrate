@@ -146,9 +146,9 @@ pub use pipeline_template::PipelineTemplate;
 
 // Re-export model selection types
 pub use model_selection::{
-    classify_task_complexity, model_to_tier, AlternativeModel, ModelPerformance,
-    ModelRecommendation, ModelSelectionConfig, ModelSelectionRule, ModelTier, OptimizationGoal,
-    TaskComplexity,
+    classify_task_complexity, model_to_tier, models, AlternativeModel, AutoModelSelector,
+    AutoSelectionFactors, AutoSelectionReason, ModelPerformance, ModelRecommendation,
+    ModelSelectionConfig, ModelSelectionRule, ModelTier, OptimizationGoal, TaskComplexity,
 };
 
 // Re-export prompt optimization types

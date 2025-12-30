@@ -408,6 +408,231 @@ pub fn model_to_tier(model: &str) -> ModelTier {
     }
 }
 
+// ==================== Epic 016 Extensions ====================
+
+/// Model identifier constants for easy reference
+pub mod models {
+    pub const OPUS: &str = "claude-opus-4-20250514";
+    pub const SONNET: &str = "claude-sonnet-4-20250514";
+    pub const HAIKU: &str = "claude-3-5-haiku-20241022";
+}
+
+impl ModelTier {
+    /// Get the next tier up (for escalation)
+    pub fn escalate(&self) -> Option<Self> {
+        match self {
+            Self::Fast => Some(Self::Balanced),
+            Self::Balanced => Some(Self::Smart),
+            Self::Smart => Some(Self::Premium),
+            Self::Premium => None,
+        }
+    }
+
+    /// Get the next tier down (for cost optimization)
+    pub fn deescalate(&self) -> Option<Self> {
+        match self {
+            Self::Premium => Some(Self::Smart),
+            Self::Smart => Some(Self::Balanced),
+            Self::Balanced => Some(Self::Fast),
+            Self::Fast => None,
+        }
+    }
+
+    /// Get the latest model ID for this tier
+    pub fn latest_model_id(&self) -> &'static str {
+        match self {
+            Self::Fast => models::HAIKU,
+            Self::Balanced | Self::Smart => models::SONNET,
+            Self::Premium => models::OPUS,
+        }
+    }
+
+    /// Get approximate cost factor relative to Fast tier
+    pub fn cost_factor(&self) -> f64 {
+        match self {
+            Self::Fast => 1.0,
+            Self::Balanced => 3.0,
+            Self::Smart => 3.0,
+            Self::Premium => 15.0,
+        }
+    }
+}
+
+/// Factors that influence model selection for autonomous processing
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutoSelectionFactors {
+    /// Story points (1-13 typical)
+    pub story_points: Option<u8>,
+    /// Number of files involved
+    pub file_count: Option<u32>,
+    /// Depth of dependencies
+    pub dependency_depth: Option<u32>,
+    /// Number of failed retries
+    pub retry_count: u32,
+    /// Is there a critical review issue?
+    pub critical_review_issue: bool,
+    /// Is context size expected to be large?
+    pub large_context: bool,
+    /// Is this security sensitive?
+    pub security_sensitive: bool,
+}
+
+impl AutoSelectionFactors {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_story_points(mut self, points: u8) -> Self {
+        self.story_points = Some(points);
+        self
+    }
+
+    pub fn with_file_count(mut self, count: u32) -> Self {
+        self.file_count = Some(count);
+        self
+    }
+
+    pub fn with_retries(mut self, count: u32) -> Self {
+        self.retry_count = count;
+        self
+    }
+
+    pub fn critical_issue(mut self) -> Self {
+        self.critical_review_issue = true;
+        self
+    }
+
+    pub fn large_context(mut self) -> Self {
+        self.large_context = true;
+        self
+    }
+
+    pub fn security_sensitive(mut self) -> Self {
+        self.security_sensitive = true;
+        self
+    }
+
+    /// Calculate a complexity score (0-100)
+    pub fn complexity_score(&self) -> u32 {
+        let mut score = 0u32;
+
+        if let Some(points) = self.story_points {
+            score += (points as u32).min(13) * 3;
+        }
+
+        if let Some(count) = self.file_count {
+            score += (count / 2).min(20);
+        }
+
+        if let Some(depth) = self.dependency_depth {
+            score += (depth * 3).min(15);
+        }
+
+        if self.security_sensitive {
+            score += 15;
+        }
+
+        score.min(100)
+    }
+}
+
+/// Selection reasons for audit/tracking
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoSelectionReason {
+    /// Default selection
+    Default,
+    /// Based on task complexity
+    TaskComplexity,
+    /// Escalation due to retries
+    RetryEscalation,
+    /// Critical review issue requires highest tier
+    CriticalIssue,
+    /// Large context requires larger model
+    LargeContext,
+    /// Security sensitive task
+    SecuritySensitive,
+    /// Manual override by user
+    Override,
+}
+
+/// Autonomous model selector for epic processing
+#[derive(Debug, Clone)]
+pub struct AutoModelSelector {
+    /// Default tier if no factors indicate otherwise
+    pub default_tier: ModelTier,
+    /// Escalate after this many retries
+    pub escalation_threshold: u32,
+    /// Score threshold for Premium tier
+    pub premium_threshold: u32,
+    /// Score threshold for Smart tier
+    pub smart_threshold: u32,
+}
+
+impl Default for AutoModelSelector {
+    fn default() -> Self {
+        Self {
+            default_tier: ModelTier::Smart,
+            escalation_threshold: 2,
+            premium_threshold: 70,
+            smart_threshold: 30,
+        }
+    }
+}
+
+impl AutoModelSelector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Select model based on factors
+    pub fn select(&self, factors: &AutoSelectionFactors) -> (ModelTier, AutoSelectionReason) {
+        // Critical issue always uses Premium
+        if factors.critical_review_issue {
+            return (ModelTier::Premium, AutoSelectionReason::CriticalIssue);
+        }
+
+        // Security sensitive uses Premium
+        if factors.security_sensitive {
+            return (ModelTier::Premium, AutoSelectionReason::SecuritySensitive);
+        }
+
+        // Check retry escalation
+        if factors.retry_count >= self.escalation_threshold {
+            let base = self.tier_for_score(factors.complexity_score());
+            if let Some(escalated) = base.escalate() {
+                return (escalated, AutoSelectionReason::RetryEscalation);
+            }
+            return (base, AutoSelectionReason::RetryEscalation);
+        }
+
+        // Large context prefers Smart tier
+        if factors.large_context {
+            return (ModelTier::Smart, AutoSelectionReason::LargeContext);
+        }
+
+        // Select based on complexity score
+        let score = factors.complexity_score();
+        let tier = self.tier_for_score(score);
+        (tier, AutoSelectionReason::TaskComplexity)
+    }
+
+    fn tier_for_score(&self, score: u32) -> ModelTier {
+        if score >= self.premium_threshold {
+            ModelTier::Premium
+        } else if score >= self.smart_threshold {
+            ModelTier::Smart
+        } else {
+            ModelTier::Fast
+        }
+    }
+
+    /// Escalate current tier
+    pub fn escalate(&self, current: ModelTier) -> Option<ModelTier> {
+        current.escalate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +710,178 @@ mod tests {
         // Balanced score should be in between
         let balanced = perf.balanced_score();
         assert!(balanced > 0.5 && balanced < 1.0);
+    }
+
+    // ==================== Epic 016 Extension Tests ====================
+
+    #[test]
+    fn test_model_tier_escalate() {
+        assert_eq!(ModelTier::Fast.escalate(), Some(ModelTier::Balanced));
+        assert_eq!(ModelTier::Balanced.escalate(), Some(ModelTier::Smart));
+        assert_eq!(ModelTier::Smart.escalate(), Some(ModelTier::Premium));
+        assert_eq!(ModelTier::Premium.escalate(), None);
+    }
+
+    #[test]
+    fn test_model_tier_deescalate() {
+        assert_eq!(ModelTier::Premium.deescalate(), Some(ModelTier::Smart));
+        assert_eq!(ModelTier::Smart.deescalate(), Some(ModelTier::Balanced));
+        assert_eq!(ModelTier::Balanced.deescalate(), Some(ModelTier::Fast));
+        assert_eq!(ModelTier::Fast.deescalate(), None);
+    }
+
+    #[test]
+    fn test_model_tier_latest_model_id() {
+        assert_eq!(ModelTier::Fast.latest_model_id(), models::HAIKU);
+        assert_eq!(ModelTier::Balanced.latest_model_id(), models::SONNET);
+        assert_eq!(ModelTier::Smart.latest_model_id(), models::SONNET);
+        assert_eq!(ModelTier::Premium.latest_model_id(), models::OPUS);
+    }
+
+    #[test]
+    fn test_model_tier_cost_factor() {
+        assert_eq!(ModelTier::Fast.cost_factor(), 1.0);
+        assert_eq!(ModelTier::Balanced.cost_factor(), 3.0);
+        assert_eq!(ModelTier::Smart.cost_factor(), 3.0);
+        assert_eq!(ModelTier::Premium.cost_factor(), 15.0);
+    }
+
+    #[test]
+    fn test_auto_selection_factors_builder() {
+        let factors = AutoSelectionFactors::new()
+            .with_story_points(8)
+            .with_file_count(10)
+            .with_retries(1)
+            .critical_issue()
+            .security_sensitive();
+
+        assert_eq!(factors.story_points, Some(8));
+        assert_eq!(factors.file_count, Some(10));
+        assert_eq!(factors.retry_count, 1);
+        assert!(factors.critical_review_issue);
+        assert!(factors.security_sensitive);
+    }
+
+    #[test]
+    fn test_auto_selection_factors_complexity_score() {
+        // Empty factors = 0
+        let empty = AutoSelectionFactors::default();
+        assert_eq!(empty.complexity_score(), 0);
+
+        // Story points contribute
+        let with_points = AutoSelectionFactors::new().with_story_points(8);
+        assert_eq!(with_points.complexity_score(), 24); // 8 * 3 = 24
+
+        // File count contributes
+        let with_files = AutoSelectionFactors::new().with_file_count(20);
+        assert_eq!(with_files.complexity_score(), 10); // 20 / 2 = 10
+
+        // Security sensitive adds 15
+        let security = AutoSelectionFactors::new().security_sensitive();
+        assert_eq!(security.complexity_score(), 15);
+
+        // Combined score capped at 100
+        let high_complexity = AutoSelectionFactors::new()
+            .with_story_points(13)
+            .with_file_count(50)
+            .security_sensitive();
+        assert!(high_complexity.complexity_score() <= 100);
+    }
+
+    #[test]
+    fn test_auto_model_selector_critical_issue_uses_premium() {
+        let selector = AutoModelSelector::new();
+        let factors = AutoSelectionFactors::new().critical_issue();
+
+        let (tier, reason) = selector.select(&factors);
+        assert_eq!(tier, ModelTier::Premium);
+        assert_eq!(reason, AutoSelectionReason::CriticalIssue);
+    }
+
+    #[test]
+    fn test_auto_model_selector_security_sensitive_uses_premium() {
+        let selector = AutoModelSelector::new();
+        let factors = AutoSelectionFactors::new().security_sensitive();
+
+        let (tier, reason) = selector.select(&factors);
+        assert_eq!(tier, ModelTier::Premium);
+        assert_eq!(reason, AutoSelectionReason::SecuritySensitive);
+    }
+
+    #[test]
+    fn test_auto_model_selector_retry_escalation() {
+        let selector = AutoModelSelector::new();
+
+        // 1 retry - no escalation (threshold is 2)
+        let factors_1 = AutoSelectionFactors::new().with_retries(1);
+        let (tier_1, reason_1) = selector.select(&factors_1);
+        assert_ne!(reason_1, AutoSelectionReason::RetryEscalation);
+
+        // 2 retries - should escalate
+        let factors_2 = AutoSelectionFactors::new().with_retries(2);
+        let (tier_2, reason_2) = selector.select(&factors_2);
+        assert_eq!(reason_2, AutoSelectionReason::RetryEscalation);
+        // With no other factors, base tier would be Fast, escalated to Balanced
+        assert_eq!(tier_2, ModelTier::Balanced);
+    }
+
+    #[test]
+    fn test_auto_model_selector_large_context() {
+        let selector = AutoModelSelector::new();
+        let factors = AutoSelectionFactors::new().large_context();
+
+        let (tier, reason) = selector.select(&factors);
+        assert_eq!(tier, ModelTier::Smart);
+        assert_eq!(reason, AutoSelectionReason::LargeContext);
+    }
+
+    #[test]
+    fn test_auto_model_selector_complexity_based() {
+        let selector = AutoModelSelector::new();
+
+        // Low complexity -> Fast
+        let low = AutoSelectionFactors::new().with_story_points(2);
+        let (tier_low, reason_low) = selector.select(&low);
+        assert_eq!(tier_low, ModelTier::Fast);
+        assert_eq!(reason_low, AutoSelectionReason::TaskComplexity);
+
+        // Medium complexity -> Smart (>= 30)
+        let medium = AutoSelectionFactors::new().with_story_points(13);
+        let (tier_medium, _) = selector.select(&medium);
+        assert_eq!(tier_medium, ModelTier::Smart);
+
+        // Higher complexity via more files -> Smart (score ~64)
+        // 13*3=39 (story) + 20 (max file contribution) = 59
+        let higher = AutoSelectionFactors::new()
+            .with_story_points(13)
+            .with_file_count(50);
+        let (tier_higher, _) = selector.select(&higher);
+        assert_eq!(tier_higher, ModelTier::Smart);
+
+        // To get Premium via complexity, need score >= 70
+        // Need to also add dependency_depth: 13*3=39 + 20 + 15 = 74
+        let mut premium = AutoSelectionFactors::new()
+            .with_story_points(13)
+            .with_file_count(50);
+        premium.dependency_depth = Some(5);
+        let (tier_premium, reason_premium) = selector.select(&premium);
+        assert_eq!(tier_premium, ModelTier::Premium);
+        assert_eq!(reason_premium, AutoSelectionReason::TaskComplexity);
+    }
+
+    #[test]
+    fn test_auto_model_selector_escalate() {
+        let selector = AutoModelSelector::new();
+
+        assert_eq!(selector.escalate(ModelTier::Fast), Some(ModelTier::Balanced));
+        assert_eq!(selector.escalate(ModelTier::Smart), Some(ModelTier::Premium));
+        assert_eq!(selector.escalate(ModelTier::Premium), None);
+    }
+
+    #[test]
+    fn test_models_constants() {
+        assert!(models::OPUS.contains("opus"));
+        assert!(models::SONNET.contains("sonnet"));
+        assert!(models::HAIKU.contains("haiku"));
     }
 }
