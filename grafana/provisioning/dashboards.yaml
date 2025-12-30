@@ -1,0 +1,26 @@
+# Grafana Dashboard Provisioning Configuration
+# This file configures Grafana to automatically load dashboards from the dashboards directory
+#
+# To use this configuration:
+# 1. Copy this file to your Grafana provisioning directory (usually /etc/grafana/provisioning/dashboards/)
+# 2. Update the path in the options section to point to your dashboards directory
+# 3. Restart Grafana
+#
+# For Docker deployments, you can mount this file and the dashboards directory:
+#   volumes:
+#     - ./grafana/provisioning:/etc/grafana/provisioning
+#     - ./grafana/dashboards:/var/lib/grafana/dashboards
+
+apiVersion: 1
+
+providers:
+  - name: 'Orchestrate Dashboards'
+    orgId: 1
+    folder: 'Orchestrate'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
