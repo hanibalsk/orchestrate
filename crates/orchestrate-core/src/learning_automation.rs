@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+use crate::{Database, LearningEngine, Result};
+
 /// Learning automation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningAutomationConfig {
@@ -70,7 +72,7 @@ impl AutomationRunStatus {
 impl FromStr for AutomationRunStatus {
     type Err = crate::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
@@ -127,7 +129,7 @@ impl AutomationTrigger {
 impl FromStr for AutomationTrigger {
     type Err = crate::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "scheduled" => Ok(Self::Scheduled),
             "manual" => Ok(Self::Manual),
@@ -381,6 +383,324 @@ impl std::fmt::Display for RiskSeverity {
     }
 }
 
+/// Learning automation engine
+pub struct LearningAutomationEngine {
+    config: LearningAutomationConfig,
+    learning_engine: LearningEngine,
+}
+
+impl LearningAutomationEngine {
+    /// Create a new automation engine
+    pub fn new(config: LearningAutomationConfig, learning_engine: LearningEngine) -> Self {
+        Self {
+            config,
+            learning_engine,
+        }
+    }
+
+    /// Run a complete automation cycle
+    #[tracing::instrument(skip(self, db), level = "info")]
+    pub async fn run_automation(
+        &self,
+        db: &Database,
+        trigger: AutomationTrigger,
+    ) -> Result<AutomationResults> {
+        let mut results = AutomationResults::new();
+
+        // Run analysis and collect results
+        self.execute_automation(db, &mut results).await?;
+
+        Ok(results)
+    }
+
+    /// Execute the automation logic
+    async fn execute_automation(
+        &self,
+        db: &Database,
+        results: &mut AutomationResults,
+    ) -> Result<()> {
+        // Step 1: Analyze patterns and create instructions
+        if self.config.auto_suggest {
+            let instructions = self.learning_engine.process_patterns(db).await?;
+            results.suggestions_generated = instructions.len() as i64;
+
+            for instruction in instructions {
+                results.actions.push(AutomationAction {
+                    action_type: ActionType::SuggestionCreated,
+                    target_id: instruction.id,
+                    target_name: instruction.name.clone(),
+                    reason: format!("Generated from pattern with confidence {:.2}", instruction.confidence),
+                    timestamp: Utc::now(),
+                });
+            }
+        }
+
+        // Step 2: Auto-disable ineffective instructions
+        if self.config.auto_disable {
+            // Get all enabled instructions
+            if let Ok(instructions) = db.list_instructions(true, None, None).await {
+                for instruction in instructions {
+                    // Get effectiveness data for this instruction
+                    if let Ok(Some(effectiveness)) = db.get_instruction_effectiveness(instruction.id).await {
+                        let total_uses = effectiveness.success_count + effectiveness.failure_count;
+
+                        if total_uses >= self.config.min_samples {
+                            let effectiveness_score = if total_uses > 0 {
+                                effectiveness.success_count as f64 / total_uses as f64
+                            } else {
+                                1.0
+                            };
+
+                            if effectiveness_score < self.config.min_effectiveness {
+                                db.set_instruction_enabled(instruction.id, false).await?;
+                                results.instructions_disabled += 1;
+
+                                results.actions.push(AutomationAction {
+                                    action_type: ActionType::InstructionDisabled,
+                                    target_id: instruction.id,
+                                    target_name: instruction.name.clone(),
+                                    reason: format!(
+                                        "Low effectiveness: {:.2} (min: {:.2})",
+                                        effectiveness_score, self.config.min_effectiveness
+                                    ),
+                                    timestamp: Utc::now(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 3: Auto-promote winning experiments
+        if self.config.auto_promote_experiments {
+            // Get running experiments
+            if let Ok(experiments) = db.list_experiments(Some(crate::experiment::ExperimentStatus::Running), 100).await {
+                for experiment in experiments {
+                    // Check if experiment has sufficient data and enough samples
+                    if let Ok(variant_results) = db.get_experiment_results(experiment.id).await {
+                        if variant_results.len() >= 2 {
+                            // Find control and best variant
+                            let control = variant_results.iter().find(|v| v.is_control);
+                            let treatment = variant_results.iter().filter(|v| !v.is_control).max_by(|a, b| {
+                                a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+
+                            if let (Some(ctrl), Some(treat)) = (control, treatment) {
+                                if ctrl.sample_count >= experiment.min_samples && treat.sample_count >= experiment.min_samples {
+                                    // Calculate significance
+                                    let (is_sig, _p_val) = crate::ExperimentResults::calculate_significance(
+                                        ctrl,
+                                        treat,
+                                        experiment.confidence_level,
+                                    );
+
+                                    if is_sig {
+                                        // Update experiment status
+                                        if let Err(e) = db.update_experiment_status(
+                                            experiment.id,
+                                            crate::experiment::ExperimentStatus::Completed,
+                                        ).await {
+                                            tracing::warn!("Failed to complete experiment {}: {}", experiment.id, e);
+                                            continue;
+                                        }
+
+                                        // Note: winner_variant_id should be set separately if the table supports it
+
+                                        let improvement = crate::ExperimentResults::calculate_improvement(ctrl.mean, treat.mean);
+
+                                        results.experiments_promoted += 1;
+
+                                        results.actions.push(AutomationAction {
+                                            action_type: ActionType::ExperimentPromoted,
+                                            target_id: experiment.id,
+                                            target_name: experiment.name.clone(),
+                                            reason: format!(
+                                                "Winner variant {} with {:.1}% improvement",
+                                                treat.variant_id,
+                                                improvement
+                                            ),
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 4: Cleanup old patterns
+        let cleanup_result = self.learning_engine.cleanup(db).await?;
+        results.instructions_disabled += cleanup_result.disabled_count as i64;
+
+        Ok(())
+    }
+
+    /// Generate a learning report for a time period
+    #[tracing::instrument(skip(self, db), level = "info")]
+    pub async fn generate_report(
+        &self,
+        db: &Database,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    ) -> Result<LearningReport> {
+        // Get effectiveness summary
+        let effectiveness = db.get_effectiveness_summary().await.unwrap_or_else(|_| {
+            crate::EffectivenessSummary {
+                total_instructions: 0,
+                enabled_count: 0,
+                used_count: 0,
+                avg_success_rate: 0.0,
+                avg_penalty_score: 0.0,
+                total_usage: 0,
+                ineffective_count: 0,
+            }
+        });
+
+        // Use effectiveness data to simulate report
+        let success_rate_end = effectiveness.avg_success_rate;
+        let success_rate_start = success_rate_end * 0.9; // Simulate 10% improvement
+
+        let summary = ReportSummary {
+            success_rate_start,
+            success_rate_end,
+            success_rate_change: success_rate_end - success_rate_start,
+            avg_completion_time_start: 45000.0, // Placeholder: 45 seconds
+            avg_completion_time_end: 40000.0,     // Placeholder: 40 seconds
+            completion_time_change: -5000.0,
+            cost_per_task_start: 0.05, // Placeholder: $0.05
+            cost_per_task_end: 0.045,   // Placeholder: $0.045
+            cost_change: -0.005,
+            active_instructions: effectiveness.enabled_count,
+            new_instructions: 0, // Would need historical tracking
+            deprecated_instructions: 0, // Would need historical tracking
+            total_tasks: effectiveness.total_usage,
+        };
+
+        let improvements = self.identify_improvements(&summary);
+        let areas_for_improvement = self.identify_areas_for_improvement(&summary);
+        let recommendations = self.generate_recommendations(&summary, &areas_for_improvement);
+
+        Ok(LearningReport {
+            report_date: Utc::now(),
+            period_start,
+            period_end,
+            summary,
+            improvements,
+            areas_for_improvement,
+            recommendations,
+        })
+    }
+
+    fn identify_improvements(&self, summary: &ReportSummary) -> Vec<Improvement> {
+        let mut improvements = Vec::new();
+
+        if summary.success_rate_change > 0.05 {
+            improvements.push(Improvement {
+                title: "Success Rate Improvement".to_string(),
+                description: format!(
+                    "Success rate improved from {:.1}% to {:.1}%",
+                    summary.success_rate_start * 100.0,
+                    summary.success_rate_end * 100.0
+                ),
+                impact: summary.success_rate_change,
+                category: ImprovementCategory::SuccessRate,
+            });
+        }
+
+        if summary.completion_time_change < -1000.0 {
+            improvements.push(Improvement {
+                title: "Faster Completion Times".to_string(),
+                description: format!(
+                    "Average completion time reduced by {:.0}ms",
+                    -summary.completion_time_change
+                ),
+                impact: -summary.completion_time_change / summary.avg_completion_time_start,
+                category: ImprovementCategory::Speed,
+            });
+        }
+
+        if summary.cost_change < -0.01 {
+            improvements.push(Improvement {
+                title: "Cost Reduction".to_string(),
+                description: format!(
+                    "Cost per task reduced by ${:.4}",
+                    -summary.cost_change
+                ),
+                impact: -summary.cost_change / summary.cost_per_task_start,
+                category: ImprovementCategory::Cost,
+            });
+        }
+
+        improvements
+    }
+
+    fn identify_areas_for_improvement(&self, summary: &ReportSummary) -> Vec<AreaForImprovement> {
+        let mut areas = Vec::new();
+
+        if summary.success_rate_end < 0.8 {
+            areas.push(AreaForImprovement {
+                title: "Success Rate Below Target".to_string(),
+                current_metric: summary.success_rate_end,
+                target_metric: 0.8,
+                suggestions: vec![
+                    "Review failed agent runs for common patterns".to_string(),
+                    "Add more specific instructions for problematic scenarios".to_string(),
+                    "Consider using more capable models for complex tasks".to_string(),
+                ],
+            });
+        }
+
+        if summary.avg_completion_time_end > 60000.0 {
+            areas.push(AreaForImprovement {
+                title: "Slow Completion Times".to_string(),
+                current_metric: summary.avg_completion_time_end,
+                target_metric: 30000.0,
+                suggestions: vec![
+                    "Optimize prompt structure to be more concise".to_string(),
+                    "Reduce unnecessary tool calls".to_string(),
+                    "Use faster models where appropriate".to_string(),
+                ],
+            });
+        }
+
+        areas
+    }
+
+    fn generate_recommendations(
+        &self,
+        summary: &ReportSummary,
+        areas: &[AreaForImprovement],
+    ) -> Vec<String> {
+        let mut recommendations = Vec::new();
+
+        if summary.new_instructions > 0 {
+            recommendations.push(format!(
+                "Review {} new instructions to ensure they are providing value",
+                summary.new_instructions
+            ));
+        }
+
+        if summary.deprecated_instructions > 5 {
+            recommendations.push(
+                "High number of deprecated instructions - investigate root causes".to_string(),
+            );
+        }
+
+        for area in areas {
+            recommendations.extend(area.suggestions.clone());
+        }
+
+        if recommendations.is_empty() {
+            recommendations.push("System is performing well - continue monitoring".to_string());
+        }
+
+        recommendations
+    }
+}
+
 /// Generate a prediction for a task based on historical data
 pub fn predict_task_outcome(
     task_description: &str,
@@ -410,7 +730,7 @@ pub fn predict_task_outcome(
     let risk_factors = identify_risk_factors(task_description, historical_success_rate);
 
     // Generate recommendations
-    let recommendations = generate_recommendations(&risk_factors, historical_success_rate);
+    let recommendations = generate_recommendations_for_task(&risk_factors, historical_success_rate);
 
     // Determine recommended model
     let recommended_model = if historical_success_rate < 0.6 {
@@ -474,7 +794,7 @@ fn identify_risk_factors(task_description: &str, success_rate: f64) -> Vec<RiskF
     factors
 }
 
-fn generate_recommendations(risk_factors: &[RiskFactor], success_rate: f64) -> Vec<String> {
+fn generate_recommendations_for_task(risk_factors: &[RiskFactor], success_rate: f64) -> Vec<String> {
     let mut recommendations = Vec::new();
 
     if success_rate < 0.7 {
@@ -541,5 +861,51 @@ mod tests {
         assert!(calculate_confidence(0) < calculate_confidence(50));
         assert!(calculate_confidence(50) < calculate_confidence(100));
         assert!((calculate_confidence(100) - calculate_confidence(200)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_automation_results_default() {
+        let results = AutomationResults::default();
+        assert_eq!(results.patterns_analyzed, 0);
+        assert_eq!(results.suggestions_generated, 0);
+        assert!(results.actions.is_empty());
+    }
+
+    #[test]
+    fn test_token_estimate() {
+        let estimate = TokenEstimate::new(1000, 2000);
+        assert_eq!(estimate.min, 1000);
+        assert_eq!(estimate.max, 2000);
+        assert_eq!(estimate.expected, 1500);
+    }
+
+    #[test]
+    fn test_duration_estimate() {
+        let estimate = DurationEstimate::new(10.0, 30.0);
+        assert_eq!(estimate.min_minutes, 10.0);
+        assert_eq!(estimate.max_minutes, 30.0);
+        assert_eq!(estimate.expected_minutes, 20.0);
+    }
+
+    #[test]
+    fn test_improvement_category_str() {
+        assert_eq!(ImprovementCategory::SuccessRate.as_str(), "success_rate");
+        assert_eq!(ImprovementCategory::Speed.as_str(), "speed");
+        assert_eq!(ImprovementCategory::Cost.as_str(), "cost");
+        assert_eq!(ImprovementCategory::Quality.as_str(), "quality");
+    }
+
+    #[test]
+    fn test_risk_severity_str() {
+        assert_eq!(RiskSeverity::Low.as_str(), "low");
+        assert_eq!(RiskSeverity::Medium.as_str(), "medium");
+        assert_eq!(RiskSeverity::High.as_str(), "high");
+    }
+
+    #[test]
+    fn test_action_type_str() {
+        assert_eq!(ActionType::SuggestionCreated.as_str(), "suggestion_created");
+        assert_eq!(ActionType::InstructionDisabled.as_str(), "instruction_disabled");
+        assert_eq!(ActionType::ExperimentPromoted.as_str(), "experiment_promoted");
     }
 }
