@@ -23,29 +23,31 @@ mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
 #[cfg(test)]
-mod database_environment_tests;
-pub mod deployment_executor;
-pub mod deployment_rollback;
-pub mod deployment_strategy;
-pub mod environment;
+mod database_notifications_tests;
+pub mod documentation;
 pub mod epic;
-pub mod release_management;
-pub mod post_deploy_verification;
-pub mod pre_deploy_validation;
+pub mod requirements;
+pub mod multi_repo;
+pub mod ci_integration;
+pub mod incident;
 pub mod error;
-pub mod feature_flags;
+pub mod experiment;
 pub mod feedback;
 pub mod instruction;
 pub mod learning;
+pub mod learning_automation;
 pub mod message;
+pub mod model_selection;
 pub mod network;
+pub mod notifications;
+pub mod pattern_export;
+pub mod prompt_optimization;
 pub mod pipeline;
 pub mod pipeline_executor;
 pub mod pipeline_parser;
 pub mod pipeline_template;
 pub mod pr;
 pub mod schedule;
-pub mod secrets;
 pub mod schedule_template;
 pub mod session;
 pub mod shell_state;
@@ -54,7 +56,10 @@ pub mod webhook_config;
 pub mod worktree;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
-pub use database::{AgentStats, DailyTokenUsage, Database, TokenStats};
+pub use database::{
+    AgentStats, DailyTokenUsage, Database, EffectivenessAnalysisRow, EffectivenessSummary,
+    NotificationLog, TokenStats,
+};
 pub use epic::{BmadPhase, Epic, EpicStatus, Story, StoryStatus};
 pub use error::{Error, Result};
 pub use message::{Message, MessageRole};
@@ -64,9 +69,9 @@ pub use worktree::{create_pr_worktree, Worktree, WorktreeStatus};
 
 // Re-export instruction types
 pub use instruction::{
-    CustomInstruction, InstructionEffectiveness, InstructionScope, InstructionSource,
-    LearningConfig, LearningPattern, PatternStatus, PatternType, SuccessPattern,
-    SuccessPatternType,
+    CustomInstruction, EffectivenessAnalysis, InstructionEffectiveness, InstructionScope,
+    InstructionSource, LearningConfig, LearningPattern, PatternStatus, PatternType,
+    SuccessPattern, SuccessPatternType,
 };
 
 // Re-export learning types
@@ -74,6 +79,12 @@ pub use learning::{CleanupResult, LearningEngine, SuccessRecommendations};
 
 // Re-export feedback types
 pub use feedback::{Feedback, FeedbackRating, FeedbackSource, FeedbackStats};
+
+// Re-export experiment types
+pub use experiment::{
+    Experiment, ExperimentAssignment, ExperimentMetric, ExperimentObservation, ExperimentResults,
+    ExperimentStatus, ExperimentType, ExperimentVariant, VariantResults,
+};
 
 // Re-export network types
 pub use network::{
@@ -125,48 +136,74 @@ pub use approval_service::ApprovalService;
 // Re-export pipeline template types
 pub use pipeline_template::PipelineTemplate;
 
-// Re-export environment types
-pub use environment::{CreateEnvironment, Environment, EnvironmentType};
-
-// Re-export secrets types
-pub use secrets::{get_encryption_key, SecretsManager};
-
-// Re-export deployment strategy types
-pub use deployment_strategy::{
-    BatchSize, BlueGreenConfig, CanaryConfig, DeploymentStrategy, Environment as BlueGreenEnvironment,
-    HealthCheck, RecreateConfig, RollingConfig, StrategyType,
+// Re-export model selection types
+pub use model_selection::{
+    classify_task_complexity, model_to_tier, AlternativeModel, ModelPerformance,
+    ModelRecommendation, ModelSelectionConfig, ModelSelectionRule, ModelTier, OptimizationGoal,
+    TaskComplexity,
 };
 
-// Re-export pre-deployment validation types
-pub use pre_deploy_validation::{
-    DeploymentValidation, PreDeployValidator, ValidationCheck, ValidationStatus,
+// Re-export prompt optimization types
+pub use prompt_optimization::{
+    analyze_prompt_sections, prompt_similarity, PromptEffectiveness, PromptOptimizationConfig,
+    PromptSection, PromptSuggestion, PromptVersion, SectionAnalysis, SuggestionStatus,
 };
 
-// Re-export deployment executor types
-pub use deployment_executor::{
-    Deployment, DeploymentExecutor, DeploymentProgress, DeploymentProvider, DeploymentRequest,
-    DeploymentStatus,
+// Re-export pattern export types
+pub use pattern_export::{
+    filter_patterns, ExportMetadata, ExportablePattern, ImportDetail, ImportOptions, ImportResult,
+    ImportStatus, InstructionPattern, PatternContext, PatternEffectiveness, PatternExport,
+    PromptTemplatePattern, SuccessPatternExport, ToolSequencePattern,
 };
 
-// Re-export post-deployment verification types
-pub use post_deploy_verification::{
-    PostDeployVerifier, VerificationCheck, VerificationCheckStatus, VerificationCheckType,
-    VerificationResult,
+// Re-export learning automation types
+pub use learning_automation::{
+    predict_task_outcome, ActionType, AreaForImprovement, AutomationAction, AutomationResults,
+    AutomationRun, AutomationRunStatus, AutomationTrigger, DurationEstimate, Improvement,
+    ImprovementCategory, LearningAutomationConfig, LearningReport, ReportSummary, RiskFactor,
+    RiskSeverity, TaskPrediction, TokenEstimate,
 };
 
-// Re-export deployment rollback types
-pub use deployment_rollback::{
-    DeploymentRollback, RollbackEvent as DeploymentRollbackEvent, RollbackNotification,
-    RollbackRequest, RollbackStatus as DeploymentRollbackStatus, RollbackType,
+// Re-export documentation types
+pub use documentation::{
+    Adr, AdrConsequence, AdrStatus, ApiContact, ApiDocumentation, ApiEndpoint, ApiInfo, ApiLicense,
+    ApiParameter, ApiServer, Changelog, ChangelogEntry, ChangelogRelease, ChangeType, DocItemType,
+    DocIssueType, DocType, DocValidationIssue, DocValidationResult, ParameterLocation, PropertyInfo,
+    ReadmeContent, ReadmeSection, ReadmeSectionContent, SchemaInfo,
 };
 
-// Re-export release management types
-pub use release_management::{
-    BumpType, Changelog, ChangelogEntry, Commit, CommitType, ReleaseAsset, ReleaseManager,
-    ReleasePreparation, ReleaseRequest, Version,
+// Re-export requirements types
+pub use requirements::{
+    ArtifactType, ClarifyingQuestion, EffortEstimate, GeneratedStory, ImpactAnalysis, LinkType,
+    Requirement, RequirementPriority, RequirementStatus, RequirementType, RiskLevel,
+    StoryComplexity, TraceCoverage, TraceabilityLink, TraceabilityMatrix,
 };
 
-// Re-export feature flags types
-pub use feature_flags::{
-    CreateFeatureFlag, FeatureFlag, FlagStatus, UpdateFeatureFlag,
+// Re-export multi-repo types
+pub use multi_repo::{
+    CoordinatedRelease, CrossRepoBranch, LinkedPr, LinkedPrGroup, LinkedPrStatus, ReleaseStatus,
+    RepoBranchStatus, RepoConfig, RepoDependencyGraph, RepoProvider, RepoRelease, RepoStatus,
+    Repository,
+};
+
+// Re-export CI integration types
+pub use ci_integration::{
+    CiArtifact, CiAuthType, CiConclusion, CiConfig, CiFailureAnalysis, CiJob, CiProvider, CiRun,
+    CiRunStatus, CiStep, CiTriggerRequest, FailedJob, FailedTest,
+};
+
+// Re-export incident types
+pub use incident::{
+    ActionItem, ActionItemPriority, ActionResult, AnomalyMetric, EscalationCondition,
+    EscalationRule, EscalationTarget, EscalationTargetType, Evidence, EvidenceType, Hypothesis,
+    Incident, IncidentImpact, IncidentSeverity, IncidentStatus, Playbook, PlaybookAction,
+    PlaybookExecution, PlaybookExecutionStatus, PlaybookTrigger, PostMortem, RelatedEvent,
+    RootCauseAnalysis, TimelineEvent, TimelineEventType,
+};
+
+// Re-export notification types
+pub use notifications::{
+    ChannelConfig, ChannelType, EmailConfig, MessageTemplate, NotificationError,
+    NotificationWebhookConfig, PagerDutyConfig, RateLimiter, SlackConfig, SLACK_CRITICAL_TEMPLATE,
+    SLACK_INFO_TEMPLATE, SLACK_WARNING_TEMPLATE,
 };

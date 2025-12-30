@@ -154,6 +154,10 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/016_alerting.sql"))
             .execute(&self.pool)
             .await?;
+        // Notification channels migration
+        sqlx::query(include_str!("../../../migrations/017_notification_channels.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -6082,6 +6086,392 @@ impl TryFrom<AlertRow> for Alert {
             fingerprint: row.fingerprint,
             last_notified_at,
             notification_count: row.notification_count,
+        })
+    }
+}
+
+impl Database {
+    // ========================================================================
+    // Notification Channels
+    // ========================================================================
+
+    /// Create a new notification channel
+    pub async fn create_notification_channel(&self, channel: &crate::ChannelConfig) -> Result<i64> {
+        let config_json = serde_json::to_string(&channel.config)?;
+        let channel_type = channel.channel_type.to_string();
+
+        let result = sqlx::query(
+            "INSERT INTO notification_channels (name, channel_type, enabled, rate_limit_per_hour, config)
+             VALUES (?, ?, ?, ?, ?)"
+        )
+        .bind(&channel.name)
+        .bind(&channel_type)
+        .bind(channel.enabled)
+        .bind(channel.rate_limit_per_hour)
+        .bind(&config_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get a notification channel by ID
+    pub async fn get_notification_channel(&self, id: i64) -> Result<crate::ChannelConfig> {
+        let row: ChannelConfigRow = sqlx::query_as(
+            "SELECT id, name, channel_type, enabled, rate_limit_per_hour, config, created_at, updated_at
+             FROM notification_channels
+             WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    /// Get a notification channel by name
+    pub async fn get_notification_channel_by_name(&self, name: &str) -> Result<crate::ChannelConfig> {
+        let row: ChannelConfigRow = sqlx::query_as(
+            "SELECT id, name, channel_type, enabled, rate_limit_per_hour, config, created_at, updated_at
+             FROM notification_channels
+             WHERE name = ?"
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    /// List all notification channels
+    pub async fn list_notification_channels(&self) -> Result<Vec<crate::ChannelConfig>> {
+        let rows: Vec<ChannelConfigRow> = sqlx::query_as(
+            "SELECT id, name, channel_type, enabled, rate_limit_per_hour, config, created_at, updated_at
+             FROM notification_channels
+             ORDER BY name"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|row| row.try_into()).collect()
+    }
+
+    /// List enabled notification channels
+    pub async fn list_enabled_notification_channels(&self) -> Result<Vec<crate::ChannelConfig>> {
+        let rows: Vec<ChannelConfigRow> = sqlx::query_as(
+            "SELECT id, name, channel_type, enabled, rate_limit_per_hour, config, created_at, updated_at
+             FROM notification_channels
+             WHERE enabled = 1
+             ORDER BY name"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|row| row.try_into()).collect()
+    }
+
+    /// Update a notification channel
+    pub async fn update_notification_channel(&self, channel: &crate::ChannelConfig) -> Result<()> {
+        let id = channel.id.ok_or_else(|| crate::Error::Other("Channel ID is required for update".to_string()))?;
+        let config_json = serde_json::to_string(&channel.config)?;
+        let channel_type = channel.channel_type.to_string();
+
+        sqlx::query(
+            "UPDATE notification_channels
+             SET name = ?, channel_type = ?, enabled = ?, rate_limit_per_hour = ?, config = ?,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?"
+        )
+        .bind(&channel.name)
+        .bind(&channel_type)
+        .bind(channel.enabled)
+        .bind(channel.rate_limit_per_hour)
+        .bind(&config_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Enable or disable a notification channel
+    pub async fn set_notification_channel_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        sqlx::query(
+            "UPDATE notification_channels
+             SET enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?"
+        )
+        .bind(enabled)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a notification channel
+    pub async fn delete_notification_channel(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM notification_channels WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Message Templates
+    // ========================================================================
+
+    /// Create or update a message template
+    pub async fn upsert_message_template(&self, template: &crate::MessageTemplate) -> Result<i64> {
+        let channel_type = template.channel_type.to_string();
+        let severity = template.severity.to_string();
+
+        let result = sqlx::query(
+            "INSERT INTO notification_templates (channel_type, severity, template)
+             VALUES (?, ?, ?)
+             ON CONFLICT(channel_type, severity)
+             DO UPDATE SET template = excluded.template,
+                          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        )
+        .bind(&channel_type)
+        .bind(&severity)
+        .bind(&template.template)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get a message template for a specific channel and severity
+    pub async fn get_message_template(
+        &self,
+        channel_type: crate::ChannelType,
+        severity: crate::AlertSeverity,
+    ) -> Result<crate::MessageTemplate> {
+        let channel_type_str = channel_type.to_string();
+        let severity_str = severity.to_string();
+
+        let row: MessageTemplateRow = sqlx::query_as(
+            "SELECT id, channel_type, severity, template, created_at, updated_at
+             FROM notification_templates
+             WHERE channel_type = ? AND severity = ?"
+        )
+        .bind(&channel_type_str)
+        .bind(&severity_str)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    /// List all message templates
+    pub async fn list_message_templates(&self) -> Result<Vec<crate::MessageTemplate>> {
+        let rows: Vec<MessageTemplateRow> = sqlx::query_as(
+            "SELECT id, channel_type, severity, template, created_at, updated_at
+             FROM notification_templates
+             ORDER BY channel_type, severity"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|row| row.try_into()).collect()
+    }
+
+    /// Delete a message template
+    pub async fn delete_message_template(
+        &self,
+        channel_type: crate::ChannelType,
+        severity: crate::AlertSeverity,
+    ) -> Result<()> {
+        let channel_type_str = channel_type.to_string();
+        let severity_str = severity.to_string();
+
+        sqlx::query(
+            "DELETE FROM notification_templates
+             WHERE channel_type = ? AND severity = ?"
+        )
+        .bind(&channel_type_str)
+        .bind(&severity_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Notification Log
+    // ========================================================================
+
+    /// Log a notification attempt
+    pub async fn log_notification(
+        &self,
+        alert_id: i64,
+        channel_id: i64,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO notification_log (alert_id, channel_id, status, error_message)
+             VALUES (?, ?, ?, ?)"
+        )
+        .bind(alert_id)
+        .bind(channel_id)
+        .bind(status)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get notification logs for an alert
+    pub async fn get_notification_logs_by_alert(&self, alert_id: i64) -> Result<Vec<NotificationLog>> {
+        let rows: Vec<NotificationLogRow> = sqlx::query_as(
+            "SELECT id, alert_id, channel_id, status, error_message, sent_at
+             FROM notification_log
+             WHERE alert_id = ?
+             ORDER BY sent_at DESC"
+        )
+        .bind(alert_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|row| row.try_into()).collect()
+    }
+
+    /// Get notification logs for a channel
+    pub async fn get_notification_logs_by_channel(&self, channel_id: i64) -> Result<Vec<NotificationLog>> {
+        let rows: Vec<NotificationLogRow> = sqlx::query_as(
+            "SELECT id, alert_id, channel_id, status, error_message, sent_at
+             FROM notification_log
+             WHERE channel_id = ?
+             ORDER BY sent_at DESC"
+        )
+        .bind(channel_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|row| row.try_into()).collect()
+    }
+}
+
+/// Notification log entry
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NotificationLog {
+    pub id: i64,
+    pub alert_id: i64,
+    pub channel_id: i64,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub sent_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChannelConfigRow {
+    id: i64,
+    name: String,
+    channel_type: String,
+    enabled: bool,
+    rate_limit_per_hour: i64,
+    config: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<ChannelConfigRow> for crate::ChannelConfig {
+    type Error = crate::Error;
+
+    fn try_from(row: ChannelConfigRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        let channel_type = crate::ChannelType::from_str(&row.channel_type)
+            .map_err(|e| crate::Error::Other(e))?;
+        let config: serde_json::Value = serde_json::from_str(&row.config)?;
+        let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(crate::ChannelConfig {
+            id: Some(row.id),
+            name: row.name,
+            channel_type,
+            enabled: row.enabled,
+            rate_limit_per_hour: row.rate_limit_per_hour,
+            config,
+            created_at: Some(created_at),
+            updated_at: Some(updated_at),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct MessageTemplateRow {
+    id: i64,
+    channel_type: String,
+    severity: String,
+    template: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<MessageTemplateRow> for crate::MessageTemplate {
+    type Error = crate::Error;
+
+    fn try_from(row: MessageTemplateRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        let channel_type = crate::ChannelType::from_str(&row.channel_type)
+            .map_err(|e| crate::Error::Other(e))?;
+        let severity = crate::AlertSeverity::from_str(&row.severity)
+            .map_err(|e| crate::Error::Other(e))?;
+        let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(crate::MessageTemplate {
+            id: Some(row.id),
+            channel_type,
+            severity,
+            template: row.template,
+            created_at: Some(created_at),
+            updated_at: Some(updated_at),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct NotificationLogRow {
+    id: i64,
+    alert_id: i64,
+    channel_id: i64,
+    status: String,
+    error_message: Option<String>,
+    sent_at: String,
+}
+
+impl TryFrom<NotificationLogRow> for NotificationLog {
+    type Error = crate::Error;
+
+    fn try_from(row: NotificationLogRow) -> Result<Self> {
+        let sent_at = chrono::DateTime::parse_from_rfc3339(&row.sent_at)
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(NotificationLog {
+            id: row.id,
+            alert_id: row.alert_id,
+            channel_id: row.channel_id,
+            status: row.status,
+            error_message: row.error_message,
+            sent_at,
         })
     }
 }
