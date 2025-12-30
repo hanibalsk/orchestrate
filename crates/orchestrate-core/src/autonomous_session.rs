@@ -305,6 +305,12 @@ impl WorkItemType {
     }
 }
 
+impl std::fmt::Display for WorkItemType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Completed work item record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedItem {
