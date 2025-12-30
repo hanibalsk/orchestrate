@@ -534,13 +534,23 @@ impl AutonomousSession {
     }
 
     /// Pop the next work item from the queue (highest priority)
+    ///
+    /// Uses O(n) min-search with swap_remove instead of O(n log n) sort.
     pub fn pop_work_item(&mut self) -> Option<WorkItem> {
         if self.work_queue.is_empty() {
             return None;
         }
-        // Sort by priority (lower is higher priority)
-        self.work_queue.sort_by(|a, b| a.priority.cmp(&b.priority));
-        let item = self.work_queue.remove(0);
+        // Find the index of the item with lowest priority value (highest priority)
+        // This is O(n) vs O(n log n) for sorting on every pop
+        let min_idx = self
+            .work_queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, item)| item.priority)
+            .map(|(idx, _)| idx)?;
+
+        // swap_remove is O(1) - swaps with last element and pops
+        let item = self.work_queue.swap_remove(min_idx);
         self.updated_at = Utc::now();
         Some(item)
     }
