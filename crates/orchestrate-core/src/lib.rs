@@ -20,6 +20,7 @@ mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
 pub mod documentation;
+pub mod doc_generator;
 pub mod epic;
 pub mod requirements;
 pub mod multi_repo;
@@ -163,6 +164,12 @@ pub use documentation::{
     ApiParameter, ApiServer, Changelog, ChangelogEntry, ChangelogRelease, ChangeType, DocItemType,
     DocIssueType, DocType, DocValidationIssue, DocValidationResult, ParameterLocation, PropertyInfo,
     ReadmeContent, ReadmeSection, ReadmeSectionContent, SchemaInfo,
+};
+
+// Re-export doc_generator functions
+pub use doc_generator::{
+    generate_readme_content, parse_api_endpoints_from_rust, parse_git_commits,
+    validate_rust_doc_coverage,
 };
 
 // Re-export requirements types
