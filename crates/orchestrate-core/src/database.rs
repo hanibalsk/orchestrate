@@ -105,6 +105,11 @@ impl Database {
         Ok(db)
     }
 
+    /// Get a reference to the database pool
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Run database migrations
     async fn run_migrations(&self) -> Result<()> {
         sqlx::query(include_str!("../../../migrations/001_initial.sql"))
@@ -147,6 +152,10 @@ impl Database {
             .await?;
         // Success patterns migration
         sqlx::query(include_str!("../../../migrations/011_success_patterns.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Slack integration migration
+        sqlx::query(include_str!("../../../migrations/016_slack_integration.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -5455,5 +5464,362 @@ impl From<ModelSelectionConfigRow> for ModelSelectionConfig {
             min_samples_for_auto: row.min_samples_for_auto,
             enabled: row.enabled,
         }
+    }
+}
+
+// ==================== Slack Integration Operations ====================
+
+impl Database {
+    /// Insert a Slack approval request
+    pub async fn insert_slack_approval_request(
+        &self,
+        request: &crate::slack::SlackApprovalRequest,
+        connection_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO slack_approval_requests (
+                id, approval_id, connection_id, channel_id, message_ts,
+                requester_slack_id, resource_type, resource_id, description,
+                created_at, responded_at, responder_slack_id, decision, comment
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&request.id)
+        .bind(&request.approval_id)
+        .bind(connection_id)
+        .bind(&request.channel_id)
+        .bind(&request.message_ts)
+        .bind(&request.requester_slack_id)
+        .bind(&request.resource_type)
+        .bind(&request.resource_id)
+        .bind(&request.description)
+        .bind(request.created_at.to_rfc3339())
+        .bind(request.responded_at.map(|dt| dt.to_rfc3339()))
+        .bind(&request.responder_slack_id)
+        .bind(request.decision.as_ref().map(|d| match d {
+            crate::slack::ApprovalDecision::Approved => "approved",
+            crate::slack::ApprovalDecision::Rejected => "rejected",
+            crate::slack::ApprovalDecision::RequestedChanges => "requested_changes",
+        }))
+        .bind(&None::<String>) // comment placeholder
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get Slack approval request by ID
+    pub async fn get_slack_approval_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::slack::SlackApprovalRequest>> {
+        let row = sqlx::query_as::<_, SlackApprovalRequestRow>(
+            "SELECT * FROM slack_approval_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Update Slack approval request with response
+    pub async fn update_slack_approval_request_response(
+        &self,
+        id: &str,
+        responder_slack_id: &str,
+        decision: &crate::slack::ApprovalDecision,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        let decision_str = match decision {
+            crate::slack::ApprovalDecision::Approved => "approved",
+            crate::slack::ApprovalDecision::Rejected => "rejected",
+            crate::slack::ApprovalDecision::RequestedChanges => "requested_changes",
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE slack_approval_requests
+            SET responded_at = ?,
+                responder_slack_id = ?,
+                decision = ?,
+                comment = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(responder_slack_id)
+        .bind(decision_str)
+        .bind(comment)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert or update a PR thread
+    pub async fn upsert_pr_thread(&self, thread: &crate::slack::PrThread, connection_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO slack_pr_threads (
+                id, connection_id, pr_number, channel_id, thread_ts,
+                created_at, last_updated, is_archived
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id, pr_number)
+            DO UPDATE SET
+                thread_ts = excluded.thread_ts,
+                last_updated = excluded.last_updated,
+                is_archived = excluded.is_archived
+            "#,
+        )
+        .bind(&thread.id)
+        .bind(connection_id)
+        .bind(thread.pr_number)
+        .bind(&thread.channel_id)
+        .bind(&thread.thread_ts)
+        .bind(thread.created_at.to_rfc3339())
+        .bind(thread.last_updated.to_rfc3339())
+        .bind(thread.is_archived)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get PR thread by PR number
+    pub async fn get_pr_thread(
+        &self,
+        pr_number: i32,
+        connection_id: &str,
+    ) -> Result<Option<crate::slack::PrThread>> {
+        let row = sqlx::query_as::<_, PrThreadRow>(
+            "SELECT * FROM slack_pr_threads WHERE pr_number = ? AND connection_id = ?",
+        )
+        .bind(pr_number)
+        .bind(connection_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Archive a PR thread
+    pub async fn archive_pr_thread(&self, pr_number: i32, connection_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE slack_pr_threads
+            SET is_archived = 1,
+                last_updated = ?
+            WHERE pr_number = ? AND connection_id = ?
+            "#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(pr_number)
+        .bind(connection_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert a slash command audit entry
+    pub async fn insert_slack_command_audit(
+        &self,
+        connection_id: &str,
+        command: &str,
+        user_id: &str,
+        user_name: &str,
+        channel_id: &str,
+        text: Option<&str>,
+        response_type: &str,
+        success: bool,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO slack_command_audit (
+                connection_id, command, user_id, user_name, channel_id,
+                text, response_type, success, error_message, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(connection_id)
+        .bind(command)
+        .bind(user_id)
+        .bind(user_name)
+        .bind(channel_id)
+        .bind(text)
+        .bind(response_type)
+        .bind(success)
+        .bind(error_message)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get recent slash command audit entries
+    pub async fn get_recent_slack_command_audit(
+        &self,
+        connection_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SlackCommandAudit>> {
+        let rows = sqlx::query_as::<_, SlackCommandAuditRow>(
+            r#"
+            SELECT * FROM slack_command_audit
+            WHERE connection_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(connection_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+}
+
+// ==================== Slack Row Structs ====================
+
+#[derive(sqlx::FromRow)]
+struct SlackApprovalRequestRow {
+    id: String,
+    approval_id: String,
+    #[allow(dead_code)]
+    connection_id: String,
+    channel_id: String,
+    message_ts: String,
+    requester_slack_id: String,
+    resource_type: String,
+    resource_id: String,
+    description: String,
+    created_at: String,
+    responded_at: Option<String>,
+    responder_slack_id: Option<String>,
+    decision: Option<String>,
+    #[allow(dead_code)]
+    comment: Option<String>,
+}
+
+impl TryFrom<SlackApprovalRequestRow> for crate::slack::SlackApprovalRequest {
+    type Error = crate::Error;
+
+    fn try_from(row: SlackApprovalRequestRow) -> Result<Self> {
+        let decision = row.decision.map(|d| match d.as_str() {
+            "approved" => crate::slack::ApprovalDecision::Approved,
+            "rejected" => crate::slack::ApprovalDecision::Rejected,
+            "requested_changes" => crate::slack::ApprovalDecision::RequestedChanges,
+            _ => crate::slack::ApprovalDecision::Rejected,
+        });
+
+        Ok(crate::slack::SlackApprovalRequest {
+            id: row.id,
+            approval_id: row.approval_id,
+            channel_id: row.channel_id,
+            message_ts: row.message_ts,
+            requester_slack_id: row.requester_slack_id,
+            resource_type: row.resource_type,
+            resource_id: row.resource_id,
+            description: row.description,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            responded_at: row
+                .responded_at
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(|dt| dt.into()),
+            responder_slack_id: row.responder_slack_id,
+            decision,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PrThreadRow {
+    id: String,
+    #[allow(dead_code)]
+    connection_id: String,
+    pr_number: i32,
+    channel_id: String,
+    thread_ts: String,
+    created_at: String,
+    last_updated: String,
+    is_archived: i32,
+}
+
+impl TryFrom<PrThreadRow> for crate::slack::PrThread {
+    type Error = crate::Error;
+
+    fn try_from(row: PrThreadRow) -> Result<Self> {
+        Ok(crate::slack::PrThread {
+            id: row.id,
+            pr_number: row.pr_number,
+            channel_id: row.channel_id,
+            thread_ts: row.thread_ts,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            last_updated: chrono::DateTime::parse_from_rfc3339(&row.last_updated)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            is_archived: row.is_archived != 0,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SlackCommandAudit {
+    pub id: i64,
+    pub connection_id: String,
+    pub command: String,
+    pub user_id: String,
+    pub user_name: String,
+    pub channel_id: String,
+    pub text: Option<String>,
+    pub response_type: String,
+    pub success: bool,
+    pub error_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SlackCommandAuditRow {
+    id: i64,
+    connection_id: String,
+    command: String,
+    user_id: String,
+    user_name: String,
+    channel_id: String,
+    text: Option<String>,
+    response_type: String,
+    success: i32,
+    error_message: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<SlackCommandAuditRow> for SlackCommandAudit {
+    type Error = crate::Error;
+
+    fn try_from(row: SlackCommandAuditRow) -> Result<Self> {
+        Ok(SlackCommandAudit {
+            id: row.id,
+            connection_id: row.connection_id,
+            command: row.command,
+            user_id: row.user_id,
+            user_name: row.user_name,
+            channel_id: row.channel_id,
+            text: row.text,
+            response_type: row.response_type,
+            success: row.success != 0,
+            error_message: row.error_message,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
     }
 }

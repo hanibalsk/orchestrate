@@ -43,8 +43,17 @@ pub enum Error {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Parse error: {0}")]
+    Parse(String),
+
     #[error("{0}")]
     Other(String),
+}
+
+impl From<chrono::ParseError> for Error {
+    fn from(err: chrono::ParseError) -> Self {
+        Error::Parse(err.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
