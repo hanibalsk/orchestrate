@@ -25,6 +25,7 @@ pub mod requirements;
 pub mod multi_repo;
 pub mod ci_integration;
 pub mod incident;
+pub mod test_generation;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -187,4 +188,12 @@ pub use incident::{
     Incident, IncidentImpact, IncidentSeverity, IncidentStatus, Playbook, PlaybookAction,
     PlaybookExecution, PlaybookExecutionStatus, PlaybookTrigger, PostMortem, RelatedEvent,
     RootCauseAnalysis, TimelineEvent, TimelineEventType,
+};
+
+// Re-export test generation types
+pub use test_generation::{
+    CoverageReport, CoverageTrend, FileCoverage, GeneratedTest, IssueSeverity, ModuleCoverage,
+    TestableUnit, TestableUnitType, TestFramework, TestGenerationRequest, TestQualityIssue,
+    TestQualityIssueType, TestQualityReport, TestResult, TestResultStatus, TestRun, TestRunStatus,
+    TestSuggestion, TestType,
 };

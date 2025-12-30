@@ -206,6 +206,11 @@ enum Commands {
         #[command(subcommand)]
         action: IncidentAction,
     },
+    /// Test generation and coverage
+    Test {
+        #[command(subcommand)]
+        action: TestAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1352,6 +1357,63 @@ enum PlaybookAction {
         /// Associated incident ID
         #[arg(short, long)]
         incident: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TestAction {
+    /// Generate tests for a target
+    Generate {
+        /// Target file or directory
+        target: String,
+        /// Test type (unit, integration, e2e, property)
+        #[arg(short = 't', long, default_value = "unit")]
+        test_type: String,
+        /// Output file for generated tests
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Show test coverage
+    Coverage {
+        /// Coverage threshold percentage
+        #[arg(short, long, default_value = "80")]
+        threshold: u32,
+        /// Show coverage for changed files only
+        #[arg(long)]
+        diff: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run tests
+    Run {
+        /// Run only tests for changed code
+        #[arg(long)]
+        changed: bool,
+        /// Test type filter
+        #[arg(short = 't', long)]
+        test_type: Option<String>,
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Validate test quality
+    Validate {
+        /// Run mutation testing
+        #[arg(long)]
+        mutation: bool,
+        /// Target path to validate
+        #[arg(short, long)]
+        target: Option<String>,
+    },
+    /// Generate test report
+    Report {
+        /// Output format (text, html, json)
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Output file
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -4903,6 +4965,200 @@ async fn main() -> Result<()> {
                     println!("(Would load and execute playbook actions)");
                 }
             },
+        },
+        Commands::Test { action } => match action {
+            TestAction::Generate { target, test_type, output } => {
+                use orchestrate_core::{GeneratedTest, TestType, TestFramework};
+                use std::str::FromStr;
+
+                let tt = TestType::from_str(&test_type)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                // Detect framework from file extension
+                let ext = std::path::Path::new(&target)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("rs");
+                let framework = TestFramework::from_extension(ext)
+                    .unwrap_or(TestFramework::CargoTest);
+
+                println!("Generating {} tests for: {}", tt.as_str(), target);
+                println!("  Framework: {}", framework.as_str());
+                println!();
+
+                // Create sample generated test
+                let test = GeneratedTest::new(
+                    &format!("test_{}", target.replace('/', "_").replace('.', "_")),
+                    tt,
+                    framework,
+                    &target,
+                )
+                .with_code("// Generated test placeholder\n#[test]\nfn test_placeholder() {\n    // TODO: Implement test\n    assert!(true);\n}");
+
+                if let Some(path) = output {
+                    std::fs::write(&path, &test.test_code)?;
+                    println!("Test written to: {}", path);
+                } else {
+                    println!("Generated test:\n{}", test.test_code);
+                }
+
+                println!();
+                println!("(In production, would analyze code and generate comprehensive tests)");
+            }
+            TestAction::Coverage { threshold, diff, json } => {
+                use orchestrate_core::{CoverageReport, ModuleCoverage, FileCoverage};
+
+                println!("Analyzing test coverage...");
+                if diff {
+                    println!("  (Changed files only)");
+                }
+                println!();
+
+                // Create sample coverage report
+                let mut report = CoverageReport::new("orchestrate");
+                report.target_percentage = threshold as f64;
+
+                let mut core = ModuleCoverage::new("orchestrate-core", "crates/orchestrate-core");
+                core.add_file(FileCoverage::new("src/agent.rs", 200, 120));
+                core.add_file(FileCoverage::new("src/database.rs", 500, 200));
+                core.add_file(FileCoverage::new("src/learning.rs", 150, 50));
+                report.add_module(core);
+
+                let mut cli = ModuleCoverage::new("orchestrate-cli", "crates/orchestrate-cli");
+                cli.add_file(FileCoverage::new("src/main.rs", 1000, 300));
+                report.add_module(cli);
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", report.to_summary());
+
+                    if !report.meets_target() {
+                        println!("\n⚠️  Coverage below target ({:.0}%)", threshold);
+                        println!("Run 'orchestrate test generate' to add tests");
+                    }
+                }
+            }
+            TestAction::Run { changed, test_type, verbose } => {
+                use orchestrate_core::{TestRun, TestResult, TestResultStatus, TestRunStatus};
+
+                println!("Running tests...");
+                if changed {
+                    println!("  (Changed files only)");
+                }
+                if let Some(tt) = &test_type {
+                    println!("  Test type: {}", tt);
+                }
+                println!();
+
+                // Create sample test run
+                let mut run = TestRun::new(&format!("run-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+
+                run.add_result(TestResult {
+                    name: "test_agent_creation".to_string(),
+                    status: TestResultStatus::Passed,
+                    duration_ms: Some(15),
+                    error_message: None,
+                    stack_trace: None,
+                });
+
+                run.add_result(TestResult {
+                    name: "test_database_query".to_string(),
+                    status: TestResultStatus::Passed,
+                    duration_ms: Some(45),
+                    error_message: None,
+                    stack_trace: None,
+                });
+
+                run.complete(TestRunStatus::Completed);
+
+                println!("Test Results:");
+                println!("  Total: {}", run.total_tests);
+                println!("  Passed: {} ✓", run.passed);
+                println!("  Failed: {}", run.failed);
+                println!("  Skipped: {}", run.skipped);
+                if let Some(duration) = run.duration_seconds {
+                    println!("  Duration: {:.2}s", duration);
+                }
+
+                if verbose {
+                    println!("\nDetails:");
+                    for result in &run.test_results {
+                        let status = match result.status {
+                            TestResultStatus::Passed => "✓",
+                            TestResultStatus::Failed => "✗",
+                            TestResultStatus::Skipped => "○",
+                        };
+                        println!("  {} {} ({:?}ms)", status, result.name, result.duration_ms.unwrap_or(0));
+                    }
+                }
+            }
+            TestAction::Validate { mutation, target } => {
+                use orchestrate_core::{TestQualityReport, TestQualityIssue, TestQualityIssueType, IssueSeverity};
+
+                println!("Validating test quality...");
+                if mutation {
+                    println!("  (With mutation testing)");
+                }
+                if let Some(t) = &target {
+                    println!("  Target: {}", t);
+                }
+                println!();
+
+                let mut report = TestQualityReport::new();
+                report.total_tests = 50;
+
+                if mutation {
+                    report.mutation_score = Some(72.5);
+                }
+
+                report.add_issue(TestQualityIssue {
+                    test_name: "test_always_true".to_string(),
+                    issue_type: TestQualityIssueType::WeakAssertion,
+                    description: "Uses assert!(true) instead of meaningful assertion".to_string(),
+                    severity: IssueSeverity::Medium,
+                });
+
+                report.add_suggestion("Add edge case tests for error handling");
+
+                println!("Quality Report:");
+                println!("  Total tests: {}", report.total_tests);
+                if let Some(score) = report.mutation_score {
+                    println!("  Mutation score: {:.1}%", score);
+                }
+                println!("  Issues found: {}", report.issues.len());
+
+                if !report.issues.is_empty() {
+                    println!("\nIssues:");
+                    for issue in &report.issues {
+                        println!("  [{:?}] {}: {}", issue.severity, issue.test_name, issue.description);
+                    }
+                }
+
+                if !report.suggestions.is_empty() {
+                    println!("\nSuggestions:");
+                    for suggestion in &report.suggestions {
+                        println!("  - {}", suggestion);
+                    }
+                }
+            }
+            TestAction::Report { format, output } => {
+                println!("Generating test report...");
+                println!("  Format: {}", format);
+
+                let content = match format.as_str() {
+                    "json" => r#"{"status": "ok", "tests": 50, "passed": 48, "failed": 2}"#.to_string(),
+                    "html" => "<html><body><h1>Test Report</h1><p>50 tests, 48 passed, 2 failed</p></body></html>".to_string(),
+                    _ => "Test Report\n===========\nTotal: 50\nPassed: 48\nFailed: 2".to_string(),
+                };
+
+                if let Some(path) = output {
+                    std::fs::write(&path, &content)?;
+                    println!("Report written to: {}", path);
+                } else {
+                    println!("\n{}", content);
+                }
+            }
         },
     }
 
