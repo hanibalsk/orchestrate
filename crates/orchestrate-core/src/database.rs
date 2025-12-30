@@ -1,6 +1,7 @@
 //! Database layer for SQLite
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
@@ -160,6 +161,10 @@ impl Database {
             .await?;
         // Cost analytics migration
         sqlx::query(include_str!("../../../migrations/018_cost_analytics.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Audit log migration
+        sqlx::query(include_str!("../../../migrations/019_audit_log.sql"))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -7270,6 +7275,429 @@ impl Database {
             by_story,
             trend,
             budget_status,
+        })
+    }
+
+    // ==================== Audit Log Operations ====================
+
+    /// Insert an audit log entry
+    pub async fn insert_audit_entry(&self, entry: &crate::monitoring::AuditEntry) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO audit_log (
+                id, timestamp, actor, actor_type, action, resource_type, resource_id,
+                details, ip_address, user_agent, success, error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&entry.id)
+        .bind(entry.timestamp.to_rfc3339())
+        .bind(&entry.actor)
+        .bind(format!("{:?}", entry.actor_type).to_lowercase())
+        .bind(entry.action.to_string())
+        .bind(&entry.resource_type)
+        .bind(&entry.resource_id)
+        .bind(serde_json::to_string(&entry.details)?)
+        .bind(&entry.ip_address)
+        .bind(&entry.user_agent)
+        .bind(entry.success)
+        .bind(&entry.error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Query audit log with filters
+    pub async fn query_audit_log(
+        &self,
+        query: &crate::audit::AuditQuery,
+    ) -> Result<Vec<crate::monitoring::AuditEntry>> {
+        let mut sql = String::from("SELECT * FROM audit_log WHERE 1=1");
+        let mut conditions = Vec::new();
+
+        if query.start_time.is_some() {
+            sql.push_str(" AND timestamp >= ?");
+            conditions.push("start_time");
+        }
+        if query.end_time.is_some() {
+            sql.push_str(" AND timestamp <= ?");
+            conditions.push("end_time");
+        }
+        if query.actor.is_some() {
+            sql.push_str(" AND actor = ?");
+            conditions.push("actor");
+        }
+        if query.actor_type.is_some() {
+            sql.push_str(" AND actor_type = ?");
+            conditions.push("actor_type");
+        }
+        if query.action.is_some() {
+            sql.push_str(" AND action = ?");
+            conditions.push("action");
+        }
+        if query.resource_type.is_some() {
+            sql.push_str(" AND resource_type = ?");
+            conditions.push("resource_type");
+        }
+        if query.resource_id.is_some() {
+            sql.push_str(" AND resource_id = ?");
+            conditions.push("resource_id");
+        }
+        if query.success.is_some() {
+            sql.push_str(" AND success = ?");
+            conditions.push("success");
+        }
+
+        sql.push_str(" ORDER BY timestamp DESC");
+
+        if query.limit.is_some() {
+            sql.push_str(" LIMIT ?");
+            conditions.push("limit");
+        }
+        if query.offset.is_some() {
+            sql.push_str(" OFFSET ?");
+            conditions.push("offset");
+        }
+
+        let mut q = sqlx::query_as::<_, AuditEntryRow>(&sql);
+
+        for condition in &conditions {
+            match *condition {
+                "start_time" => {
+                    q = q.bind(query.start_time.as_ref().unwrap().to_rfc3339());
+                }
+                "end_time" => {
+                    q = q.bind(query.end_time.as_ref().unwrap().to_rfc3339());
+                }
+                "actor" => {
+                    q = q.bind(query.actor.as_ref().unwrap());
+                }
+                "actor_type" => {
+                    q = q.bind(format!("{:?}", query.actor_type.as_ref().unwrap()).to_lowercase());
+                }
+                "action" => {
+                    q = q.bind(query.action.as_ref().unwrap().to_string());
+                }
+                "resource_type" => {
+                    q = q.bind(query.resource_type.as_ref().unwrap());
+                }
+                "resource_id" => {
+                    q = q.bind(query.resource_id.as_ref().unwrap());
+                }
+                "success" => {
+                    q = q.bind(query.success.unwrap());
+                }
+                "limit" => {
+                    q = q.bind(query.limit.unwrap());
+                }
+                "offset" => {
+                    q = q.bind(query.offset.unwrap());
+                }
+                _ => {}
+            }
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Count audit log entries matching query
+    pub async fn count_audit_entries(&self, query: &crate::audit::AuditQuery) -> Result<i64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM audit_log WHERE 1=1");
+        let mut conditions = Vec::new();
+
+        if query.start_time.is_some() {
+            sql.push_str(" AND timestamp >= ?");
+            conditions.push("start_time");
+        }
+        if query.end_time.is_some() {
+            sql.push_str(" AND timestamp <= ?");
+            conditions.push("end_time");
+        }
+        if query.actor.is_some() {
+            sql.push_str(" AND actor = ?");
+            conditions.push("actor");
+        }
+        if query.actor_type.is_some() {
+            sql.push_str(" AND actor_type = ?");
+            conditions.push("actor_type");
+        }
+        if query.action.is_some() {
+            sql.push_str(" AND action = ?");
+            conditions.push("action");
+        }
+        if query.resource_type.is_some() {
+            sql.push_str(" AND resource_type = ?");
+            conditions.push("resource_type");
+        }
+        if query.resource_id.is_some() {
+            sql.push_str(" AND resource_id = ?");
+            conditions.push("resource_id");
+        }
+        if query.success.is_some() {
+            sql.push_str(" AND success = ?");
+            conditions.push("success");
+        }
+
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+
+        for condition in &conditions {
+            match *condition {
+                "start_time" => {
+                    q = q.bind(query.start_time.as_ref().unwrap().to_rfc3339());
+                }
+                "end_time" => {
+                    q = q.bind(query.end_time.as_ref().unwrap().to_rfc3339());
+                }
+                "actor" => {
+                    q = q.bind(query.actor.as_ref().unwrap());
+                }
+                "actor_type" => {
+                    q = q.bind(format!("{:?}", query.actor_type.as_ref().unwrap()).to_lowercase());
+                }
+                "action" => {
+                    q = q.bind(query.action.as_ref().unwrap().to_string());
+                }
+                "resource_type" => {
+                    q = q.bind(query.resource_type.as_ref().unwrap());
+                }
+                "resource_id" => {
+                    q = q.bind(query.resource_id.as_ref().unwrap());
+                }
+                "success" => {
+                    q = q.bind(query.success.unwrap());
+                }
+                _ => {}
+            }
+        }
+
+        Ok(q.fetch_one(&self.pool).await?)
+    }
+
+    /// Get audit log statistics
+    pub async fn get_audit_stats(&self) -> Result<crate::audit::AuditStats> {
+        // Get basic counts
+        let total_entries = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&self.pool)
+            .await?;
+
+        let success_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE success = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let failure_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE success = 0",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Get entries by action
+        #[derive(sqlx::FromRow)]
+        struct ActionCount {
+            action: String,
+            count: i64,
+        }
+
+        let action_rows = sqlx::query_as::<_, ActionCount>(
+            "SELECT action, COUNT(*) as count FROM audit_log GROUP BY action",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut entries_by_action = HashMap::new();
+        for row in action_rows {
+            entries_by_action.insert(row.action, row.count);
+        }
+
+        // Get entries by actor type
+        #[derive(sqlx::FromRow)]
+        struct ActorTypeCount {
+            actor_type: String,
+            count: i64,
+        }
+
+        let actor_type_rows = sqlx::query_as::<_, ActorTypeCount>(
+            "SELECT actor_type, COUNT(*) as count FROM audit_log GROUP BY actor_type",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut entries_by_actor_type = HashMap::new();
+        for row in actor_type_rows {
+            entries_by_actor_type.insert(row.actor_type, row.count);
+        }
+
+        // Get time range
+        #[derive(sqlx::FromRow)]
+        struct TimeRange {
+            first_entry: Option<String>,
+            last_entry: Option<String>,
+        }
+
+        let time_range = sqlx::query_as::<_, TimeRange>(
+            "SELECT MIN(timestamp) as first_entry, MAX(timestamp) as last_entry FROM audit_log",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let first_entry_at = time_range
+            .first_entry
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(Into::into);
+
+        let last_entry_at = time_range
+            .last_entry
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+            .transpose()
+            .map_err(|e| crate::Error::Other(e.to_string()))?
+            .map(Into::into);
+
+        Ok(crate::audit::AuditStats {
+            total_entries,
+            entries_by_action,
+            entries_by_actor_type,
+            success_count,
+            failure_count,
+            first_entry_at,
+            last_entry_at,
+        })
+    }
+
+    /// Export audit log to specified format
+    pub async fn export_audit_log(
+        &self,
+        query: &crate::audit::AuditQuery,
+        format: crate::audit::ExportFormat,
+    ) -> Result<String> {
+        let entries = self.query_audit_log(query).await?;
+
+        match format {
+            crate::audit::ExportFormat::Json => {
+                serde_json::to_string_pretty(&entries)
+                    .map_err(|e| crate::Error::Other(e.to_string()))
+            }
+            crate::audit::ExportFormat::JsonLines => {
+                let lines: Vec<String> = entries
+                    .iter()
+                    .map(|e| serde_json::to_string(e))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| crate::Error::Other(e.to_string()))?;
+                Ok(lines.join("\n"))
+            }
+            crate::audit::ExportFormat::Csv => {
+                let mut csv = String::new();
+                csv.push_str("id,timestamp,actor,actor_type,action,resource_type,resource_id,success,error_message,ip_address\n");
+
+                for entry in entries {
+                    csv.push_str(&format!(
+                        "{},{},{},{},{},{},{},{},{},{}\n",
+                        entry.id,
+                        entry.timestamp.to_rfc3339(),
+                        entry.actor,
+                        format!("{:?}", entry.actor_type).to_lowercase(),
+                        entry.action,
+                        entry.resource_type,
+                        entry.resource_id,
+                        entry.success,
+                        entry.error_message.as_deref().unwrap_or(""),
+                        entry.ip_address.as_deref().unwrap_or(""),
+                    ));
+                }
+
+                Ok(csv)
+            }
+        }
+    }
+
+    /// Apply retention policy to audit logs
+    pub async fn apply_retention_policy(
+        &self,
+        policy: &crate::audit::RetentionPolicy,
+    ) -> Result<i64> {
+        let cutoff = policy.cutoff_date();
+
+        let result = sqlx::query(
+            "DELETE FROM audit_log WHERE timestamp < ?",
+        )
+        .bind(cutoff.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as i64)
+    }
+}
+
+// Database row types for audit log
+
+#[derive(sqlx::FromRow)]
+struct AuditEntryRow {
+    id: String,
+    timestamp: String,
+    actor: String,
+    actor_type: String,
+    action: String,
+    resource_type: String,
+    resource_id: String,
+    details: String,
+    ip_address: Option<String>,
+    user_agent: Option<String>,
+    success: bool,
+    error_message: Option<String>,
+}
+
+impl TryFrom<AuditEntryRow> for crate::monitoring::AuditEntry {
+    type Error = crate::Error;
+
+    fn try_from(row: AuditEntryRow) -> Result<Self> {
+        use std::str::FromStr;
+
+        let actor_type = match row.actor_type.as_str() {
+            "user" => crate::monitoring::ActorType::User,
+            "system" => crate::monitoring::ActorType::System,
+            "agent" => crate::monitoring::ActorType::Agent,
+            "api_key" => crate::monitoring::ActorType::ApiKey,
+            "webhook" => crate::monitoring::ActorType::Webhook,
+            _ => return Err(crate::Error::Other(format!("Unknown actor type: {}", row.actor_type))),
+        };
+
+        let action = match row.action.as_str() {
+            "agent.spawned" => crate::monitoring::AuditAction::AgentSpawned,
+            "agent.terminated" => crate::monitoring::AuditAction::AgentTerminated,
+            "config.changed" => crate::monitoring::AuditAction::ConfigurationChanged,
+            "approval.granted" => crate::monitoring::AuditAction::ApprovalGranted,
+            "approval.denied" => crate::monitoring::AuditAction::ApprovalDenied,
+            "deployment.triggered" => crate::monitoring::AuditAction::DeploymentTriggered,
+            "deployment.rolled_back" => crate::monitoring::AuditAction::DeploymentRolledBack,
+            "alert.acknowledged" => crate::monitoring::AuditAction::AlertAcknowledged,
+            "alert.silenced" => crate::monitoring::AuditAction::AlertSilenced,
+            "user.login" => crate::monitoring::AuditAction::UserLogin,
+            "user.logout" => crate::monitoring::AuditAction::UserLogout,
+            "apikey.created" => crate::monitoring::AuditAction::ApiKeyCreated,
+            "apikey.revoked" => crate::monitoring::AuditAction::ApiKeyRevoked,
+            other => crate::monitoring::AuditAction::Custom(other.to_string()),
+        };
+
+        Ok(crate::monitoring::AuditEntry {
+            id: row.id,
+            timestamp: chrono::DateTime::parse_from_rfc3339(&row.timestamp)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            actor: row.actor,
+            actor_type,
+            action,
+            resource_type: row.resource_type,
+            resource_id: row.resource_id,
+            details: serde_json::from_str(&row.details)?,
+            ip_address: row.ip_address,
+            user_agent: row.user_agent,
+            success: row.success,
+            error_message: row.error_message,
         })
     }
 }

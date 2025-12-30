@@ -11,6 +11,7 @@ pub mod agent;
 pub mod alerting;
 pub mod approval;
 pub mod approval_service;
+pub mod audit;
 pub mod condition_evaluator;
 pub mod cost_analytics;
 pub mod cron;
@@ -43,6 +44,7 @@ pub mod learning;
 pub mod learning_automation;
 pub mod message;
 pub mod model_selection;
+pub mod monitoring;
 pub mod network;
 pub mod notifications;
 pub mod pattern_export;
@@ -224,4 +226,16 @@ pub use cost_analytics::{
     BudgetPeriod, BudgetStatus, CostAnalytics, CostBudget, CostRecord, CostRecommendation,
     CostReport, CostTrend, DailyCost, EntityType, ModelCostBreakdown, ModelPricing,
     RecommendationType, TrendDirection,
+};
+
+// Re-export audit types
+pub use audit::{AuditQuery, AuditStats, ExportFormat, RetentionPolicy};
+
+// Re-export monitoring types (non-overlapping with alerting module)
+pub use monitoring::{
+    ActorType, AgentPerformance, AuditAction, AuditEntry, ComponentHealth,
+    CostRecord as MonitoringCostRecord, CostReport as MonitoringCostReport,
+    DailyCost as MonitoringDailyCost, HealthStatus, HistogramBucket, HistogramValue,
+    MetricDefinition, MetricType, MetricValue, MetricsSummary, NotificationChannel,
+    NotificationChannelType, SystemHealth,
 };
