@@ -72,6 +72,7 @@ pub mod stuck_detection;
 pub mod recovery;
 pub mod work_evaluation;
 pub mod code_review;
+pub mod pr_workflow;
 #[cfg(test)]
 mod database_stuck_detection_tests;
 #[cfg(test)]
@@ -331,4 +332,11 @@ pub use work_evaluation::{
 pub use code_review::{
     CodeReviewConfig, CodeReviewCoordinator, ReviewEscalationLevel, ReviewIteration,
     ReviewRequest, ReviewResponse, ReviewerType,
+};
+
+// Re-export PR workflow types (Epic 016 - Story 10)
+pub use pr_workflow::{
+    CiAggregateStatus, ConflictInfo, ConflictResolutionStrategy, MergeMethod, PrDescription,
+    PrStateTransition, PrWorkflowAction, PrWorkflowConfig, PrWorkflowContext, PrWorkflowManager,
+    PrWorkflowRecord, PrWorkflowState,
 };
