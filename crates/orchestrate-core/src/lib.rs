@@ -28,6 +28,7 @@ pub mod incident;
 pub mod test_generation;
 pub mod deployment;
 pub mod monitoring;
+pub mod slack;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -215,4 +216,14 @@ pub use monitoring::{
     AuditEntry, ComponentHealth, ConditionType, CostRecord, CostReport, DailyCost, HealthStatus,
     HistogramBucket, HistogramValue, MetricDefinition, MetricType, MetricValue, MetricsSummary,
     NotificationChannel, NotificationChannelType, SystemHealth,
+};
+
+// Re-export Slack types
+pub use slack::{
+    ButtonStyle, ChannelConfig, DigestMode, InteractionAction, InteractionChannel,
+    InteractionMessage, InteractionPayload, InteractionType, InteractionUser, NotificationSettings,
+    NotificationType, NotificationTemplate, PrThread, ResponseType, SentMessage, SlackApprovalRequest,
+    SlackBlock, SlackConnection, SlackContextElement, SlackElement, SlackMessage, SlackOption,
+    SlackText, SlashCommand, SlashCommandResponse, TextType, UserMapping,
+    ApprovalDecision as SlackApprovalDecision,
 };
