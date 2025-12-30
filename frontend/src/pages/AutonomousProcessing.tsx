@@ -190,21 +190,37 @@ function ControlPanel({ status }: { status: AutoProcessStatus }) {
       queryClient.invalidateQueries({ queryKey: ['autoStatus'] });
       setShowStartDialog(false);
     },
+    onError: (error: Error) => {
+      console.error('Failed to start autonomous processing:', error);
+      alert(`Error: ${error.message || 'Failed to start autonomous processing'}`);
+    },
   });
 
   const pauseMutation = useMutation({
     mutationFn: pauseAutoProcess,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['autoStatus'] }),
+    onError: (error: Error) => {
+      console.error('Failed to pause processing:', error);
+      alert(`Error: ${error.message || 'Failed to pause processing'}`);
+    },
   });
 
   const resumeMutation = useMutation({
     mutationFn: resumeAutoProcess,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['autoStatus'] }),
+    onError: (error: Error) => {
+      console.error('Failed to resume processing:', error);
+      alert(`Error: ${error.message || 'Failed to resume processing'}`);
+    },
   });
 
   const stopMutation = useMutation({
     mutationFn: stopAutoProcess,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['autoStatus'] }),
+    onError: (error: Error) => {
+      console.error('Failed to stop processing:', error);
+      alert(`Error: ${error.message || 'Failed to stop processing'}`);
+    },
   });
 
   const isActive = status.state !== 'idle' && status.state !== 'done';
@@ -314,6 +330,10 @@ function StuckAgentsPanel({ stuckAgents }: { stuckAgents: StuckAgent[] }) {
       setShowDialog(false);
       setSelectedAgent(null);
     },
+    onError: (error: Error) => {
+      console.error('Failed to unblock session:', error);
+      alert(`Error: ${error.message || 'Failed to unblock session'}`);
+    },
   });
 
   if (stuckAgents.length === 0) {
@@ -421,6 +441,10 @@ function EdgeCasesPanel({ edgeCases }: { edgeCases: EdgeCase[] }) {
       resolveEdgeCase(id, { resolution }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['edgeCases'] });
+    },
+    onError: (error: Error) => {
+      console.error('Failed to resolve edge case:', error);
+      alert(`Error: ${error.message || 'Failed to resolve edge case'}`);
     },
   });
 
