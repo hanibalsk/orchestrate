@@ -9,9 +9,16 @@
 //! - Create prioritized work queue
 
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+// Pre-compiled regex for story heading parsing (hot path during epic parsing)
+static STORY_HEADING_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"###\s+Story\s+(\d+)[:\s]+(.+)").unwrap()
+});
 
 /// Status of an epic in autonomous processing
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,8 +730,8 @@ impl EpicDiscoveryService {
     /// Parse story heading
     fn parse_story_heading(&self, line: &str) -> Option<(u32, String)> {
         // Match patterns like "### Story 1: Title" or "### Story 10: Title"
-        let re = regex::Regex::new(r"###\s+Story\s+(\d+)[:\s]+(.+)").ok()?;
-        let caps = re.captures(line)?;
+        // Uses pre-compiled regex for performance
+        let caps = STORY_HEADING_REGEX.captures(line)?;
 
         let num = caps.get(1)?.as_str().parse().ok()?;
         let title = caps.get(2)?.as_str().trim().to_string();

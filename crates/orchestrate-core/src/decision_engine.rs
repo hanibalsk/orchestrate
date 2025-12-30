@@ -5,7 +5,54 @@
 //! detecting when reviews or escalation are needed.
 
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+// Pre-compiled regex patterns for hot paths
+static STATUS_REGEX_PLAIN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)STATUS:\s*(\w+)(?:\s*[-:]\s*(.*))?").unwrap()
+});
+
+static STATUS_REGEX_MARKDOWN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\*\*STATUS\*\*:\s*(\w+)(?:\s*[-:]\s*(.*))?").unwrap()
+});
+
+static STATUS_REGEX_BRACKET: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\[STATUS\]:\s*(\w+)(?:\s*[-:]\s*(.*))?").unwrap()
+});
+
+static JSON_STATUS_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"```json\s*\{[^}]*"status"\s*:\s*"(\w+)"[^}]*\}\s*```"#).unwrap()
+});
+
+static FILE_CREATED_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:Created|Modified|Updated|Wrote|Edited|Changed)\s+(?:file\s+)?[`']?([^\s`']+\.\w+)[`']?").unwrap()
+});
+
+static FILE_TOOL_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:Write|Edit)\s+tool.*?[`']([^\s`']+\.\w+)[`']").unwrap()
+});
+
+static FILE_GIT_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"git\s+(?:add|diff)\s+[`']?([^\s`']+\.\w+)[`']?").unwrap()
+});
+
+static FILE_PATH_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"File:\s+[`']?([^\s`']+\.\w+)[`']?").unwrap()
+});
+
+static TEST_ATTR_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:#\[test\]|#\[tokio::test\])\s*(?:async\s+)?fn\s+(\w+)").unwrap()
+});
+
+static TEST_RESULT_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"test\s+(\w+)\s+\.\.\.\s+(?:ok|FAILED)").unwrap()
+});
+
+static TEST_RUNNING_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"running\s+\d+\s+tests?.*?test\s+(\w+)").unwrap()
+});
 
 /// Status signals that agents can emit
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -259,29 +306,28 @@ impl DecisionEngine {
         // STATUS: BLOCKED - reason here
         // **STATUS**: WAITING
 
-        let status_patterns = [
-            r"(?i)STATUS:\s*(\w+)(?:\s*[-:]\s*(.*))?",
-            r"(?i)\*\*STATUS\*\*:\s*(\w+)(?:\s*[-:]\s*(.*))?",
-            r"(?i)\[STATUS\]:\s*(\w+)(?:\s*[-:]\s*(.*))?",
+        // Use pre-compiled regex patterns for performance
+        let status_regexes: [&Regex; 3] = [
+            &STATUS_REGEX_PLAIN,
+            &STATUS_REGEX_MARKDOWN,
+            &STATUS_REGEX_BRACKET,
         ];
 
-        for pattern in &status_patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                if let Some(captures) = re.captures(output) {
-                    if let Some(status_match) = captures.get(1) {
-                        if let Some(status) = AgentStatus::from_str(status_match.as_str()) {
-                            let reason = captures.get(2).map(|m| m.as_str().trim().to_string());
-                            return Some(StatusSignal {
-                                status,
-                                reason: if reason.as_ref().map(|r| r.is_empty()).unwrap_or(true) {
-                                    None
-                                } else {
-                                    reason
-                                },
-                                details: None,
-                                parsed_at: Utc::now(),
-                            });
-                        }
+        for re in status_regexes {
+            if let Some(captures) = re.captures(output) {
+                if let Some(status_match) = captures.get(1) {
+                    if let Some(status) = AgentStatus::from_str(status_match.as_str()) {
+                        let reason = captures.get(2).map(|m| m.as_str().trim().to_string());
+                        return Some(StatusSignal {
+                            status,
+                            reason: if reason.as_ref().map(|r| r.is_empty()).unwrap_or(true) {
+                                None
+                            } else {
+                                reason
+                            },
+                            details: None,
+                            parsed_at: Utc::now(),
+                        });
                     }
                 }
             }
@@ -297,20 +343,16 @@ impl DecisionEngine {
 
     /// Parse JSON-formatted status signal
     fn parse_json_status(&self, output: &str) -> Option<StatusSignal> {
-        // Look for JSON blocks that might contain status
-        let json_pattern = r#"```json\s*\{[^}]*"status"\s*:\s*"(\w+)"[^}]*\}\s*```"#;
-
-        if let Ok(re) = regex::Regex::new(json_pattern) {
-            if let Some(captures) = re.captures(output) {
-                if let Some(status_match) = captures.get(1) {
-                    if let Some(status) = AgentStatus::from_str(status_match.as_str()) {
-                        return Some(StatusSignal {
-                            status,
-                            reason: None,
-                            details: None,
-                            parsed_at: Utc::now(),
-                        });
-                    }
+        // Look for JSON blocks that might contain status (using pre-compiled regex)
+        if let Some(captures) = JSON_STATUS_REGEX.captures(output) {
+            if let Some(status_match) = captures.get(1) {
+                if let Some(status) = AgentStatus::from_str(status_match.as_str()) {
+                    return Some(StatusSignal {
+                        status,
+                        reason: None,
+                        details: None,
+                        parsed_at: Utc::now(),
+                    });
                 }
             }
         }
@@ -322,22 +364,20 @@ impl DecisionEngine {
     pub fn detect_files_changed(&self, output: &str) -> Vec<String> {
         let mut files = Vec::new();
 
-        // Look for common patterns indicating file changes
-        let patterns = [
-            r"(?:Created|Modified|Updated|Wrote|Edited|Changed)\s+(?:file\s+)?[`']?([^\s`']+\.\w+)[`']?",
-            r"(?:Write|Edit)\s+tool.*?[`']([^\s`']+\.\w+)[`']",
-            r"git\s+(?:add|diff)\s+[`']?([^\s`']+\.\w+)[`']?",
-            r"File:\s+[`']?([^\s`']+\.\w+)[`']?",
+        // Use pre-compiled regex patterns for performance
+        let file_regexes: [&Regex; 4] = [
+            &FILE_CREATED_REGEX,
+            &FILE_TOOL_REGEX,
+            &FILE_GIT_REGEX,
+            &FILE_PATH_REGEX,
         ];
 
-        for pattern in &patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                for captures in re.captures_iter(output) {
-                    if let Some(file_match) = captures.get(1) {
-                        let file = file_match.as_str().to_string();
-                        if !files.contains(&file) && self.is_valid_file_path(&file) {
-                            files.push(file);
-                        }
+        for re in file_regexes {
+            for captures in re.captures_iter(output) {
+                if let Some(file_match) = captures.get(1) {
+                    let file = file_match.as_str().to_string();
+                    if !files.contains(&file) && self.is_valid_file_path(&file) {
+                        files.push(file);
                     }
                 }
             }
@@ -366,20 +406,19 @@ impl DecisionEngine {
     pub fn detect_tests_affected(&self, output: &str) -> Vec<String> {
         let mut tests = Vec::new();
 
-        let patterns = [
-            r"(?:#\[test\]|#\[tokio::test\])\s*(?:async\s+)?fn\s+(\w+)",
-            r"test\s+(\w+)\s+\.\.\.\s+(?:ok|FAILED)",
-            r"running\s+\d+\s+tests?.*?test\s+(\w+)",
+        // Use pre-compiled regex patterns for performance
+        let test_regexes: [&Regex; 3] = [
+            &TEST_ATTR_REGEX,
+            &TEST_RESULT_REGEX,
+            &TEST_RUNNING_REGEX,
         ];
 
-        for pattern in &patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                for captures in re.captures_iter(output) {
-                    if let Some(test_match) = captures.get(1) {
-                        let test = test_match.as_str().to_string();
-                        if !tests.contains(&test) {
-                            tests.push(test);
-                        }
+        for re in test_regexes {
+            for captures in re.captures_iter(output) {
+                if let Some(test_match) = captures.get(1) {
+                    let test = test_match.as_str().to_string();
+                    if !tests.contains(&test) {
+                        tests.push(test);
                     }
                 }
             }
