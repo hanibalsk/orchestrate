@@ -149,6 +149,26 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/011_success_patterns.sql"))
             .execute(&self.pool)
             .await?;
+        // Feedback migration
+        sqlx::query(include_str!("../../../migrations/012_feedback.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Experiments migration
+        sqlx::query(include_str!("../../../migrations/013_experiments.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Model selection migration
+        sqlx::query(include_str!("../../../migrations/014_model_selection.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Prompt optimization migration
+        sqlx::query(include_str!("../../../migrations/015_prompt_optimization.sql"))
+            .execute(&self.pool)
+            .await?;
+        // Incidents migration
+        sqlx::query(include_str!("../../../migrations/016_incidents.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -5459,382 +5479,855 @@ impl From<ModelSelectionConfigRow> for ModelSelectionConfig {
 }
 
 impl Database {
-    // CI Integration methods
+    // ==================== Incident Operations ====================
 
-    /// Save a CI run to the database
-    pub async fn save_ci_run(&self, run: &crate::ci_integration::CiRun) -> Result<()> {
+    /// Create a new incident
+    pub async fn create_incident(&self, incident: &crate::incident::Incident) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO ci_runs (id, provider, workflow_name, branch, commit_sha, status, conclusion,
-                                 started_at, completed_at, duration_seconds, url, triggered_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                status = excluded.status,
-                conclusion = excluded.conclusion,
-                completed_at = excluded.completed_at,
-                duration_seconds = excluded.duration_seconds,
-                updated_at = datetime('now')
-            "#,
-        )
-        .bind(&run.id)
-        .bind(run.provider.as_str())
-        .bind(&run.workflow_name)
-        .bind(&run.branch)
-        .bind(&run.commit_sha)
-        .bind(run.status.as_str())
-        .bind(run.conclusion.as_ref().map(|c| c.as_str()))
-        .bind(run.started_at.map(|t| t.to_rfc3339()))
-        .bind(run.completed_at.map(|t| t.to_rfc3339()))
-        .bind(run.duration_seconds)
-        .bind(&run.url)
-        .bind(&run.triggered_by)
-        .execute(&self.pool)
-        .await?;
-
-        // Save jobs
-        for job in &run.jobs {
-            self.save_ci_job(&run.id, job).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Save a CI job
-    async fn save_ci_job(&self, run_id: &str, job: &crate::ci_integration::CiJob) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO ci_jobs (id, run_id, name, status, conclusion, started_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                status = excluded.status,
-                conclusion = excluded.conclusion,
-                completed_at = excluded.completed_at
-            "#,
-        )
-        .bind(&job.id)
-        .bind(run_id)
-        .bind(&job.name)
-        .bind(job.status.as_str())
-        .bind(job.conclusion.as_ref().map(|c| c.as_str()))
-        .bind(job.started_at.map(|t| t.to_rfc3339()))
-        .bind(job.completed_at.map(|t| t.to_rfc3339()))
-        .execute(&self.pool)
-        .await?;
-
-        // Save steps
-        for step in &job.steps {
-            sqlx::query(
-                r#"
-                INSERT INTO ci_steps (job_id, name, status, conclusion, step_number)
-                VALUES (?, ?, ?, ?, ?)
-                "#,
+            INSERT INTO incidents (
+                id, title, description, severity, status, detected_at,
+                acknowledged_at, resolved_at, affected_services,
+                related_incidents, tags, metadata
             )
-            .bind(&job.id)
-            .bind(&step.name)
-            .bind(step.status.as_str())
-            .bind(step.conclusion.as_ref().map(|c| c.as_str()))
-            .bind(step.number)
-            .execute(&self.pool)
-            .await?;
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&incident.id)
+        .bind(&incident.title)
+        .bind(&incident.description)
+        .bind(incident.severity.as_str())
+        .bind(incident.status.as_str())
+        .bind(incident.detected_at.to_rfc3339())
+        .bind(incident.acknowledged_at.as_ref().map(|t| t.to_rfc3339()))
+        .bind(incident.resolved_at.as_ref().map(|t| t.to_rfc3339()))
+        .bind(serde_json::to_string(&incident.affected_services)?)
+        .bind(serde_json::to_string(&incident.related_incidents)?)
+        .bind(serde_json::to_string(&incident.tags)?)
+        .bind(serde_json::to_string(&incident.metadata)?)
+        .execute(&self.pool)
+        .await?;
+
+        // Insert timeline events
+        for event in &incident.timeline {
+            self.add_timeline_event(&incident.id, event).await?;
         }
 
         Ok(())
     }
 
-    /// Get a CI run by ID
-    pub async fn get_ci_run(&self, run_id: &str) -> Result<Option<crate::ci_integration::CiRun>> {
-        #[derive(sqlx::FromRow)]
-        struct CiRunRow {
-            id: String,
-            provider: String,
-            workflow_name: String,
-            branch: String,
-            commit_sha: Option<String>,
-            status: String,
-            conclusion: Option<String>,
-            started_at: Option<String>,
-            completed_at: Option<String>,
-            duration_seconds: Option<i64>,
-            url: Option<String>,
-            triggered_by: Option<String>,
-        }
-
-        let row = sqlx::query_as::<_, CiRunRow>(
-            "SELECT * FROM ci_runs WHERE id = ?"
+    /// Update an incident
+    pub async fn update_incident(&self, incident: &crate::incident::Incident) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE incidents SET
+                title = ?, description = ?, severity = ?, status = ?,
+                acknowledged_at = ?, resolved_at = ?,
+                affected_services = ?, related_incidents = ?,
+                tags = ?, metadata = ?, updated_at = datetime('now')
+            WHERE id = ?
+            "#,
         )
-        .bind(run_id)
+        .bind(&incident.title)
+        .bind(&incident.description)
+        .bind(incident.severity.as_str())
+        .bind(incident.status.as_str())
+        .bind(incident.acknowledged_at.as_ref().map(|t| t.to_rfc3339()))
+        .bind(incident.resolved_at.as_ref().map(|t| t.to_rfc3339()))
+        .bind(serde_json::to_string(&incident.affected_services)?)
+        .bind(serde_json::to_string(&incident.related_incidents)?)
+        .bind(serde_json::to_string(&incident.tags)?)
+        .bind(serde_json::to_string(&incident.metadata)?)
+        .bind(&incident.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get an incident by ID
+    pub async fn get_incident(&self, id: &str) -> Result<Option<crate::incident::Incident>> {
+        let row = sqlx::query_as::<_, IncidentRow>(
+            r#"
+            SELECT id, title, description, severity, status, detected_at,
+                   acknowledged_at, resolved_at, affected_services,
+                   related_incidents, tags, metadata
+            FROM incidents
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
 
         if let Some(row) = row {
-            use std::str::FromStr;
-            let provider = crate::ci_integration::CiProvider::from_str(&row.provider)
-                .map_err(|e| crate::Error::Other(e))?;
-
-            let status = match row.status.as_str() {
-                "queued" => crate::ci_integration::CiRunStatus::Queued,
-                "in_progress" => crate::ci_integration::CiRunStatus::InProgress,
-                "completed" => crate::ci_integration::CiRunStatus::Completed,
-                "cancelled" => crate::ci_integration::CiRunStatus::Cancelled,
-                "skipped" => crate::ci_integration::CiRunStatus::Skipped,
-                _ => crate::ci_integration::CiRunStatus::Queued,
-            };
-
-            let conclusion = row.conclusion.and_then(|c| match c.as_str() {
-                "success" => Some(crate::ci_integration::CiConclusion::Success),
-                "failure" => Some(crate::ci_integration::CiConclusion::Failure),
-                "cancelled" => Some(crate::ci_integration::CiConclusion::Cancelled),
-                "skipped" => Some(crate::ci_integration::CiConclusion::Skipped),
-                "timed_out" => Some(crate::ci_integration::CiConclusion::TimedOut),
-                "action_required" => Some(crate::ci_integration::CiConclusion::ActionRequired),
-                "neutral" => Some(crate::ci_integration::CiConclusion::Neutral),
-                _ => None,
-            });
-
-            let jobs = self.get_ci_jobs(&row.id).await?;
-
-            Ok(Some(crate::ci_integration::CiRun {
-                id: row.id,
-                provider,
-                workflow_name: row.workflow_name,
-                branch: row.branch,
-                commit_sha: row.commit_sha,
-                status,
-                conclusion,
-                jobs,
-                started_at: row.started_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
-                completed_at: row.completed_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
-                duration_seconds: row.duration_seconds,
-                url: row.url,
-                triggered_by: row.triggered_by,
-            }))
+            let timeline = self.get_timeline_events(id).await?;
+            Ok(Some(row.into_incident(timeline)?))
         } else {
             Ok(None)
         }
     }
 
-    /// Get CI jobs for a run
-    async fn get_ci_jobs(&self, run_id: &str) -> Result<Vec<crate::ci_integration::CiJob>> {
-        #[derive(sqlx::FromRow)]
-        struct CiJobRow {
-            id: String,
-            name: String,
-            status: String,
-            conclusion: Option<String>,
-            started_at: Option<String>,
-            completed_at: Option<String>,
+    /// List incidents with optional filters
+    pub async fn list_incidents(
+        &self,
+        status: Option<&str>,
+        severity: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<crate::incident::Incident>> {
+        let mut query = String::from(
+            r#"
+            SELECT id, title, description, severity, status, detected_at,
+                   acknowledged_at, resolved_at, affected_services,
+                   related_incidents, tags, metadata
+            FROM incidents
+            WHERE 1=1
+            "#,
+        );
+
+        if status.is_some() {
+            query.push_str(" AND status = ?");
+        }
+        if severity.is_some() {
+            query.push_str(" AND severity = ?");
         }
 
-        let rows = sqlx::query_as::<_, CiJobRow>(
-            "SELECT * FROM ci_jobs WHERE run_id = ? ORDER BY created_at"
-        )
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await?;
+        query.push_str(" ORDER BY detected_at DESC");
 
-        let mut jobs = Vec::new();
+        if let Some(limit) = limit {
+            query.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        let mut q = sqlx::query_as::<_, IncidentRow>(&query);
+        if let Some(s) = status {
+            q = q.bind(s);
+        }
+        if let Some(sev) = severity {
+            q = q.bind(sev);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+
+        let mut incidents = Vec::new();
         for row in rows {
-            let status = match row.status.as_str() {
-                "queued" => crate::ci_integration::CiRunStatus::Queued,
-                "in_progress" => crate::ci_integration::CiRunStatus::InProgress,
-                "completed" => crate::ci_integration::CiRunStatus::Completed,
-                "cancelled" => crate::ci_integration::CiRunStatus::Cancelled,
-                "skipped" => crate::ci_integration::CiRunStatus::Skipped,
-                _ => crate::ci_integration::CiRunStatus::Queued,
-            };
-
-            let conclusion = row.conclusion.and_then(|c| match c.as_str() {
-                "success" => Some(crate::ci_integration::CiConclusion::Success),
-                "failure" => Some(crate::ci_integration::CiConclusion::Failure),
-                "cancelled" => Some(crate::ci_integration::CiConclusion::Cancelled),
-                "skipped" => Some(crate::ci_integration::CiConclusion::Skipped),
-                "timed_out" => Some(crate::ci_integration::CiConclusion::TimedOut),
-                "action_required" => Some(crate::ci_integration::CiConclusion::ActionRequired),
-                "neutral" => Some(crate::ci_integration::CiConclusion::Neutral),
-                _ => None,
-            });
-
-            let steps = self.get_ci_steps(&row.id).await?;
-
-            jobs.push(crate::ci_integration::CiJob {
-                id: row.id,
-                name: row.name,
-                status,
-                conclusion,
-                started_at: row.started_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
-                completed_at: row.completed_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
-                steps,
-            });
+            let timeline = self.get_timeline_events(&row.id).await?;
+            incidents.push(row.into_incident(timeline)?);
         }
 
-        Ok(jobs)
+        Ok(incidents)
     }
 
-    /// Get CI steps for a job
-    async fn get_ci_steps(&self, job_id: &str) -> Result<Vec<crate::ci_integration::CiStep>> {
-        #[derive(sqlx::FromRow)]
-        struct CiStepRow {
-            name: String,
-            status: String,
-            conclusion: Option<String>,
-            step_number: u32,
-        }
+    /// Add timeline event to incident
+    pub async fn add_timeline_event(
+        &self,
+        incident_id: &str,
+        event: &crate::incident::TimelineEvent,
+    ) -> Result<()> {
+        let event_type_str = match event.event_type {
+            crate::incident::TimelineEventType::Detected => "detected",
+            crate::incident::TimelineEventType::Acknowledged => "acknowledged",
+            crate::incident::TimelineEventType::InvestigationStarted => "investigation_started",
+            crate::incident::TimelineEventType::RootCauseIdentified => "root_cause_identified",
+            crate::incident::TimelineEventType::MitigationStarted => "mitigation_started",
+            crate::incident::TimelineEventType::PlaybookExecuted => "playbook_executed",
+            crate::incident::TimelineEventType::Escalated => "escalated",
+            crate::incident::TimelineEventType::Resolved => "resolved",
+            crate::incident::TimelineEventType::PostMortemCreated => "post_mortem_created",
+            crate::incident::TimelineEventType::Comment => "comment",
+        };
 
-        let rows = sqlx::query_as::<_, CiStepRow>(
-            "SELECT name, status, conclusion, step_number FROM ci_steps WHERE job_id = ? ORDER BY step_number"
+        sqlx::query(
+            r#"
+            INSERT INTO incident_timeline (
+                incident_id, timestamp, event_type, description, actor, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
         )
-        .bind(job_id)
+        .bind(incident_id)
+        .bind(event.timestamp.to_rfc3339())
+        .bind(event_type_str)
+        .bind(&event.description)
+        .bind(&event.actor)
+        .bind(serde_json::to_string(&event.metadata)?)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get timeline events for an incident
+    pub async fn get_timeline_events(
+        &self,
+        incident_id: &str,
+    ) -> Result<Vec<crate::incident::TimelineEvent>> {
+        let rows = sqlx::query_as::<_, TimelineEventRow>(
+            r#"
+            SELECT timestamp, event_type, description, actor, metadata
+            FROM incident_timeline
+            WHERE incident_id = ?
+            ORDER BY timestamp ASC
+            "#,
+        )
+        .bind(incident_id)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|row| {
-            let status = match row.status.as_str() {
-                "queued" => crate::ci_integration::CiRunStatus::Queued,
-                "in_progress" => crate::ci_integration::CiRunStatus::InProgress,
-                "completed" => crate::ci_integration::CiRunStatus::Completed,
-                "cancelled" => crate::ci_integration::CiRunStatus::Cancelled,
-                "skipped" => crate::ci_integration::CiRunStatus::Skipped,
-                _ => crate::ci_integration::CiRunStatus::Queued,
-            };
-
-            let conclusion = row.conclusion.and_then(|c| match c.as_str() {
-                "success" => Some(crate::ci_integration::CiConclusion::Success),
-                "failure" => Some(crate::ci_integration::CiConclusion::Failure),
-                "cancelled" => Some(crate::ci_integration::CiConclusion::Cancelled),
-                "skipped" => Some(crate::ci_integration::CiConclusion::Skipped),
-                "timed_out" => Some(crate::ci_integration::CiConclusion::TimedOut),
-                "action_required" => Some(crate::ci_integration::CiConclusion::ActionRequired),
-                "neutral" => Some(crate::ci_integration::CiConclusion::Neutral),
-                _ => None,
-            });
-
-            crate::ci_integration::CiStep {
-                name: row.name,
-                status,
-                conclusion,
-                number: row.step_number,
-            }
-        }).collect())
+        rows.into_iter().map(|r| r.try_into()).collect()
     }
 
-    /// List recent CI runs
-    pub async fn list_ci_runs(&self, limit: i64) -> Result<Vec<crate::ci_integration::CiRun>> {
-        #[derive(sqlx::FromRow)]
-        struct CiRunRow {
-            id: String,
+    // ==================== Root Cause Analysis ====================
+
+    /// Save root cause analysis
+    pub async fn save_root_cause_analysis(
+        &self,
+        rca: &crate::incident::RootCauseAnalysis,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO root_cause_analyses (
+                incident_id, primary_cause, evidence, contributing_factors,
+                hypotheses, related_events, analyzed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&rca.incident_id)
+        .bind(&rca.primary_cause)
+        .bind(serde_json::to_string(&rca.evidence)?)
+        .bind(serde_json::to_string(&rca.contributing_factors)?)
+        .bind(serde_json::to_string(&rca.hypotheses)?)
+        .bind(serde_json::to_string(&rca.related_events)?)
+        .bind(rca.analyzed_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get root cause analysis for an incident
+    pub async fn get_root_cause_analysis(
+        &self,
+        incident_id: &str,
+    ) -> Result<Option<crate::incident::RootCauseAnalysis>> {
+        let row = sqlx::query_as::<_, RootCauseAnalysisRow>(
+            r#"
+            SELECT incident_id, primary_cause, evidence, contributing_factors,
+                   hypotheses, related_events, analyzed_at
+            FROM root_cause_analyses
+            WHERE incident_id = ?
+            "#,
+        )
+        .bind(incident_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    // ==================== Playbook Operations ====================
+
+    /// Create a playbook
+    pub async fn create_playbook(&self, playbook: &crate::incident::Playbook) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO playbooks (id, name, description, triggers, actions)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&playbook.id)
+        .bind(&playbook.name)
+        .bind(&playbook.description)
+        .bind(serde_json::to_string(&playbook.triggers)?)
+        .bind(serde_json::to_string(&playbook.actions)?)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update a playbook
+    pub async fn update_playbook(&self, playbook: &crate::incident::Playbook) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE playbooks SET
+                name = ?, description = ?, triggers = ?, actions = ?,
+                updated_at = datetime('now')
+            WHERE id = ?
+            "#,
+        )
+        .bind(&playbook.name)
+        .bind(&playbook.description)
+        .bind(serde_json::to_string(&playbook.triggers)?)
+        .bind(serde_json::to_string(&playbook.actions)?)
+        .bind(&playbook.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get a playbook by ID
+    pub async fn get_playbook(&self, id: &str) -> Result<Option<crate::incident::Playbook>> {
+        let row = sqlx::query_as::<_, PlaybookRow>(
+            r#"
+            SELECT id, name, description, triggers, actions, created_at, updated_at
+            FROM playbooks
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// Get a playbook by name
+    pub async fn get_playbook_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::incident::Playbook>> {
+        let row = sqlx::query_as::<_, PlaybookRow>(
+            r#"
+            SELECT id, name, description, triggers, actions, created_at, updated_at
+            FROM playbooks
+            WHERE name = ?
+            "#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List all playbooks
+    pub async fn list_playbooks(&self) -> Result<Vec<crate::incident::Playbook>> {
+        let rows = sqlx::query_as::<_, PlaybookRow>(
+            r#"
+            SELECT id, name, description, triggers, actions, created_at, updated_at
+            FROM playbooks
+            ORDER BY name ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    /// Delete a playbook
+    pub async fn delete_playbook(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM playbooks WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    // ==================== Playbook Execution ====================
+
+    /// Create playbook execution
+    pub async fn create_playbook_execution(
+        &self,
+        execution: &crate::incident::PlaybookExecution,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO playbook_executions (
+                id, playbook_id, incident_id, status, started_at,
+                completed_at, action_results, triggered_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&execution.id)
+        .bind(&execution.playbook_id)
+        .bind(&execution.incident_id)
+        .bind(execution.status.as_str())
+        .bind(execution.started_at.to_rfc3339())
+        .bind(execution.completed_at.as_ref().map(|t| t.to_rfc3339()))
+        .bind(serde_json::to_string(&execution.action_results)?)
+        .bind(&execution.triggered_by)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update playbook execution
+    pub async fn update_playbook_execution(
+        &self,
+        execution: &crate::incident::PlaybookExecution,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE playbook_executions SET
+                status = ?, completed_at = ?, action_results = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(execution.status.as_str())
+        .bind(execution.completed_at.as_ref().map(|t| t.to_rfc3339()))
+        .bind(serde_json::to_string(&execution.action_results)?)
+        .bind(&execution.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get playbook execution by ID
+    pub async fn get_playbook_execution(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::incident::PlaybookExecution>> {
+        let row = sqlx::query_as::<_, PlaybookExecutionRow>(
+            r#"
+            SELECT id, playbook_id, incident_id, status, started_at,
+                   completed_at, action_results, triggered_by
+            FROM playbook_executions
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| r.try_into()).transpose()
+    }
+
+    /// List executions for a playbook
+    pub async fn list_playbook_executions(
+        &self,
+        playbook_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<crate::incident::PlaybookExecution>> {
+        let mut query = String::from(
+            r#"
+            SELECT id, playbook_id, incident_id, status, started_at,
+                   completed_at, action_results, triggered_by
+            FROM playbook_executions
+            WHERE playbook_id = ?
+            ORDER BY started_at DESC
+            "#,
+        );
+
+        if let Some(limit) = limit {
+            query.push_str(&format!(" LIMIT {}", limit));
         }
 
-        let rows = sqlx::query_as::<_, CiRunRow>(
-            "SELECT id FROM ci_runs ORDER BY created_at DESC LIMIT ?"
+        let rows = sqlx::query_as::<_, PlaybookExecutionRow>(&query)
+            .bind(playbook_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+
+    // ==================== Post-Mortem Operations ====================
+
+    /// Save post-mortem
+    pub async fn save_post_mortem(&self, pm: &crate::incident::PostMortem) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO post_mortems (
+                incident_id, title, summary, impact, root_cause,
+                contributing_factors, resolution, action_items,
+                lessons_learned, authors
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&pm.incident_id)
+        .bind(&pm.title)
+        .bind(&pm.summary)
+        .bind(serde_json::to_string(&pm.impact)?)
+        .bind(&pm.root_cause)
+        .bind(serde_json::to_string(&pm.contributing_factors)?)
+        .bind(&pm.resolution)
+        .bind(serde_json::to_string(&pm.action_items)?)
+        .bind(serde_json::to_string(&pm.lessons_learned)?)
+        .bind(serde_json::to_string(&pm.authors)?)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get post-mortem for an incident
+    pub async fn get_post_mortem(
+        &self,
+        incident_id: &str,
+    ) -> Result<Option<crate::incident::PostMortem>> {
+        let row = sqlx::query_as::<_, PostMortemRow>(
+            r#"
+            SELECT incident_id, title, summary, impact, root_cause,
+                   contributing_factors, resolution, action_items,
+                   lessons_learned, authors, created_at
+            FROM post_mortems
+            WHERE incident_id = ?
+            "#,
+        )
+        .bind(incident_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = row {
+            // Get timeline from incident
+            let timeline = self.get_timeline_events(incident_id).await?;
+            Ok(Some(row.into_post_mortem(timeline)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ==================== Anomaly Metrics ====================
+
+    /// Record anomaly metric
+    pub async fn record_anomaly_metric(
+        &self,
+        metric: &crate::incident::AnomalyMetric,
+        incident_id: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO anomaly_metrics (
+                name, current_value, baseline_value, threshold,
+                deviation_percent, is_anomaly, incident_id, timestamp, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&metric.name)
+        .bind(metric.current_value)
+        .bind(metric.baseline_value)
+        .bind(metric.threshold)
+        .bind(metric.deviation_percent)
+        .bind(metric.is_anomaly)
+        .bind(incident_id)
+        .bind(metric.timestamp.to_rfc3339())
+        .bind("{}")
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get recent anomalies
+    pub async fn get_recent_anomalies(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::incident::AnomalyMetric>> {
+        let rows = sqlx::query_as::<_, AnomalyMetricRow>(
+            r#"
+            SELECT name, current_value, baseline_value, threshold,
+                   deviation_percent, is_anomaly, timestamp
+            FROM anomaly_metrics
+            WHERE is_anomaly = 1
+            ORDER BY timestamp DESC
+            LIMIT ?
+            "#,
         )
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut runs = Vec::new();
-        for row in rows {
-            if let Some(run) = self.get_ci_run(&row.id).await? {
-                runs.push(run);
+        rows.into_iter().map(|r| r.try_into()).collect()
+    }
+}
+
+// ==================== Database Row Types ====================
+
+#[derive(sqlx::FromRow)]
+struct IncidentRow {
+    id: String,
+    title: String,
+    description: String,
+    severity: String,
+    status: String,
+    detected_at: String,
+    acknowledged_at: Option<String>,
+    resolved_at: Option<String>,
+    affected_services: String,
+    related_incidents: String,
+    tags: String,
+    metadata: String,
+}
+
+impl IncidentRow {
+    fn into_incident(
+        self,
+        timeline: Vec<crate::incident::TimelineEvent>,
+    ) -> Result<crate::incident::Incident> {
+        use std::str::FromStr;
+
+        Ok(crate::incident::Incident {
+            id: self.id,
+            title: self.title,
+            description: self.description,
+            severity: crate::incident::IncidentSeverity::from_str(&self.severity)
+                .map_err(|e| crate::Error::Other(e))?,
+            status: crate::incident::IncidentStatus::from_str(&self.status)
+                .map_err(|e| crate::Error::Other(e))?,
+            detected_at: chrono::DateTime::parse_from_rfc3339(&self.detected_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            acknowledged_at: self
+                .acknowledged_at
+                .as_ref()
+                .map(|s| chrono::DateTime::parse_from_rfc3339(s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(|dt| dt.into()),
+            resolved_at: self
+                .resolved_at
+                .as_ref()
+                .map(|s| chrono::DateTime::parse_from_rfc3339(s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(|dt| dt.into()),
+            timeline,
+            affected_services: serde_json::from_str(&self.affected_services)?,
+            related_incidents: serde_json::from_str(&self.related_incidents)?,
+            tags: serde_json::from_str(&self.tags)?,
+            metadata: serde_json::from_str(&self.metadata)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct TimelineEventRow {
+    timestamp: String,
+    event_type: String,
+    description: String,
+    actor: Option<String>,
+    metadata: String,
+}
+
+impl TryFrom<TimelineEventRow> for crate::incident::TimelineEvent {
+    type Error = crate::Error;
+
+    fn try_from(row: TimelineEventRow) -> Result<Self> {
+        let event_type = match row.event_type.as_str() {
+            "detected" => crate::incident::TimelineEventType::Detected,
+            "acknowledged" => crate::incident::TimelineEventType::Acknowledged,
+            "investigation_started" | "investigationstarted" => {
+                crate::incident::TimelineEventType::InvestigationStarted
             }
-        }
+            "root_cause_identified" | "rootcauseidentified" => {
+                crate::incident::TimelineEventType::RootCauseIdentified
+            }
+            "mitigation_started" | "mitigationstarted" => {
+                crate::incident::TimelineEventType::MitigationStarted
+            }
+            "playbook_executed" | "playbookexecuted" => {
+                crate::incident::TimelineEventType::PlaybookExecuted
+            }
+            "escalated" => crate::incident::TimelineEventType::Escalated,
+            "resolved" => crate::incident::TimelineEventType::Resolved,
+            "post_mortem_created" | "postmortemcreated" => {
+                crate::incident::TimelineEventType::PostMortemCreated
+            }
+            "comment" => crate::incident::TimelineEventType::Comment,
+            _ => {
+                return Err(crate::Error::Other(format!(
+                    "Unknown event type: {}",
+                    row.event_type
+                )))
+            }
+        };
 
-        Ok(runs)
+        Ok(crate::incident::TimelineEvent {
+            timestamp: chrono::DateTime::parse_from_rfc3339(&row.timestamp)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            event_type,
+            description: row.description,
+            actor: row.actor,
+            metadata: serde_json::from_str(&row.metadata)?,
+        })
     }
+}
 
-    /// Save failure analysis
-    pub async fn save_ci_failure_analysis(&self, analysis: &crate::ci_integration::CiFailureAnalysis) -> Result<i64> {
-        #[derive(sqlx::FromRow)]
-        struct IdRow {
-            id: i64,
-        }
+#[derive(sqlx::FromRow)]
+struct RootCauseAnalysisRow {
+    incident_id: String,
+    primary_cause: String,
+    evidence: String,
+    contributing_factors: String,
+    hypotheses: String,
+    related_events: String,
+    analyzed_at: String,
+}
 
-        let row = sqlx::query_as::<_, IdRow>(
-            r#"
-            INSERT INTO ci_failure_analysis (run_id, is_flaky, flaky_confidence, should_auto_fix)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET
-                is_flaky = excluded.is_flaky,
-                flaky_confidence = excluded.flaky_confidence,
-                should_auto_fix = excluded.should_auto_fix,
-                analyzed_at = datetime('now')
-            RETURNING id
-            "#,
-        )
-        .bind(&analysis.run_id)
-        .bind(analysis.is_flaky)
-        .bind(analysis.flaky_confidence)
-        .bind(analysis.should_auto_fix())
-        .fetch_one(&self.pool)
-        .await?;
+impl TryFrom<RootCauseAnalysisRow> for crate::incident::RootCauseAnalysis {
+    type Error = crate::Error;
 
-        let id = row.id;
-
-        // Save failed jobs
-        for job in &analysis.failed_jobs {
-            sqlx::query(
-                "INSERT INTO ci_failed_jobs (analysis_id, job_name, step_name, error_summary, log_url) VALUES (?, ?, ?, ?, ?)"
-            )
-            .bind(id)
-            .bind(&job.job_name)
-            .bind(&job.step_name)
-            .bind(&job.error_summary)
-            .bind(&job.log_url)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        // Save failed tests
-        for test in &analysis.failed_tests {
-            sqlx::query(
-                "INSERT INTO ci_failed_tests (analysis_id, test_name, test_file, error_message, stack_trace, failure_count, is_flaky) VALUES (?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(id)
-            .bind(&test.test_name)
-            .bind(&test.test_file)
-            .bind(&test.error_message)
-            .bind(&test.stack_trace)
-            .bind(test.failure_count)
-            .bind(test.is_flaky)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        // Save error messages
-        for msg in &analysis.error_messages {
-            sqlx::query(
-                "INSERT INTO ci_error_messages (analysis_id, message) VALUES (?, ?)"
-            )
-            .bind(id)
-            .bind(msg)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        // Save recommendations
-        for rec in &analysis.recommendations {
-            sqlx::query(
-                "INSERT INTO ci_recommendations (analysis_id, recommendation) VALUES (?, ?)"
-            )
-            .bind(id)
-            .bind(rec)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        Ok(id)
+    fn try_from(row: RootCauseAnalysisRow) -> Result<Self> {
+        Ok(crate::incident::RootCauseAnalysis {
+            incident_id: row.incident_id,
+            primary_cause: row.primary_cause,
+            evidence: serde_json::from_str(&row.evidence)?,
+            contributing_factors: serde_json::from_str(&row.contributing_factors)?,
+            hypotheses: serde_json::from_str(&row.hypotheses)?,
+            related_events: serde_json::from_str(&row.related_events)?,
+            analyzed_at: chrono::DateTime::parse_from_rfc3339(&row.analyzed_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
     }
+}
 
-    /// Track flaky test occurrence
-    pub async fn track_flaky_test(&self, test_name: &str, run_id: &str, failed: bool) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO ci_flaky_test_history (test_name, run_id, failed) VALUES (?, ?, ?)"
-        )
-        .bind(test_name)
-        .bind(run_id)
-        .bind(failed)
-        .execute(&self.pool)
-        .await?;
+#[derive(sqlx::FromRow)]
+struct PlaybookRow {
+    id: String,
+    name: String,
+    description: String,
+    triggers: String,
+    actions: String,
+    created_at: String,
+    updated_at: String,
+}
 
-        Ok(())
+impl TryFrom<PlaybookRow> for crate::incident::Playbook {
+    type Error = crate::Error;
+
+    fn try_from(row: PlaybookRow) -> Result<Self> {
+        Ok(crate::incident::Playbook {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            triggers: serde_json::from_str(&row.triggers)?,
+            actions: serde_json::from_str(&row.actions)?,
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PlaybookExecutionRow {
+    id: String,
+    playbook_id: String,
+    incident_id: Option<String>,
+    status: String,
+    started_at: String,
+    completed_at: Option<String>,
+    action_results: String,
+    triggered_by: Option<String>,
+}
+
+impl TryFrom<PlaybookExecutionRow> for crate::incident::PlaybookExecution {
+    type Error = crate::Error;
+
+    fn try_from(row: PlaybookExecutionRow) -> Result<Self> {
+
+        let status = match row.status.as_str() {
+            "running" => crate::incident::PlaybookExecutionStatus::Running,
+            "waiting_approval" => crate::incident::PlaybookExecutionStatus::WaitingApproval,
+            "completed" => crate::incident::PlaybookExecutionStatus::Completed,
+            "failed" => crate::incident::PlaybookExecutionStatus::Failed,
+            "cancelled" => crate::incident::PlaybookExecutionStatus::Cancelled,
+            _ => {
+                return Err(crate::Error::Other(format!(
+                    "Unknown execution status: {}",
+                    row.status
+                )))
+            }
+        };
+
+        Ok(crate::incident::PlaybookExecution {
+            id: row.id,
+            playbook_id: row.playbook_id,
+            incident_id: row.incident_id,
+            status,
+            started_at: chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            completed_at: row
+                .completed_at
+                .as_ref()
+                .map(|s| chrono::DateTime::parse_from_rfc3339(s))
+                .transpose()
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .map(|dt| dt.into()),
+            action_results: serde_json::from_str(&row.action_results)?,
+            triggered_by: row.triggered_by,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PostMortemRow {
+    incident_id: String,
+    title: String,
+    summary: String,
+    impact: String,
+    root_cause: String,
+    contributing_factors: String,
+    resolution: String,
+    action_items: String,
+    lessons_learned: String,
+    authors: String,
+    created_at: String,
+}
+
+impl PostMortemRow {
+    fn into_post_mortem(
+        self,
+        timeline: Vec<crate::incident::TimelineEvent>,
+    ) -> Result<crate::incident::PostMortem> {
+        Ok(crate::incident::PostMortem {
+            incident_id: self.incident_id,
+            title: self.title,
+            summary: self.summary,
+            impact: serde_json::from_str(&self.impact)?,
+            timeline,
+            root_cause: self.root_cause,
+            contributing_factors: serde_json::from_str(&self.contributing_factors)?,
+            resolution: self.resolution,
+            action_items: serde_json::from_str(&self.action_items)?,
+            lessons_learned: serde_json::from_str(&self.lessons_learned)?,
+            created_at: chrono::DateTime::parse_from_rfc3339(&self.created_at)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+            authors: serde_json::from_str(&self.authors)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AnomalyMetricRow {
+    name: String,
+    current_value: f64,
+    baseline_value: f64,
+    threshold: f64,
+    deviation_percent: f64,
+    is_anomaly: bool,
+    timestamp: String,
+}
+
+impl TryFrom<AnomalyMetricRow> for crate::incident::AnomalyMetric {
+    type Error = crate::Error;
+
+    fn try_from(row: AnomalyMetricRow) -> Result<Self> {
+        Ok(crate::incident::AnomalyMetric {
+            name: row.name,
+            current_value: row.current_value,
+            baseline_value: row.baseline_value,
+            threshold: row.threshold,
+            deviation_percent: row.deviation_percent,
+            is_anomaly: row.is_anomaly,
+            timestamp: chrono::DateTime::parse_from_rfc3339(&row.timestamp)
+                .map_err(|e| crate::Error::Other(e.to_string()))?
+                .into(),
+        })
     }
 }
