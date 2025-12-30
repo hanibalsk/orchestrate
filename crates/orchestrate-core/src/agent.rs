@@ -133,7 +133,6 @@ pub enum AgentType {
 
     // Testing agents
     RegressionTester,
-    TestGenerator,
 
     // Issue management
     IssueTriager,
@@ -142,8 +141,23 @@ pub enum AgentType {
     BackgroundController,
     Scheduler,
 
-    // Deployment agents
-    Deployer,
+    // Documentation agents (Epic 011)
+    DocGenerator,
+
+    // Requirements agents (Epic 012)
+    RequirementsAnalyzer,
+
+    // Multi-repo agents (Epic 013)
+    MultiRepoCoordinator,
+
+    // CI/CD agents (Epic 014)
+    CiIntegrator,
+
+    // Incident response agents (Epic 015)
+    IncidentResponder,
+
+    // Security agents (Epic 009)
+    SecurityScanner,
 }
 
 impl AgentType {
@@ -160,11 +174,15 @@ impl AgentType {
             AgentType::PrController => "pr_controller",
             AgentType::ConflictResolver => "conflict_resolver",
             AgentType::RegressionTester => "regression_tester",
-            AgentType::TestGenerator => "test_generator",
             AgentType::IssueTriager => "issue_triager",
             AgentType::BackgroundController => "background_controller",
             AgentType::Scheduler => "scheduler",
-            AgentType::Deployer => "deployer",
+            AgentType::DocGenerator => "doc_generator",
+            AgentType::RequirementsAnalyzer => "requirements_analyzer",
+            AgentType::MultiRepoCoordinator => "multi_repo_coordinator",
+            AgentType::CiIntegrator => "ci_integrator",
+            AgentType::IncidentResponder => "incident_responder",
+            AgentType::SecurityScanner => "security_scanner",
         }
     }
 
@@ -181,11 +199,15 @@ impl AgentType {
             "pr_controller" => Ok(AgentType::PrController),
             "conflict_resolver" => Ok(AgentType::ConflictResolver),
             "regression_tester" => Ok(AgentType::RegressionTester),
-            "test_generator" => Ok(AgentType::TestGenerator),
             "issue_triager" => Ok(AgentType::IssueTriager),
             "background_controller" => Ok(AgentType::BackgroundController),
             "scheduler" => Ok(AgentType::Scheduler),
-            "deployer" => Ok(AgentType::Deployer),
+            "doc_generator" => Ok(AgentType::DocGenerator),
+            "requirements_analyzer" => Ok(AgentType::RequirementsAnalyzer),
+            "multi_repo_coordinator" => Ok(AgentType::MultiRepoCoordinator),
+            "ci_integrator" => Ok(AgentType::CiIntegrator),
+            "incident_responder" => Ok(AgentType::IncidentResponder),
+            "security_scanner" => Ok(AgentType::SecurityScanner),
             _ => Err(crate::Error::Other(format!("Unknown agent type: {}", s))),
         }
     }
@@ -219,15 +241,27 @@ impl AgentType {
             AgentType::RegressionTester => {
                 vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
             }
-            AgentType::TestGenerator => {
-                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
-            }
             AgentType::IssueTriager => vec!["Bash", "Read", "Glob", "Grep"],
             AgentType::BackgroundController => {
                 vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
             }
             AgentType::Scheduler => vec!["Bash", "Read"],
-            AgentType::Deployer => vec!["Bash", "Read", "Write", "Glob", "Grep"],
+            AgentType::DocGenerator => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+            }
+            AgentType::RequirementsAnalyzer => vec!["Bash", "Read", "Glob", "Grep"],
+            AgentType::MultiRepoCoordinator => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
+            }
+            AgentType::CiIntegrator => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+            }
+            AgentType::IncidentResponder => {
+                vec!["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task"]
+            }
+            AgentType::SecurityScanner => {
+                vec!["Bash", "Read", "Write", "Glob", "Grep"]
+            }
         }
     }
 
@@ -239,9 +273,10 @@ impl AgentType {
             AgentType::IssueFixer => 40,
             AgentType::ConflictResolver => 30,
             AgentType::RegressionTester => 50,
-            AgentType::TestGenerator => 50,
             AgentType::IssueTriager => 30,
-            AgentType::Deployer => 60,
+            AgentType::DocGenerator => 50,
+            AgentType::RequirementsAnalyzer => 40,
+            AgentType::CiIntegrator => 40,
             _ => 80,
         }
     }
@@ -502,58 +537,6 @@ mod tests {
         assert_eq!(AgentType::StoryDeveloper.default_max_turns(), 80);
     }
 
-    // ==================== TestGenerator Agent Tests ====================
-
-    #[test]
-    fn test_test_generator_agent_type_exists() {
-        // TestGenerator should be a valid agent type
-        let agent = Agent::new(AgentType::TestGenerator, "Generate tests for user.rs");
-        assert_eq!(agent.agent_type, AgentType::TestGenerator);
-        assert_eq!(agent.task, "Generate tests for user.rs");
-    }
-
-    #[test]
-    fn test_test_generator_as_str() {
-        assert_eq!(AgentType::TestGenerator.as_str(), "test_generator");
-    }
-
-    #[test]
-    fn test_test_generator_from_str() {
-        assert_eq!(
-            AgentType::from_str("test_generator").unwrap(),
-            AgentType::TestGenerator
-        );
-    }
-
-    #[test]
-    fn test_test_generator_allowed_tools() {
-        let tools = AgentType::TestGenerator.allowed_tools();
-        // TestGenerator needs to read code, search patterns, run tests
-        assert!(tools.contains(&"Read"));
-        assert!(tools.contains(&"Glob"));
-        assert!(tools.contains(&"Grep"));
-        assert!(tools.contains(&"Bash"));
-        assert!(tools.contains(&"Write"));
-        assert!(tools.contains(&"Edit"));
-        // Should not have Task tool (focused agent)
-        assert!(!tools.contains(&"Task"));
-    }
-
-    #[test]
-    fn test_test_generator_default_model() {
-        // TestGenerator should use sonnet for code analysis
-        assert_eq!(
-            AgentType::TestGenerator.default_model(),
-            "claude-sonnet-4-20250514"
-        );
-    }
-
-    #[test]
-    fn test_test_generator_max_turns() {
-        // TestGenerator needs moderate turns for analyzing and writing tests
-        assert_eq!(AgentType::TestGenerator.default_max_turns(), 50);
-    }
-
     // ==================== Agent Tests ====================
 
     #[test]
@@ -662,51 +645,5 @@ mod tests {
 
         agent.transition_to(AgentState::Initializing).unwrap();
         assert!(agent.updated_at > initial_updated_at);
-    }
-
-    // ==================== Deployer Agent Tests ====================
-
-    #[test]
-    fn test_deployer_agent_type_exists() {
-        let agent = Agent::new(AgentType::Deployer, "Deploy to staging");
-        assert_eq!(agent.agent_type, AgentType::Deployer);
-    }
-
-    #[test]
-    fn test_deployer_agent_type_as_str() {
-        assert_eq!(AgentType::Deployer.as_str(), "deployer");
-    }
-
-    #[test]
-    fn test_deployer_agent_type_from_str() {
-        assert_eq!(
-            AgentType::from_str("deployer").unwrap(),
-            AgentType::Deployer
-        );
-    }
-
-    #[test]
-    fn test_deployer_agent_allowed_tools() {
-        let tools = AgentType::Deployer.allowed_tools();
-        assert!(tools.contains(&"Bash"), "Deployer needs Bash for executing deployment commands");
-        assert!(tools.contains(&"Read"), "Deployer needs Read for reading deployment configs");
-        assert!(tools.contains(&"Write"), "Deployer needs Write for logging deployment info");
-        assert!(tools.contains(&"Glob"), "Deployer needs Glob for finding deployment files");
-        assert!(tools.contains(&"Grep"), "Deployer needs Grep for validating deployments");
-    }
-
-    #[test]
-    fn test_deployer_agent_default_max_turns() {
-        // Deployments can be complex and require many steps
-        assert_eq!(AgentType::Deployer.default_max_turns(), 60);
-    }
-
-    #[test]
-    fn test_deployer_agent_default_model() {
-        // Deployer should use the default sonnet model
-        assert_eq!(
-            AgentType::Deployer.default_model(),
-            "claude-sonnet-4-20250514"
-        );
     }
 }

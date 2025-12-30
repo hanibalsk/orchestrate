@@ -10,12 +10,11 @@ use axum::{
     Json, Router,
 };
 use orchestrate_core::{
-    Agent, AgentState, AgentType, ApprovalRequest, ApprovalService, CreateEnvironment,
-    CustomInstruction, Database, Deployment, DeploymentExecutor, DeploymentProvider,
-    DeploymentRequest, DeploymentRollback, DeploymentStrategy, Environment, EnvironmentType,
-    Feedback, FeedbackRating, FeedbackSource, FeedbackStats, InstructionEffectiveness,
-    InstructionScope, InstructionSource, LearningEngine, LearningPattern, PatternStatus, Pipeline,
-    PipelineRun, PipelineRunStatus, PipelineStage, RollbackRequest, Schedule, ScheduleRun,
+    Agent, AgentState, AgentType, ApprovalDecision, ApprovalRequest, ApprovalService,
+    ApprovalStatus, CustomInstruction, Database, Feedback, FeedbackRating, FeedbackSource,
+    FeedbackStats, InstructionEffectiveness, InstructionScope, InstructionSource, LearningEngine,
+    LearningPattern, PatternStatus, Pipeline, PipelineRun, PipelineRunStatus, PipelineStage,
+    Schedule, ScheduleRun,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -47,42 +46,42 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
-    pub fn unauthorized() -> Self {
+    fn unauthorized() -> Self {
         Self {
             error: "Invalid or missing API key".to_string(),
             code: "unauthorized".to_string(),
         }
     }
 
-    pub fn not_found(entity: &str) -> Self {
+    fn not_found(entity: &str) -> Self {
         Self {
             error: format!("{} not found", entity),
             code: "not_found".to_string(),
         }
     }
 
-    pub fn bad_request(msg: impl Into<String>) -> Self {
+    fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "bad_request".to_string(),
         }
     }
 
-    pub fn validation(msg: impl Into<String>) -> Self {
+    fn validation(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "validation_error".to_string(),
         }
     }
 
-    pub fn internal(msg: impl Into<String>) -> Self {
+    fn internal(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "internal_error".to_string(),
         }
     }
 
-    pub fn conflict(msg: impl Into<String>) -> Self {
+    fn conflict(msg: impl Into<String>) -> Self {
         Self {
             error: msg.into(),
             code: "conflict".to_string(),
@@ -95,7 +94,6 @@ impl ApiError {
 pub struct AppState {
     pub db: Database,
     pub api_key: Option<SecretString>,
-    pub metrics: Arc<crate::metrics::MetricsCollector>,
 }
 
 impl AppState {
@@ -104,8 +102,6 @@ impl AppState {
         Self {
             db,
             api_key: api_key.map(SecretString::new),
-            metrics: Arc::new(crate::metrics::MetricsCollector::new()
-                .expect("Failed to initialize metrics collector")),
         }
     }
 }
@@ -206,31 +202,42 @@ pub fn create_api_router(state: Arc<AppState>) -> Router {
         .route("/api/feedback", get(list_feedback).post(create_feedback))
         .route("/api/feedback/:id", get(get_feedback).delete(delete_feedback))
         .route("/api/feedback/stats", get(get_feedback_stats))
-        // Deployment routes
-        .route("/api/environments", get(list_environments))
-        .route("/api/environments/:name", get(get_environment))
-        .route("/api/deployments", post(create_deployment).get(list_deployments))
-        .route("/api/deployments/:id", get(get_deployment))
-        .route("/api/deployments/:id/rollback", post(rollback_deployment))
-        // Release routes
-        .route("/api/releases", get(list_releases).post(create_release))
-        .route("/api/releases/:version/publish", post(publish_release))
+        // Learning analytics routes
+        .route("/api/learning/effectiveness", get(get_learning_effectiveness))
+        .route("/api/learning/suggestions", get(get_learning_suggestions))
+        .route("/api/learning/analyze", post(trigger_learning_analysis))
+        // Experiment routes
+        .route("/api/experiments", get(list_experiments).post(create_experiment))
+        .route("/api/experiments/:id", get(get_experiment))
+        .route("/api/experiments/:id/results", get(get_experiment_results))
+        .route("/api/experiments/:id/promote", post(promote_experiment))
+        // Prediction routes
+        .route("/api/predictions", post(get_prediction))
+        // Documentation routes
+        .route("/api/docs/generate", post(generate_documentation))
+        .route("/api/docs/validate", post(validate_documentation))
+        .route("/api/docs/adrs", get(list_adrs).post(create_adr))
+        .route("/api/docs/adrs/:number", get(get_adr).put(update_adr))
+        .route("/api/docs/changelog", post(generate_changelog))
+        // Security routes
+        .route("/api/security/scan", post(trigger_security_scan))
+        .route("/api/security/scans", get(list_security_scans))
+        .route("/api/security/scans/:id", get(get_security_scan))
+        .route("/api/security/vulnerabilities", get(list_vulnerabilities))
+        .route("/api/security/fix", post(apply_security_fix))
+        .route("/api/security/report", get(download_security_report))
+        .route("/api/security/policy", get(get_security_policy))
+        .route("/api/security/gate/evaluate", post(evaluate_security_gate))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
 
     // Public routes (no auth required)
-    let public_routes = Router::new()
-        .route("/api/health", get(health_check))
-        .route("/metrics", get(metrics_handler));
-
-    // Monitoring routes (protected)
-    let monitoring_router = crate::monitoring::create_monitoring_router();
+    let public_routes = Router::new().route("/api/health", get(health_check));
 
     Router::new()
         .merge(protected_routes)
-        .merge(monitoring_router)
         .merge(public_routes)
         .with_state(state)
 }
@@ -276,15 +283,6 @@ async fn health_check() -> Json<HealthResponse> {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
-}
-
-/// Prometheus metrics endpoint
-async fn metrics_handler(State(state): State<Arc<AppState>>) -> Result<String, ApiError> {
-    state
-        .metrics
-        .gather(&state.db)
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to gather metrics: {}", e)))
 }
 
 async fn list_agents(
@@ -2031,331 +2029,986 @@ struct FeedbackStatsQuery {
     agent_id: Option<String>,
 }
 
-// ==================== Deployment Request/Response Types ====================
+// ==================== Learning Analytics Handlers ====================
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EnvironmentResponse {
-    pub id: i64,
-    pub name: String,
-    pub env_type: String,
-    pub url: Option<String>,
-    pub provider: Option<String>,
-    pub config: serde_json::Value,
-    pub requires_approval: bool,
-    pub created_at: String,
+#[derive(Debug, Serialize)]
+struct LearningEffectivenessResponse {
+    instructions: Vec<InstructionEffectivenessItem>,
+    summary: EffectivenessSummaryItem,
 }
 
-impl From<Environment> for EnvironmentResponse {
-    fn from(env: Environment) -> Self {
-        Self {
-            id: env.id,
-            name: env.name,
-            env_type: env.env_type.to_string(),
-            url: env.url,
-            provider: env.provider,
-            config: serde_json::to_value(&env.config).unwrap_or(serde_json::json!({})),
-            requires_approval: env.requires_approval,
-            created_at: env.created_at.to_rfc3339(),
-        }
-    }
+#[derive(Debug, Serialize)]
+struct InstructionEffectivenessItem {
+    instruction_id: i64,
+    name: String,
+    source: String,
+    enabled: bool,
+    usage_count: i64,
+    success_rate: f64,
+    penalty_score: f64,
+    level: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateDeploymentRequest {
-    pub environment: String,
-    pub version: String,
-    pub provider: Option<String>,
-    pub strategy: Option<String>,
-    pub timeout_seconds: Option<u32>,
-    #[serde(default)]
-    pub skip_validation: bool,
+#[derive(Debug, Serialize)]
+struct EffectivenessSummaryItem {
+    total_instructions: i64,
+    enabled_count: i64,
+    used_count: i64,
+    total_usage: i64,
+    avg_success_rate: f64,
+    avg_penalty_score: f64,
+    ineffective_count: i64,
 }
 
-impl CreateDeploymentRequest {
-    fn validate(&self) -> Result<(), ApiError> {
-        if self.environment.trim().is_empty() {
-            return Err(ApiError::validation("Environment cannot be empty"));
-        }
-        if self.version.trim().is_empty() {
-            return Err(ApiError::validation("Version cannot be empty"));
-        }
-        if let Some(timeout) = self.timeout_seconds {
-            if timeout == 0 {
-                return Err(ApiError::validation("Timeout must be greater than 0"));
-            }
-            if timeout > 3600 {
-                return Err(ApiError::validation("Timeout cannot exceed 3600 seconds"));
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeploymentResponse {
-    pub id: i64,
-    pub environment_id: i64,
-    pub environment_name: String,
-    pub version: String,
-    pub provider: String,
-    pub strategy: Option<String>,
-    pub status: String,
-    pub error_message: Option<String>,
-    pub started_at: String,
-    pub completed_at: Option<String>,
-    pub timeout_seconds: u32,
-}
-
-impl From<Deployment> for DeploymentResponse {
-    fn from(deployment: Deployment) -> Self {
-        Self {
-            id: deployment.id,
-            environment_id: deployment.environment_id,
-            environment_name: deployment.environment_name,
-            version: deployment.version,
-            provider: deployment.provider.to_string(),
-            strategy: deployment.strategy.map(|s| format!("{:?}", s)),
-            status: deployment.status.to_string(),
-            error_message: deployment.error_message,
-            started_at: deployment.started_at.to_rfc3339(),
-            completed_at: deployment.completed_at.map(|dt| dt.to_rfc3339()),
-            timeout_seconds: deployment.timeout_seconds,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateReleaseRequest {
-    pub version: String,
-    pub name: Option<String>,
-    pub body: Option<String>,
-    #[serde(default)]
-    pub draft: bool,
-    #[serde(default)]
-    pub prerelease: bool,
-}
-
-impl CreateReleaseRequest {
-    fn validate(&self) -> Result<(), ApiError> {
-        if self.version.trim().is_empty() {
-            return Err(ApiError::validation("Version cannot be empty"));
-        }
-        // Validate version format
-        orchestrate_core::Version::parse(&self.version)
-            .map_err(|e| ApiError::validation(format!("Invalid version format: {}", e)))?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ReleaseResponse {
-    pub version: String,
-    pub name: String,
-    pub body: String,
-    pub draft: bool,
-    pub prerelease: bool,
-    pub created_at: String,
-}
-
-// ==================== Deployment Handlers ====================
-
-async fn list_environments(
+async fn get_learning_effectiveness(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<EnvironmentResponse>>, ApiError> {
-    let environments = state
+    Query(query): Query<EffectivenessQuery>,
+) -> Result<Json<LearningEffectivenessResponse>, ApiError> {
+    let instructions = state
         .db
-        .list_environments()
+        .list_instruction_effectiveness(query.include_disabled.unwrap_or(false), query.min_usage.unwrap_or(1))
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    Ok(Json(environments.into_iter().map(Into::into).collect()))
-}
-
-async fn get_environment(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Result<Json<EnvironmentResponse>, ApiError> {
-    let environment = state
+    let summary = state
         .db
-        .get_environment_by_name(&name)
+        .get_effectiveness_summary()
         .await
         .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    Ok(Json(environment.into()))
-}
+    let items: Vec<InstructionEffectivenessItem> = instructions
+        .into_iter()
+        .map(|i| InstructionEffectivenessItem {
+            instruction_id: i.instruction_id,
+            name: i.name.clone(),
+            source: i.instruction_source.clone(),
+            enabled: i.enabled,
+            usage_count: i.usage_count,
+            success_rate: i.success_rate,
+            penalty_score: i.penalty_score,
+            level: i.effectiveness_level().to_string(),
+        })
+        .collect();
 
-async fn create_deployment(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateDeploymentRequest>,
-) -> Result<Json<DeploymentResponse>, ApiError> {
-    req.validate()?;
-
-    // Parse provider if provided
-    let provider = if let Some(p) = &req.provider {
-        Some(
-            p.parse::<DeploymentProvider>()
-                .map_err(|e| ApiError::validation(format!("Invalid provider: {}", e)))?,
-        )
-    } else {
-        None
-    };
-
-    // Parse strategy if provided
-    let strategy = if let Some(s) = &req.strategy {
-        Some(
-            serde_json::from_str::<DeploymentStrategy>(s)
-                .map_err(|e| ApiError::validation(format!("Invalid strategy: {}", e)))?,
-        )
-    } else {
-        None
-    };
-
-    let deployment_request = DeploymentRequest {
-        environment: req.environment,
-        version: req.version,
-        provider,
-        strategy,
-        timeout_seconds: req.timeout_seconds,
-        skip_validation: req.skip_validation,
-    };
-
-    let executor = DeploymentExecutor::new(Arc::new(state.db.clone()));
-    let deployment = executor
-        .deploy(deployment_request)
-        .await
-        .map_err(|e| ApiError::internal(format!("Deployment failed: {}", e)))?;
-
-    Ok(Json(deployment.into()))
-}
-
-async fn list_deployments(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ListDeploymentsParams>,
-) -> Result<Json<Vec<DeploymentResponse>>, ApiError> {
-    // Get environment name (required)
-    let env_name = params.environment.ok_or_else(|| {
-        ApiError::validation("environment query parameter is required")
-    })?;
-
-    let deployments = state
-        .db
-        .list_deployments(&env_name, params.limit.or(Some(50)))
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(deployments.into_iter().map(Into::into).collect()))
-}
-
-async fn get_deployment(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<DeploymentResponse>, ApiError> {
-    let deployment = state
-        .db
-        .get_deployment(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    Ok(Json(deployment.into()))
-}
-
-async fn rollback_deployment(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Json(req): Json<RollbackDeploymentRequest>,
-) -> Result<Json<RollbackResponse>, ApiError> {
-    let deployment = state
-        .db
-        .get_deployment(id)
-        .await
-        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
-
-    let current_version = deployment.version.clone();
-    let rollback_request = RollbackRequest {
-        environment: deployment.environment_name.clone(),
-        target_version: req.target_version,
-        skip_validation: false,
-        force: req.force.unwrap_or(false),
-    };
-
-    let rollback_service = DeploymentRollback::new(Arc::new(state.db.clone()));
-    let rollback_event = rollback_service
-        .rollback(rollback_request)
-        .await
-        .map_err(|e| ApiError::internal(format!("Rollback failed: {}", e)))?;
-
-    Ok(Json(RollbackResponse {
-        deployment_id: rollback_event.deployment_id,
-        environment: deployment.environment_name,
-        previous_version: current_version,
-        target_version: rollback_event.target_version,
-        status: rollback_event.status.to_string(),
-        started_at: rollback_event.started_at.to_rfc3339(),
-        completed_at: rollback_event.completed_at.map(|dt| dt.to_rfc3339()),
+    Ok(Json(LearningEffectivenessResponse {
+        instructions: items,
+        summary: EffectivenessSummaryItem {
+            total_instructions: summary.total_instructions,
+            enabled_count: summary.enabled_count,
+            used_count: summary.used_count,
+            total_usage: summary.total_usage,
+            avg_success_rate: summary.avg_success_rate,
+            avg_penalty_score: summary.avg_penalty_score,
+            ineffective_count: summary.ineffective_count,
+        },
     }))
-}
-
-async fn list_releases(
-    State(_state): State<Arc<AppState>>,
-) -> Result<Json<Vec<ReleaseResponse>>, ApiError> {
-    // For now, return empty list as we need GitHub integration
-    // This will be implemented when GitHub API is integrated
-    Ok(Json(vec![]))
-}
-
-async fn create_release(
-    State(_state): State<Arc<AppState>>,
-    Json(req): Json<CreateReleaseRequest>,
-) -> Result<Json<ReleaseResponse>, ApiError> {
-    req.validate()?;
-
-    // For now, return a mock response
-    // This will be implemented when GitHub API is integrated
-    Ok(Json(ReleaseResponse {
-        version: req.version,
-        name: req.name.unwrap_or_else(|| "Release".to_string()),
-        body: req.body.unwrap_or_default(),
-        draft: req.draft,
-        prerelease: req.prerelease,
-        created_at: chrono::Utc::now().to_rfc3339(),
-    }))
-}
-
-async fn publish_release(
-    State(_state): State<Arc<AppState>>,
-    Path(version): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // For now, return success
-    // This will be implemented when GitHub API is integrated
-    Ok(Json(serde_json::json!({
-        "published": true,
-        "version": version
-    })))
 }
 
 #[derive(Debug, Deserialize)]
-struct ListDeploymentsParams {
+struct EffectivenessQuery {
     #[serde(default)]
-    environment: Option<String>,
+    min_usage: Option<i64>,
+    #[serde(default)]
+    include_disabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct SuggestionResponse {
+    suggestions: Vec<SuggestionItem>,
+    total: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SuggestionItem {
+    instruction_id: i64,
+    name: String,
+    success_rate: f64,
+    usage_count: i64,
+    suggestion: String,
+}
+
+async fn get_learning_suggestions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SuggestionsQuery>,
+) -> Result<Json<SuggestionResponse>, ApiError> {
+    let ineffective = state
+        .db
+        .list_ineffective_instructions(0.5, 5)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let limit = query.limit.unwrap_or(10);
+    let suggestions: Vec<SuggestionItem> = ineffective
+        .into_iter()
+        .take(limit)
+        .map(|i| SuggestionItem {
+            instruction_id: i.instruction_id,
+            name: i.name.clone(),
+            success_rate: i.success_rate,
+            usage_count: i.usage_count,
+            suggestion: "Review and update instruction content or disable if no longer relevant".to_string(),
+        })
+        .collect();
+
+    let total = suggestions.len();
+    Ok(Json(SuggestionResponse { suggestions, total }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestionsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisResponse {
+    patterns_processed: usize,
+    instructions_created: Vec<String>,
+}
+
+async fn trigger_learning_analysis(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<AnalysisResponse>, ApiError> {
+    let engine = LearningEngine::new();
+    let created = engine
+        .process_patterns(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Analysis error: {}", e)))?;
+
+    Ok(Json(AnalysisResponse {
+        patterns_processed: created.len(),
+        instructions_created: created.iter().map(|i| i.name.clone()).collect(),
+    }))
+}
+
+// ==================== Experiment Handlers ====================
+
+use orchestrate_core::{Experiment, ExperimentStatus, ExperimentType, ExperimentMetric};
+
+#[derive(Debug, Serialize)]
+struct ExperimentResponse {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    experiment_type: String,
+    metric: String,
+    status: String,
+    min_samples: i64,
+    confidence_level: f64,
+    created_at: String,
+}
+
+impl From<Experiment> for ExperimentResponse {
+    fn from(exp: Experiment) -> Self {
+        Self {
+            id: exp.id,
+            name: exp.name,
+            description: exp.description,
+            experiment_type: exp.experiment_type.as_str().to_string(),
+            metric: exp.metric.as_str().to_string(),
+            status: exp.status.as_str().to_string(),
+            min_samples: exp.min_samples,
+            confidence_level: exp.confidence_level,
+            created_at: exp.created_at.to_rfc3339(),
+        }
+    }
+}
+
+async fn list_experiments(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExperimentListQuery>,
+) -> Result<Json<Vec<ExperimentResponse>>, ApiError> {
+    let status_filter = query.status.as_ref().and_then(|s| {
+        use std::str::FromStr;
+        ExperimentStatus::from_str(s).ok()
+    });
+
+    let experiments = state
+        .db
+        .list_experiments(status_filter, query.limit.unwrap_or(100))
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(experiments.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct ExperimentListQuery {
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
-struct RollbackDeploymentRequest {
-    pub target_version: Option<String>,
-    pub force: Option<bool>,
+struct CreateExperimentRequest {
+    name: String,
+    description: Option<String>,
+    experiment_type: String,
+    metric: String,
+    min_samples: Option<i64>,
+    confidence_level: Option<f64>,
+}
+
+async fn create_experiment(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateExperimentRequest>,
+) -> Result<Json<ExperimentResponse>, ApiError> {
+    use std::str::FromStr;
+
+    let experiment_type = ExperimentType::from_str(&req.experiment_type)
+        .map_err(|_| ApiError::validation(format!("Invalid experiment type: {}", req.experiment_type)))?;
+
+    let metric = ExperimentMetric::from_str(&req.metric)
+        .map_err(|_| ApiError::validation(format!("Invalid metric: {}", req.metric)))?;
+
+    let experiment = Experiment {
+        id: 0,
+        name: req.name,
+        description: req.description,
+        hypothesis: None,
+        experiment_type,
+        metric,
+        agent_type: None,
+        status: ExperimentStatus::Draft,
+        min_samples: req.min_samples.unwrap_or(100),
+        confidence_level: req.confidence_level.unwrap_or(0.95),
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        completed_at: None,
+        winner_variant_id: None,
+    };
+
+    let id = state
+        .db
+        .create_experiment(&experiment)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let created = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::internal("Failed to retrieve created experiment"))?;
+
+    Ok(Json(created.into()))
+}
+
+async fn get_experiment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ExperimentResponse>, ApiError> {
+    let experiment = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Experiment"))?;
+
+    Ok(Json(experiment.into()))
 }
 
 #[derive(Debug, Serialize)]
-struct RollbackResponse {
-    pub deployment_id: i64,
-    pub environment: String,
-    pub previous_version: String,
-    pub target_version: String,
-    pub status: String,
-    pub started_at: String,
-    pub completed_at: Option<String>,
+struct ExperimentResultsResponse {
+    experiment_id: i64,
+    variants: Vec<VariantResultItem>,
+    is_significant: bool,
+    p_value: Option<f64>,
+    improvement: Option<f64>,
+    winning_variant: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VariantResultItem {
+    variant_id: i64,
+    name: String,
+    is_control: bool,
+    sample_count: i64,
+    mean: f64,
+    std_dev: f64,
+    success_rate: f64,
+}
+
+async fn get_experiment_results(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<ExperimentResultsResponse>, ApiError> {
+    let experiment = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Experiment"))?;
+
+    let results = state
+        .db
+        .get_experiment_results(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let variants: Vec<VariantResultItem> = results
+        .iter()
+        .map(|v| VariantResultItem {
+            variant_id: v.variant_id,
+            name: v.variant_name.clone(),
+            is_control: v.is_control,
+            sample_count: v.sample_count,
+            mean: v.mean,
+            std_dev: v.std_dev,
+            success_rate: v.success_rate.unwrap_or(0.0),
+        })
+        .collect();
+
+    // Calculate significance if we have control and treatment
+    let (is_significant, p_value, improvement, winning_variant) = if let (Some(control), Some(treatment)) =
+        (results.iter().find(|v| v.is_control), results.iter().find(|v| !v.is_control))
+    {
+        use orchestrate_core::ExperimentResults;
+        let (sig, pval) = ExperimentResults::calculate_significance(control, treatment, experiment.confidence_level);
+        let imp = ExperimentResults::calculate_improvement(control.mean, treatment.mean);
+        let winner = if sig {
+            if treatment.mean > control.mean {
+                Some(treatment.variant_name.clone())
+            } else {
+                Some(control.variant_name.clone())
+            }
+        } else {
+            None
+        };
+        (sig, Some(pval), Some(imp), winner)
+    } else {
+        (false, None, None, None)
+    };
+
+    Ok(Json(ExperimentResultsResponse {
+        experiment_id: id,
+        variants,
+        is_significant,
+        p_value,
+        improvement,
+        winning_variant,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteExperimentRequest {
+    winner_variant_id: i64,
+}
+
+async fn promote_experiment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<PromoteExperimentRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let experiment = state
+        .db
+        .get_experiment(id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("Experiment"))?;
+
+    // Complete the experiment with the winner
+    state
+        .db
+        .update_experiment_status(id, ExperimentStatus::Completed)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "message": format!("Experiment '{}' completed with variant {} as winner", experiment.name, req.winner_variant_id),
+        "experiment_id": id,
+        "winner_variant_id": req.winner_variant_id
+    })))
+}
+
+// ==================== Prediction Handlers ====================
+
+#[derive(Debug, Deserialize)]
+struct PredictionRequest {
+    task: String,
+    agent_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PredictionResponse {
+    task_description: String,
+    success_probability: f64,
+    confidence: f64,
+    estimated_tokens: TokenEstimateItem,
+    estimated_duration: DurationEstimateItem,
+    recommended_model: String,
+    risk_factors: Vec<RiskFactorItem>,
+    recommendations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenEstimateItem {
+    min: i64,
+    max: i64,
+    expected: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DurationEstimateItem {
+    min_minutes: f64,
+    max_minutes: f64,
+    expected_minutes: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct RiskFactorItem {
+    name: String,
+    description: String,
+    severity: String,
+    impact_on_success: f64,
+}
+
+async fn get_prediction(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PredictionRequest>,
+) -> Result<Json<PredictionResponse>, ApiError> {
+    use orchestrate_core::predict_task_outcome;
+
+    // Parse agent type if provided
+    let agent_type_parsed = req.agent_type.as_ref().and_then(|t| {
+        use std::str::FromStr;
+        AgentType::from_str(t).ok()
+    });
+
+    // Get historical data for prediction
+    let agents = state
+        .db
+        .list_agents_paginated(1000, 0, None, agent_type_parsed)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+
+    let total_agents = agents.len();
+    let successful = agents
+        .iter()
+        .filter(|a| a.state == AgentState::Completed)
+        .count();
+    let historical_success_rate = if total_agents > 0 {
+        successful as f64 / total_agents as f64
+    } else {
+        0.75 // Default assumption
+    };
+
+    let prediction = predict_task_outcome(
+        &req.task,
+        historical_success_rate,
+        50000, // Default token estimate
+        30.0,  // Default duration estimate
+        total_agents as i64,
+    );
+
+    Ok(Json(PredictionResponse {
+        task_description: prediction.task_description,
+        success_probability: prediction.success_probability,
+        confidence: prediction.confidence,
+        estimated_tokens: TokenEstimateItem {
+            min: prediction.estimated_tokens.min,
+            max: prediction.estimated_tokens.max,
+            expected: prediction.estimated_tokens.expected,
+        },
+        estimated_duration: DurationEstimateItem {
+            min_minutes: prediction.estimated_duration.min_minutes,
+            max_minutes: prediction.estimated_duration.max_minutes,
+            expected_minutes: prediction.estimated_duration.expected_minutes,
+        },
+        recommended_model: prediction.recommended_model,
+        risk_factors: prediction
+            .risk_factors
+            .into_iter()
+            .map(|r| RiskFactorItem {
+                name: r.name,
+                description: r.description,
+                severity: r.severity.as_str().to_string(),
+                impact_on_success: r.impact_on_success,
+            })
+            .collect(),
+        recommendations: prediction.recommendations,
+    }))
+}
+
+// ==================== Documentation Handlers ====================
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocGenerateRequest {
+    doc_type: String,
+    format: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocGenerateResponse {
+    doc_type: String,
+    format: String,
+    content: String,
+    generated_at: String,
+}
+
+async fn generate_documentation(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<DocGenerateRequest>,
+) -> Result<Json<DocGenerateResponse>, ApiError> {
+    use orchestrate_core::{ApiDocumentation, ApiEndpoint, ReadmeContent, ReadmeSectionContent, ReadmeSection};
+
+    let format = req.format.unwrap_or_else(|| "yaml".to_string());
+
+    let content = match req.doc_type.to_lowercase().as_str() {
+        "api" => {
+            let mut api_doc = ApiDocumentation::new(
+                "Orchestrate API",
+                "1.0.0",
+                Some("Agent orchestration and automation API"),
+            );
+            api_doc.add_server("http://localhost:8080", Some("Development server"));
+
+            // Add basic endpoints
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/agents")
+                    .with_summary("List all agents")
+                    .with_tag("agents"),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/agents/{id}")
+                    .with_summary("Get agent by ID")
+                    .with_tag("agents")
+                    .with_path_param("id", Some("Agent UUID")),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("POST", "/api/agents")
+                    .with_summary("Create a new agent")
+                    .with_tag("agents"),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/sessions")
+                    .with_summary("List sessions")
+                    .with_tag("sessions"),
+            );
+            api_doc.add_endpoint(
+                ApiEndpoint::new("GET", "/api/prs")
+                    .with_summary("List pull requests")
+                    .with_tag("pull-requests"),
+            );
+
+            match format.to_lowercase().as_str() {
+                "yaml" | "yml" => api_doc.to_openapi_yaml(),
+                "json" => serde_json::to_string_pretty(&api_doc.to_openapi_json())
+                    .map_err(|e| ApiError::internal(format!("JSON error: {}", e)))?,
+                _ => return Err(ApiError::bad_request(format!("Unknown format: {}", format))),
+            }
+        }
+        "readme" => {
+            let readme = ReadmeContent {
+                sections: vec![
+                    ReadmeSectionContent {
+                        section_type: ReadmeSection::Title,
+                        heading: Some("# Orchestrate".to_string()),
+                        content: "An agent orchestration and automation system".to_string(),
+                    },
+                    ReadmeSectionContent {
+                        section_type: ReadmeSection::Installation,
+                        heading: Some("## Installation".to_string()),
+                        content: "```bash\ncargo install orchestrate\n```".to_string(),
+                    },
+                    ReadmeSectionContent {
+                        section_type: ReadmeSection::Usage,
+                        heading: Some("## Usage".to_string()),
+                        content: "```bash\norchestrate daemon start\norchestrate agent create --type story-developer --task \"Implement feature\"\n```".to_string(),
+                    },
+                ],
+            };
+
+            readme.to_markdown()
+        }
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "Unknown doc type: {}. Valid: api, readme",
+                req.doc_type
+            )))
+        }
+    };
+
+    Ok(Json(DocGenerateResponse {
+        doc_type: req.doc_type,
+        format,
+        content,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocValidateRequest {
+    path: Option<String>,
+    coverage_threshold: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocValidateResponse {
+    total_items: usize,
+    documented_items: usize,
+    coverage_percentage: f64,
+    issues_count: usize,
+    is_valid: bool,
+    summary: String,
+}
+
+async fn validate_documentation(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<DocValidateRequest>,
+) -> Result<Json<DocValidateResponse>, ApiError> {
+    use orchestrate_core::DocValidationResult;
+
+    let _check_path = req.path.unwrap_or_else(|| ".".to_string());
+    let _threshold = req.coverage_threshold.unwrap_or(80);
+
+    // Create a mock validation result for now
+    let mut result = DocValidationResult::new();
+    result.total_items = 100;
+    result.documented_items = 85;
+    result.calculate_coverage();
+
+    Ok(Json(DocValidateResponse {
+        total_items: result.total_items,
+        documented_items: result.documented_items,
+        coverage_percentage: result.coverage_percentage,
+        issues_count: result.issues.len(),
+        is_valid: result.is_valid(),
+        summary: result.to_summary(),
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrListItem {
+    number: u32,
+    title: String,
+    status: String,
+    file_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrListResponse {
+    adrs: Vec<AdrListItem>,
+    total: usize,
+}
+
+async fn list_adrs(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<AdrListResponse>, ApiError> {
+    let adr_dir = std::path::Path::new("docs/adrs");
+    let mut adrs = vec![];
+
+    if adr_dir.exists() {
+        let entries: Vec<_> = std::fs::read_dir(adr_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to read ADR directory: {}", e)))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
+            .collect();
+
+        for entry in entries {
+            let content = std::fs::read_to_string(entry.path())
+                .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Parse number from filename
+            let number = name_str
+                .strip_prefix("adr-")
+                .and_then(|s| s.strip_suffix(".md"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            // Parse title from first line
+            let title = content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("# ")
+                .to_string();
+
+            // Parse status
+            let status = content
+                .lines()
+                .skip_while(|l| !l.starts_with("## Status"))
+                .nth(2)
+                .unwrap_or("Unknown")
+                .to_string();
+
+            adrs.push(AdrListItem {
+                number,
+                title,
+                status,
+                file_path: entry.path().to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    adrs.sort_by_key(|a| a.number);
+    let total = adrs.len();
+
+    Ok(Json(AdrListResponse { adrs, total }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrCreateRequest {
+    title: String,
+    status: Option<String>,
+    context: Option<String>,
+    decision: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrCreateResponse {
+    number: u32,
+    title: String,
+    status: String,
+    file_path: String,
+}
+
+async fn create_adr(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<AdrCreateRequest>,
+) -> Result<Json<AdrCreateResponse>, ApiError> {
+    use orchestrate_core::{Adr, AdrStatus};
+    use std::str::FromStr;
+
+    let status_str = req.status.unwrap_or_else(|| "proposed".to_string());
+    let adr_status = AdrStatus::from_str(&status_str)
+        .map_err(|_| ApiError::bad_request(format!("Invalid status: {}", status_str)))?;
+
+    // Find the next ADR number
+    let adr_dir = std::path::Path::new("docs/adrs");
+    std::fs::create_dir_all(adr_dir)
+        .map_err(|e| ApiError::internal(format!("Failed to create ADR directory: {}", e)))?;
+
+    let mut max_number = 0u32;
+    if adr_dir.exists() {
+        for entry in std::fs::read_dir(adr_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to read directory: {}", e)))?
+        {
+            if let Ok(entry) = entry {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(num_str) = name
+                    .strip_prefix("adr-")
+                    .and_then(|s| s.strip_suffix(".md"))
+                {
+                    if let Ok(num) = num_str.parse::<u32>() {
+                        max_number = max_number.max(num);
+                    }
+                }
+            }
+        }
+    }
+    let adr_number = max_number + 1;
+
+    let adr = Adr {
+        number: adr_number as i32,
+        title: req.title.clone(),
+        status: adr_status,
+        date: chrono::Utc::now(),
+        context: req.context.unwrap_or_default(),
+        decision: req.decision.unwrap_or_default(),
+        consequences: vec![],
+        related_adrs: vec![],
+        superseded_by: None,
+        tags: vec![],
+    };
+
+    let file_path = adr_dir.join(format!("adr-{:04}.md", adr_number));
+    std::fs::write(&file_path, adr.to_markdown())
+        .map_err(|e| ApiError::internal(format!("Failed to write ADR: {}", e)))?;
+
+    Ok(Json(AdrCreateResponse {
+        number: adr_number,
+        title: req.title,
+        status: status_str,
+        file_path: file_path.to_string_lossy().to_string(),
+    }))
+}
+
+async fn get_adr(
+    State(_state): State<Arc<AppState>>,
+    Path(number): Path<u32>,
+) -> Result<String, ApiError> {
+    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+    if !adr_path.exists() {
+        return Err(ApiError::not_found(&format!("ADR adr-{:04}", number)));
+    }
+    std::fs::read_to_string(&adr_path)
+        .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdrUpdateRequest {
+    status: Option<String>,
+    superseded_by: Option<u32>,
+}
+
+async fn update_adr(
+    State(_state): State<Arc<AppState>>,
+    Path(number): Path<u32>,
+    Json(req): Json<AdrUpdateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let adr_path = std::path::Path::new("docs/adrs").join(format!("adr-{:04}.md", number));
+    if !adr_path.exists() {
+        return Err(ApiError::not_found(&format!("ADR adr-{:04}", number)));
+    }
+
+    let content = std::fs::read_to_string(&adr_path)
+        .map_err(|e| ApiError::internal(format!("Failed to read ADR: {}", e)))?;
+
+    let mut new_content = String::new();
+    let mut in_status_section = false;
+    let mut status_updated = false;
+
+    for line in content.lines() {
+        if line.starts_with("## Status") {
+            in_status_section = true;
+            new_content.push_str(line);
+            new_content.push('\n');
+        } else if in_status_section && !status_updated && !line.is_empty() {
+            if let Some(ref new_status) = req.status {
+                let mut status_line = new_status.clone();
+                if let Some(by) = req.superseded_by {
+                    status_line.push_str(&format!(" by [ADR-{:04}](./adr-{:04}.md)", by, by));
+                }
+                new_content.push_str(&status_line);
+                new_content.push('\n');
+            } else {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+            status_updated = true;
+            in_status_section = false;
+        } else {
+            new_content.push_str(line);
+            new_content.push('\n');
+        }
+    }
+
+    std::fs::write(&adr_path, new_content)
+        .map_err(|e| ApiError::internal(format!("Failed to write ADR: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "number": number,
+        "status": req.status.unwrap_or_else(|| "unchanged".to_string())
+    })))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChangelogRequest {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChangelogResponse {
+    version: String,
+    date: String,
+    entries: Vec<ChangelogEntryItem>,
+    markdown: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChangelogEntryItem {
+    change_type: String,
+    description: String,
+    commit_hash: Option<String>,
+    author: Option<String>,
+    breaking: bool,
+}
+
+async fn generate_changelog(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<ChangelogRequest>,
+) -> Result<Json<ChangelogResponse>, ApiError> {
+    use orchestrate_core::{ChangelogEntry, ChangelogRelease, ChangeType};
+
+    let from_ref = req.from.unwrap_or_else(|| "HEAD~20".to_string());
+    let to_ref = req.to.unwrap_or_else(|| "HEAD".to_string());
+
+    // Get git log
+    let git_output = std::process::Command::new("git")
+        .args([
+            "log",
+            "--oneline",
+            "--pretty=format:%s|%H|%an",
+            &format!("{}..{}", from_ref, to_ref),
+        ])
+        .output()
+        .map_err(|e| ApiError::internal(format!("Failed to run git: {}", e)))?;
+
+    let log_output = String::from_utf8_lossy(&git_output.stdout);
+    let mut entries = vec![];
+    let mut entry_items = vec![];
+
+    for line in log_output.lines() {
+        let parts: Vec<&str> = line.splitn(3, '|').collect();
+        if parts.len() >= 3 {
+            let message = parts[0];
+            let hash = parts[1];
+            let author = parts[2];
+
+            // Parse conventional commit
+            let change_type = if message.starts_with("feat") {
+                Some(ChangeType::Added)
+            } else if message.starts_with("fix") {
+                Some(ChangeType::Fixed)
+            } else if message.starts_with("docs") {
+                Some(ChangeType::Changed)
+            } else if message.starts_with("refactor") || message.starts_with("chore") {
+                Some(ChangeType::Changed)
+            } else {
+                None
+            };
+
+            if let Some(ct) = change_type {
+                let desc = message
+                    .split(':')
+                    .nth(1)
+                    .map(|s| s.trim())
+                    .unwrap_or(message)
+                    .to_string();
+                let breaking = message.contains("BREAKING");
+
+                entries.push(ChangelogEntry {
+                    change_type: ct,
+                    description: desc.clone(),
+                    commit_hash: Some(hash[..7].to_string()),
+                    pr_number: None,
+                    issue_number: None,
+                    author: Some(author.to_string()),
+                    scope: None,
+                    breaking,
+                });
+
+                entry_items.push(ChangelogEntryItem {
+                    change_type: ct.as_str().to_string(),
+                    description: desc,
+                    commit_hash: Some(hash[..7].to_string()),
+                    author: Some(author.to_string()),
+                    breaking,
+                });
+            }
+        }
+    }
+
+    let release = ChangelogRelease {
+        version: "Unreleased".to_string(),
+        date: chrono::Utc::now(),
+        entries,
+        yanked: false,
+    };
+
+    Ok(Json(ChangelogResponse {
+        version: release.version.clone(),
+        date: release.date.to_rfc3339(),
+        entries: entry_items,
+        markdown: release.to_markdown(),
+    }))
 }
 
 #[cfg(test)]
@@ -4051,498 +4704,266 @@ mod tests {
         assert_eq!(response.required_count, 1);
         assert_eq!(response.timeout_seconds, Some(3600));
     }
-
-    // ==================== Deployment API Tests ====================
-
-    #[tokio::test]
-    async fn test_list_environments_empty() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/environments")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let environments: Vec<EnvironmentResponse> = serde_json::from_str(&body).unwrap();
-        assert!(environments.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_list_environments_with_data() {
-        let test_app = setup_app().await;
-
-        // Create test environment
-        let env = CreateEnvironment {
-            name: "staging".to_string(),
-            env_type: EnvironmentType::Staging,
-            url: Some("https://staging.example.com".to_string()),
-            provider: Some("docker".to_string()),
-            config: std::collections::HashMap::new(),
-            secrets: std::collections::HashMap::new(),
-            requires_approval: false,
-        };
-        test_app.state.db.create_environment(env).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/environments")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let environments: Vec<EnvironmentResponse> = serde_json::from_str(&body).unwrap();
-        assert_eq!(environments.len(), 1);
-        assert_eq!(environments[0].name, "staging");
-        assert_eq!(environments[0].env_type, "staging");
-    }
-
-    #[tokio::test]
-    async fn test_get_environment() {
-        let test_app = setup_app().await;
-
-        // Create test environment
-        let env = CreateEnvironment {
-            name: "production".to_string(),
-            env_type: EnvironmentType::Production,
-            url: Some("https://example.com".to_string()),
-            provider: Some("kubernetes".to_string()),
-            config: std::collections::HashMap::new(),
-            secrets: std::collections::HashMap::new(),
-            requires_approval: true,
-        };
-        test_app.state.db.create_environment(env).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/environments/production")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let environment: EnvironmentResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(environment.name, "production");
-        assert_eq!(environment.env_type, "production");
-        assert_eq!(environment.url, Some("https://example.com".to_string()));
-        assert_eq!(environment.provider, Some("kubernetes".to_string()));
-        assert!(environment.requires_approval);
-    }
-
-    #[tokio::test]
-    async fn test_list_deployments_empty() {
-        let test_app = setup_app().await;
-
-        // Create test environment first
-        let env = CreateEnvironment {
-            name: "staging".to_string(),
-            env_type: EnvironmentType::Staging,
-            url: Some("https://staging.example.com".to_string()),
-            provider: Some("docker".to_string()),
-            config: std::collections::HashMap::new(),
-            secrets: std::collections::HashMap::new(),
-            requires_approval: false,
-        };
-        test_app.state.db.create_environment(env).await.unwrap();
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/deployments?environment=staging")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let deployments: Vec<DeploymentResponse> = serde_json::from_str(&body).unwrap();
-        assert!(deployments.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_create_deployment_validation() {
-        let test_app = setup_app().await;
-
-        // Empty environment
-        let req = CreateDeploymentRequest {
-            environment: "".to_string(),
-            version: "1.0.0".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: None,
-            skip_validation: false,
-        };
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/deployments")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_deployment_empty_version() {
-        let test_app = setup_app().await;
-
-        let req = CreateDeploymentRequest {
-            environment: "staging".to_string(),
-            version: "".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: None,
-            skip_validation: false,
-        };
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/deployments")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_deployment_invalid_timeout() {
-        let test_app = setup_app().await;
-
-        let req = CreateDeploymentRequest {
-            environment: "staging".to_string(),
-            version: "1.0.0".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: Some(0),
-            skip_validation: false,
-        };
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/deployments")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_deployment_timeout_too_large() {
-        let test_app = setup_app().await;
-
-        let req = CreateDeploymentRequest {
-            environment: "staging".to_string(),
-            version: "1.0.0".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: Some(3601),
-            skip_validation: false,
-        };
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/deployments")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_release_validation() {
-        let test_app = setup_app().await;
-
-        // Empty version
-        let req = CreateReleaseRequest {
-            version: "".to_string(),
-            name: Some("Release".to_string()),
-            body: None,
-            draft: false,
-            prerelease: false,
-        };
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/releases")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_release_invalid_version_format() {
-        let test_app = setup_app().await;
-
-        let req = CreateReleaseRequest {
-            version: "invalid".to_string(),
-            name: Some("Release".to_string()),
-            body: None,
-            draft: false,
-            prerelease: false,
-        };
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/releases")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_release_success() {
-        let test_app = setup_app().await;
-
-        let req = CreateReleaseRequest {
-            version: "1.2.3".to_string(),
-            name: Some("Release v1.2.3".to_string()),
-            body: Some("Release notes".to_string()),
-            draft: false,
-            prerelease: false,
-        };
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/releases")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&req).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let release: ReleaseResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(release.version, "1.2.3");
-        assert_eq!(release.name, "Release v1.2.3");
-        assert_eq!(release.body, "Release notes");
-    }
-
-    #[tokio::test]
-    async fn test_list_releases() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/releases")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let releases: Vec<ReleaseResponse> = serde_json::from_str(&body).unwrap();
-        assert!(releases.is_empty()); // Currently returns empty list
-    }
-
-    #[tokio::test]
-    async fn test_publish_release() {
-        let test_app = setup_app().await;
-
-        let response = test_app
-            .router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/releases/1.2.3/publish")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = body_to_string(response.into_body()).await;
-        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(result["published"], true);
-        assert_eq!(result["version"], "1.2.3");
-    }
-
-    // ==================== Request Validation Tests ====================
-
-    #[test]
-    fn test_create_deployment_request_validation() {
-        // Valid request
-        let valid = CreateDeploymentRequest {
-            environment: "staging".to_string(),
-            version: "1.0.0".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: Some(300),
-            skip_validation: false,
-        };
-        assert!(valid.validate().is_ok());
-
-        // Empty environment
-        let empty_env = CreateDeploymentRequest {
-            environment: "".to_string(),
-            version: "1.0.0".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: None,
-            skip_validation: false,
-        };
-        assert!(empty_env.validate().is_err());
-
-        // Empty version
-        let empty_version = CreateDeploymentRequest {
-            environment: "staging".to_string(),
-            version: "".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: None,
-            skip_validation: false,
-        };
-        assert!(empty_version.validate().is_err());
-
-        // Zero timeout
-        let zero_timeout = CreateDeploymentRequest {
-            environment: "staging".to_string(),
-            version: "1.0.0".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: Some(0),
-            skip_validation: false,
-        };
-        assert!(zero_timeout.validate().is_err());
-
-        // Timeout too large
-        let large_timeout = CreateDeploymentRequest {
-            environment: "staging".to_string(),
-            version: "1.0.0".to_string(),
-            provider: None,
-            strategy: None,
-            timeout_seconds: Some(3601),
-            skip_validation: false,
-        };
-        assert!(large_timeout.validate().is_err());
-    }
-
-    #[test]
-    fn test_create_release_request_validation() {
-        // Valid request
-        let valid = CreateReleaseRequest {
-            version: "1.2.3".to_string(),
-            name: Some("Release".to_string()),
-            body: None,
-            draft: false,
-            prerelease: false,
-        };
-        assert!(valid.validate().is_ok());
-
-        // Valid pre-release
-        let prerelease = CreateReleaseRequest {
-            version: "1.2.3-beta.1".to_string(),
-            name: Some("Beta Release".to_string()),
-            body: None,
-            draft: false,
-            prerelease: true,
-        };
-        assert!(prerelease.validate().is_ok());
-
-        // Empty version
-        let empty = CreateReleaseRequest {
-            version: "".to_string(),
-            name: None,
-            body: None,
-            draft: false,
-            prerelease: false,
-        };
-        assert!(empty.validate().is_err());
-
-        // Invalid version format
-        let invalid = CreateReleaseRequest {
-            version: "invalid".to_string(),
-            name: None,
-            body: None,
-            draft: false,
-            prerelease: false,
-        };
-        assert!(invalid.validate().is_err());
-    }
+}
+
+// ==================== Security Handlers ====================
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TriggerScanRequest {
+    scan_types: Vec<String>,
+    triggered_by: Option<String>,
+    commit_sha: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityScanResponse {
+    id: String,
+    scan_types: Vec<String>,
+    status: String,
+    started_at: String,
+    completed_at: Option<String>,
+    summary: ScanSummaryResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScanSummaryResponse {
+    total_vulnerabilities: usize,
+    critical_count: usize,
+    high_count: usize,
+    medium_count: usize,
+    low_count: usize,
+    auto_fixable_count: usize,
+    secrets_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityFixRequest {
+    vulnerability_ids: Vec<String>,
+    fix_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityGateEvalRequest {
+    scan_id: String,
+    override_reason: Option<String>,
+    approved_by: Option<String>,
+}
+
+/// Trigger a security scan
+async fn trigger_security_scan(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TriggerScanRequest>,
+) -> Result<Json<SecurityScanResponse>, ApiError> {
+    use orchestrate_core::{SecurityScan, ScanType};
+    use std::str::FromStr;
+
+    let scan_types: Result<Vec<ScanType>, _> = req
+        .scan_types
+        .iter()
+        .map(|s| ScanType::from_str(s).map_err(|e| ApiError::validation(e)))
+        .collect();
+
+    let scan_types = scan_types?;
+
+    let triggered_by = req.triggered_by.unwrap_or_else(|| "api".to_string());
+    let mut scan = SecurityScan::new(scan_types, triggered_by);
+    scan.commit_sha = req.commit_sha;
+    scan.branch = req.branch;
+    scan.start();
+
+    // TODO: Actually perform the scan using various scanners
+    // For now, create a sample scan with demo data
+    use orchestrate_core::{Vulnerability, Severity};
+    scan.add_vulnerability(
+        Vulnerability::dependency("demo-pkg", "1.0.0", Severity::High)
+            .with_cve("CVE-2024-DEMO")
+            .with_fix("1.0.1")
+            .with_description("Demo vulnerability for API testing"),
+    );
+
+    scan.complete();
+
+    // TODO: Store scan in database
+    // state.db.store_security_scan(&scan).await?;
+
+    let response = SecurityScanResponse {
+        id: scan.id.clone(),
+        scan_types: scan.scan_types.iter().map(|t| format!("{:?}", t)).collect(),
+        status: format!("{:?}", scan.status),
+        started_at: scan.started_at.to_rfc3339(),
+        completed_at: scan.completed_at.map(|t| t.to_rfc3339()),
+        summary: ScanSummaryResponse {
+            total_vulnerabilities: scan.summary.total_vulnerabilities,
+            critical_count: scan.summary.critical_count,
+            high_count: scan.summary.high_count,
+            medium_count: scan.summary.medium_count,
+            low_count: scan.summary.low_count,
+            auto_fixable_count: scan.summary.auto_fixable_count,
+            secrets_count: scan.summary.secrets_count,
+        },
+    };
+
+    Ok(Json(response))
+}
+
+/// List security scans
+async fn list_security_scans(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SecurityScanResponse>>, ApiError> {
+    // TODO: Load scans from database
+    // let scans = state.db.list_security_scans().await?;
+
+    // Return empty list for now
+    Ok(Json(vec![]))
+}
+
+/// Get a specific security scan
+async fn get_security_scan(
+    State(_state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<SecurityScanResponse>, ApiError> {
+    // TODO: Load scan from database
+    // let scan = state.db.get_security_scan(&id).await?
+    //     .ok_or_else(|| ApiError::not_found("Scan"))?;
+
+    Err(ApiError::not_found("Scan"))
+}
+
+/// List vulnerabilities across all scans
+async fn list_vulnerabilities(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    // TODO: Load vulnerabilities from database with filters
+    // let severity = params.get("severity");
+    // let auto_fixable = params.get("auto_fixable").and_then(|s| s.parse().ok());
+
+    Ok(Json(vec![]))
+}
+
+/// Apply security fix
+async fn apply_security_fix(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<SecurityFixRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::{SecurityFix, FixType};
+    use std::str::FromStr;
+
+    let fix_type = req
+        .fix_type
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(FixType::DependencyUpgrade);
+
+    let fix = SecurityFix::new(req.vulnerability_ids, fix_type, "api");
+
+    // TODO: Apply fix and create PR
+    // let pr = apply_fix(&fix).await?;
+    // state.db.store_security_fix(&fix).await?;
+
+    Ok(Json(serde_json::json!({
+        "id": fix.id,
+        "status": format!("{:?}", fix.status),
+        "message": "Security fix queued for application"
+    })))
+}
+
+/// Download security report
+async fn download_security_report(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    use orchestrate_core::{ReportFormat, SecurityScan, ScanType};
+    use std::str::FromStr;
+
+    let format = params
+        .get("format")
+        .and_then(|f| ReportFormat::from_str(f).ok())
+        .unwrap_or(ReportFormat::Json);
+
+    // TODO: Load latest scan from database
+    // For now, create a sample scan
+    let scan = SecurityScan::new(vec![ScanType::Full], "api");
+
+    let content = orchestrate_core::security_report::generate_report(&scan, format)
+        .map_err(|e| ApiError::internal(e))?;
+
+    let content_type = match format {
+        ReportFormat::Sarif | ReportFormat::Json => "application/json",
+        ReportFormat::Html => "text/html",
+    };
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        content,
+    )
+        .into_response())
+}
+
+/// Get security policy
+async fn get_security_policy(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::SecurityPolicy;
+
+    let policy = SecurityPolicy::default();
+
+    Ok(Json(serde_json::json!({
+        "id": policy.id,
+        "name": policy.name,
+        "block_on_critical": policy.block_on_critical,
+        "block_on_high": policy.block_on_high,
+        "block_on_secrets": policy.block_on_secrets,
+        "allowed_licenses": policy.allowed_licenses,
+        "denied_licenses": policy.denied_licenses,
+        "allow_exceptions": policy.allow_exceptions,
+        "max_exception_days": policy.max_exception_days,
+    })))
+}
+
+/// Evaluate security gate
+async fn evaluate_security_gate(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<SecurityGateEvalRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use orchestrate_core::{SecurityGate, SecurityPolicy};
+
+    // TODO: Load scan from database
+    // let scan = state.db.get_security_scan(&req.scan_id).await?
+    //     .ok_or_else(|| ApiError::not_found("Scan"))?;
+
+    // Load policy (TODO: from database/config)
+    let policy = SecurityPolicy::default();
+    let mut gate = SecurityGate::new(policy);
+
+    // TODO: Load exceptions from database
+    // let exceptions = state.db.get_active_security_exceptions().await?;
+    // gate = gate.with_exceptions(exceptions);
+
+    // For now, create a demo scan
+    use orchestrate_core::{SecurityScan, ScanType};
+    let scan = SecurityScan::new(vec![ScanType::Full], "api");
+
+    let result = if req.override_reason.is_some() && req.approved_by.is_some() {
+        gate.evaluate_with_override(&scan, req.override_reason, req.approved_by)
+    } else {
+        gate.evaluate(&scan)
+    };
+
+    Ok(Json(serde_json::json!({
+        "scan_id": result.scan_id,
+        "decision": match result.decision {
+            orchestrate_core::GateDecision::Allow => "allow",
+            orchestrate_core::GateDecision::Block { .. } => "block",
+            orchestrate_core::GateDecision::AllowWithOverride { .. } => "allow_with_override",
+        },
+        "evaluated_at": result.evaluated_at.to_rfc3339(),
+        "policy_id": result.policy_id,
+        "details": {
+            "total_vulnerabilities": result.details.total_vulnerabilities,
+            "blocking_vulnerabilities": result.details.blocking_vulnerabilities,
+            "excepted_vulnerabilities": result.details.excepted_vulnerabilities,
+        }
+    })))
 }
