@@ -158,6 +158,10 @@ impl Database {
         sqlx::query(include_str!("../../../migrations/017_notification_channels.sql"))
             .execute(&self.pool)
             .await?;
+        // Cost analytics migration
+        sqlx::query(include_str!("../../../migrations/018_cost_analytics.sql"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -6472,6 +6476,800 @@ impl TryFrom<NotificationLogRow> for NotificationLog {
             status: row.status,
             error_message: row.error_message,
             sent_at,
+        })
+    }
+}
+
+// ==================== Cost Analytics Operations ====================
+
+impl Database {
+    /// Create a new cost budget
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_cost_budget(
+        &self,
+        budget: crate::cost_analytics::CostBudget,
+    ) -> Result<crate::cost_analytics::CostBudget> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO cost_budgets (
+                period_type, amount_usd, alert_threshold_percent, start_date,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(budget.period_type.to_string())
+        .bind(budget.amount_usd)
+        .bind(budget.alert_threshold_percent)
+        .bind(&budget.start_date)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        Ok(crate::cost_analytics::CostBudget {
+            id: Some(id),
+            period_type: budget.period_type,
+            amount_usd: budget.amount_usd,
+            alert_threshold_percent: budget.alert_threshold_percent,
+            start_date: budget.start_date,
+            created_at: Some(now.clone()),
+            updated_at: Some(now),
+        })
+    }
+
+    /// Get a cost budget by ID
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_cost_budget(&self, id: i64) -> Result<Option<crate::cost_analytics::CostBudget>> {
+        #[derive(sqlx::FromRow)]
+        struct BudgetRow {
+            id: i64,
+            period_type: String,
+            amount_usd: f64,
+            alert_threshold_percent: i32,
+            start_date: String,
+            created_at: String,
+            updated_at: String,
+        }
+
+        let row = sqlx::query_as::<_, BudgetRow>("SELECT * FROM cost_budgets WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.map(|r| crate::cost_analytics::CostBudget {
+            id: Some(r.id),
+            period_type: r.period_type.parse().unwrap_or(crate::cost_analytics::BudgetPeriod::Monthly),
+            amount_usd: r.amount_usd,
+            alert_threshold_percent: r.alert_threshold_percent,
+            start_date: r.start_date,
+            created_at: Some(r.created_at),
+            updated_at: Some(r.updated_at),
+        }))
+    }
+
+    /// Get the active budget for a period type
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_active_budget(
+        &self,
+        period_type: crate::cost_analytics::BudgetPeriod,
+    ) -> Result<Option<crate::cost_analytics::CostBudget>> {
+        #[derive(sqlx::FromRow)]
+        struct BudgetRow {
+            id: i64,
+            period_type: String,
+            amount_usd: f64,
+            alert_threshold_percent: i32,
+            start_date: String,
+            created_at: String,
+            updated_at: String,
+        }
+
+        let row = sqlx::query_as::<_, BudgetRow>(
+            r#"
+            SELECT * FROM cost_budgets
+            WHERE period_type = ?
+            ORDER BY start_date DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(period_type.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| crate::cost_analytics::CostBudget {
+            id: Some(r.id),
+            period_type: r.period_type.parse().unwrap_or(crate::cost_analytics::BudgetPeriod::Monthly),
+            amount_usd: r.amount_usd,
+            alert_threshold_percent: r.alert_threshold_percent,
+            start_date: r.start_date,
+            created_at: Some(r.created_at),
+            updated_at: Some(r.updated_at),
+        }))
+    }
+
+    /// Update cost aggregation by agent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_cost_by_agent(
+        &self,
+        agent_id: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) -> Result<()> {
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Calculate cost
+        let pricing = crate::cost_analytics::ModelPricing::for_model(model);
+        let cost = pricing.calculate_cost(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens);
+
+        sqlx::query(
+            r#"
+            INSERT INTO cost_by_agent (
+                date, agent_id, model,
+                total_input_tokens, total_output_tokens,
+                total_cache_read_tokens, total_cache_write_tokens,
+                request_count, estimated_cost_usd,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(date, agent_id, model) DO UPDATE SET
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+                total_cache_write_tokens = total_cache_write_tokens + excluded.total_cache_write_tokens,
+                request_count = request_count + 1,
+                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&date)
+        .bind(agent_id)
+        .bind(model)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_write_tokens)
+        .bind(cost)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update cost aggregation by epic
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_cost_by_epic(
+        &self,
+        epic_id: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) -> Result<()> {
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let pricing = crate::cost_analytics::ModelPricing::for_model(model);
+        let cost = pricing.calculate_cost(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens);
+
+        sqlx::query(
+            r#"
+            INSERT INTO cost_by_epic (
+                date, epic_id, model,
+                total_input_tokens, total_output_tokens,
+                total_cache_read_tokens, total_cache_write_tokens,
+                request_count, estimated_cost_usd,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(date, epic_id, model) DO UPDATE SET
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+                total_cache_write_tokens = total_cache_write_tokens + excluded.total_cache_write_tokens,
+                request_count = request_count + 1,
+                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&date)
+        .bind(epic_id)
+        .bind(model)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_write_tokens)
+        .bind(cost)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update cost aggregation by story
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn update_cost_by_story(
+        &self,
+        story_id: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    ) -> Result<()> {
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let pricing = crate::cost_analytics::ModelPricing::for_model(model);
+        let cost = pricing.calculate_cost(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens);
+
+        sqlx::query(
+            r#"
+            INSERT INTO cost_by_story (
+                date, story_id, model,
+                total_input_tokens, total_output_tokens,
+                total_cache_read_tokens, total_cache_write_tokens,
+                request_count, estimated_cost_usd,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(date, story_id, model) DO UPDATE SET
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
+                total_cache_write_tokens = total_cache_write_tokens + excluded.total_cache_write_tokens,
+                request_count = request_count + 1,
+                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&date)
+        .bind(story_id)
+        .bind(model)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_write_tokens)
+        .bind(cost)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get costs by agent
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_costs_by_agent(&self, agent_id: &str, days: i32) -> Result<Vec<crate::cost_analytics::CostRecord>> {
+        #[derive(sqlx::FromRow)]
+        struct CostRow {
+            date: String,
+            agent_id: String,
+            model: String,
+            total_input_tokens: i64,
+            total_output_tokens: i64,
+            total_cache_read_tokens: i64,
+            total_cache_write_tokens: i64,
+            request_count: i64,
+            estimated_cost_usd: f64,
+        }
+
+        let rows = sqlx::query_as::<_, CostRow>(
+            r#"
+            SELECT * FROM cost_by_agent
+            WHERE agent_id = ? AND date >= date('now', '-' || ? || ' days')
+            ORDER BY date DESC
+            "#,
+        )
+        .bind(agent_id)
+        .bind(days)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::cost_analytics::CostRecord {
+                date: r.date,
+                entity_id: r.agent_id,
+                model: r.model,
+                total_input_tokens: r.total_input_tokens,
+                total_output_tokens: r.total_output_tokens,
+                total_cache_read_tokens: r.total_cache_read_tokens,
+                total_cache_write_tokens: r.total_cache_write_tokens,
+                request_count: r.request_count,
+                estimated_cost_usd: r.estimated_cost_usd,
+            })
+            .collect())
+    }
+
+    /// Get costs by epic
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_costs_by_epic(&self, epic_id: &str, days: i32) -> Result<Vec<crate::cost_analytics::CostRecord>> {
+        #[derive(sqlx::FromRow)]
+        struct CostRow {
+            date: String,
+            epic_id: String,
+            model: String,
+            total_input_tokens: i64,
+            total_output_tokens: i64,
+            total_cache_read_tokens: i64,
+            total_cache_write_tokens: i64,
+            request_count: i64,
+            estimated_cost_usd: f64,
+        }
+
+        let rows = sqlx::query_as::<_, CostRow>(
+            r#"
+            SELECT * FROM cost_by_epic
+            WHERE epic_id = ? AND date >= date('now', '-' || ? || ' days')
+            ORDER BY date DESC
+            "#,
+        )
+        .bind(epic_id)
+        .bind(days)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::cost_analytics::CostRecord {
+                date: r.date,
+                entity_id: r.epic_id,
+                model: r.model,
+                total_input_tokens: r.total_input_tokens,
+                total_output_tokens: r.total_output_tokens,
+                total_cache_read_tokens: r.total_cache_read_tokens,
+                total_cache_write_tokens: r.total_cache_write_tokens,
+                request_count: r.request_count,
+                estimated_cost_usd: r.estimated_cost_usd,
+            })
+            .collect())
+    }
+
+    /// Get costs by story
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_costs_by_story(&self, story_id: &str, days: i32) -> Result<Vec<crate::cost_analytics::CostRecord>> {
+        #[derive(sqlx::FromRow)]
+        struct CostRow {
+            date: String,
+            story_id: String,
+            model: String,
+            total_input_tokens: i64,
+            total_output_tokens: i64,
+            total_cache_read_tokens: i64,
+            total_cache_write_tokens: i64,
+            request_count: i64,
+            estimated_cost_usd: f64,
+        }
+
+        let rows = sqlx::query_as::<_, CostRow>(
+            r#"
+            SELECT * FROM cost_by_story
+            WHERE story_id = ? AND date >= date('now', '-' || ? || ' days')
+            ORDER BY date DESC
+            "#,
+        )
+        .bind(story_id)
+        .bind(days)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::cost_analytics::CostRecord {
+                date: r.date,
+                entity_id: r.story_id,
+                model: r.model,
+                total_input_tokens: r.total_input_tokens,
+                total_output_tokens: r.total_output_tokens,
+                total_cache_read_tokens: r.total_cache_read_tokens,
+                total_cache_write_tokens: r.total_cache_write_tokens,
+                request_count: r.request_count,
+                estimated_cost_usd: r.estimated_cost_usd,
+            })
+            .collect())
+    }
+
+    /// Get cost breakdown by model
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn get_cost_by_model(&self, days: i32) -> Result<Vec<crate::cost_analytics::ModelCostBreakdown>> {
+        #[derive(sqlx::FromRow)]
+        struct ModelRow {
+            model: String,
+            cost_usd: f64,
+            requests: i64,
+            input_tokens: i64,
+            output_tokens: i64,
+        }
+
+        let rows = sqlx::query_as::<_, ModelRow>(
+            r#"
+            SELECT
+                model,
+                SUM(estimated_cost_usd) as cost_usd,
+                SUM(request_count) as requests,
+                SUM(total_input_tokens) as input_tokens,
+                SUM(total_output_tokens) as output_tokens
+            FROM cost_by_agent
+            WHERE date >= date('now', '-' || ? || ' days')
+            GROUP BY model
+            ORDER BY cost_usd DESC
+            "#,
+        )
+        .bind(days)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::cost_analytics::ModelCostBreakdown {
+                model: r.model,
+                cost_usd: r.cost_usd,
+                requests: r.requests,
+                input_tokens: r.input_tokens,
+                output_tokens: r.output_tokens,
+            })
+            .collect())
+    }
+
+    /// Create a cost recommendation
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn create_cost_recommendation(
+        &self,
+        recommendation: crate::cost_analytics::CostRecommendation,
+    ) -> Result<crate::cost_analytics::CostRecommendation> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let id = sqlx::query(
+            r#"
+            INSERT INTO cost_recommendations (
+                recommendation_type, entity_type, entity_id,
+                description, potential_savings_usd, confidence_score,
+                applied, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(recommendation.recommendation_type.to_string())
+        .bind(recommendation.entity_type.to_string())
+        .bind(&recommendation.entity_id)
+        .bind(&recommendation.description)
+        .bind(recommendation.potential_savings_usd)
+        .bind(recommendation.confidence_score)
+        .bind(recommendation.applied)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+
+        Ok(crate::cost_analytics::CostRecommendation {
+            id: Some(id),
+            recommendation_type: recommendation.recommendation_type,
+            entity_type: recommendation.entity_type,
+            entity_id: recommendation.entity_id,
+            description: recommendation.description,
+            potential_savings_usd: recommendation.potential_savings_usd,
+            confidence_score: recommendation.confidence_score,
+            applied: recommendation.applied,
+            applied_at: None,
+            created_at: Some(now),
+        })
+    }
+
+    /// List cost recommendations
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn list_cost_recommendations(&self, include_applied: bool) -> Result<Vec<crate::cost_analytics::CostRecommendation>> {
+        #[derive(sqlx::FromRow)]
+        struct RecommendationRow {
+            id: i64,
+            recommendation_type: String,
+            entity_type: String,
+            entity_id: Option<String>,
+            description: String,
+            potential_savings_usd: f64,
+            confidence_score: f64,
+            applied: bool,
+            applied_at: Option<String>,
+            created_at: String,
+        }
+
+        let query = if include_applied {
+            "SELECT * FROM cost_recommendations ORDER BY potential_savings_usd DESC"
+        } else {
+            "SELECT * FROM cost_recommendations WHERE applied = 0 ORDER BY potential_savings_usd DESC"
+        };
+
+        let rows = sqlx::query_as::<_, RecommendationRow>(query)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::cost_analytics::CostRecommendation {
+                id: Some(r.id),
+                recommendation_type: r.recommendation_type.parse().unwrap_or(crate::cost_analytics::RecommendationType::ModelDowngrade),
+                entity_type: r.entity_type.parse().unwrap_or(crate::cost_analytics::EntityType::Global),
+                entity_id: r.entity_id,
+                description: r.description,
+                potential_savings_usd: r.potential_savings_usd,
+                confidence_score: r.confidence_score,
+                applied: r.applied,
+                applied_at: r.applied_at,
+                created_at: Some(r.created_at),
+            })
+            .collect())
+    }
+
+    /// Mark a recommendation as applied
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn mark_recommendation_applied(&self, id: i64) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE cost_recommendations
+            SET applied = 1, applied_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Generate a comprehensive cost report
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn generate_cost_report(&self, days: i32) -> Result<crate::cost_analytics::CostReport> {
+        // Get daily costs from daily_token_usage
+        let daily_usage = self.get_daily_token_usage(days).await?;
+
+        // Convert to DailyCost format
+        let daily_costs: Vec<crate::cost_analytics::DailyCost> = {
+            use std::collections::HashMap;
+            let mut by_date: HashMap<String, Vec<crate::DailyTokenUsage>> = HashMap::new();
+            for usage in daily_usage {
+                by_date.entry(usage.date.clone()).or_default().push(usage);
+            }
+
+            by_date
+                .into_iter()
+                .map(|(date, usages)| {
+                    let total_cost_usd = usages.iter().map(|u| u.estimated_cost_usd.unwrap_or(0.0)).sum();
+                    let total_requests = usages.iter().map(|u| u.request_count).sum();
+                    let total_input_tokens = usages.iter().map(|u| u.total_input_tokens).sum();
+                    let total_output_tokens = usages.iter().map(|u| u.total_output_tokens).sum();
+
+                    let models = usages
+                        .into_iter()
+                        .map(|u| crate::cost_analytics::ModelCostBreakdown {
+                            model: u.model,
+                            cost_usd: u.estimated_cost_usd.unwrap_or(0.0),
+                            requests: u.request_count,
+                            input_tokens: u.total_input_tokens,
+                            output_tokens: u.total_output_tokens,
+                        })
+                        .collect();
+
+                    crate::cost_analytics::DailyCost {
+                        date,
+                        total_cost_usd,
+                        total_requests,
+                        total_input_tokens,
+                        total_output_tokens,
+                        models,
+                    }
+                })
+                .collect()
+        };
+
+        let total_cost_usd = daily_costs.iter().map(|d| d.total_cost_usd).sum();
+
+        // Get aggregations
+        let by_agent = {
+            #[derive(sqlx::FromRow)]
+            struct AgentCostRow {
+                agent_id: String,
+                model: String,
+                total_input_tokens: i64,
+                total_output_tokens: i64,
+                total_cache_read_tokens: i64,
+                total_cache_write_tokens: i64,
+                request_count: i64,
+                estimated_cost_usd: f64,
+            }
+
+            let rows = sqlx::query_as::<_, AgentCostRow>(
+                r#"
+                SELECT
+                    agent_id,
+                    model,
+                    SUM(total_input_tokens) as total_input_tokens,
+                    SUM(total_output_tokens) as total_output_tokens,
+                    SUM(total_cache_read_tokens) as total_cache_read_tokens,
+                    SUM(total_cache_write_tokens) as total_cache_write_tokens,
+                    SUM(request_count) as request_count,
+                    SUM(estimated_cost_usd) as estimated_cost_usd
+                FROM cost_by_agent
+                WHERE date >= date('now', '-' || ? || ' days')
+                GROUP BY agent_id, model
+                ORDER BY estimated_cost_usd DESC
+                "#,
+            )
+            .bind(days)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|r| crate::cost_analytics::CostRecord {
+                    date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    entity_id: r.agent_id,
+                    model: r.model,
+                    total_input_tokens: r.total_input_tokens,
+                    total_output_tokens: r.total_output_tokens,
+                    total_cache_read_tokens: r.total_cache_read_tokens,
+                    total_cache_write_tokens: r.total_cache_write_tokens,
+                    request_count: r.request_count,
+                    estimated_cost_usd: r.estimated_cost_usd,
+                })
+                .collect()
+        };
+
+        let by_epic = {
+            #[derive(sqlx::FromRow)]
+            struct EpicCostRow {
+                epic_id: String,
+                model: String,
+                total_input_tokens: i64,
+                total_output_tokens: i64,
+                total_cache_read_tokens: i64,
+                total_cache_write_tokens: i64,
+                request_count: i64,
+                estimated_cost_usd: f64,
+            }
+
+            let rows = sqlx::query_as::<_, EpicCostRow>(
+                r#"
+                SELECT
+                    epic_id,
+                    model,
+                    SUM(total_input_tokens) as total_input_tokens,
+                    SUM(total_output_tokens) as total_output_tokens,
+                    SUM(total_cache_read_tokens) as total_cache_read_tokens,
+                    SUM(total_cache_write_tokens) as total_cache_write_tokens,
+                    SUM(request_count) as request_count,
+                    SUM(estimated_cost_usd) as estimated_cost_usd
+                FROM cost_by_epic
+                WHERE date >= date('now', '-' || ? || ' days')
+                GROUP BY epic_id, model
+                ORDER BY estimated_cost_usd DESC
+                "#,
+            )
+            .bind(days)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|r| crate::cost_analytics::CostRecord {
+                    date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    entity_id: r.epic_id,
+                    model: r.model,
+                    total_input_tokens: r.total_input_tokens,
+                    total_output_tokens: r.total_output_tokens,
+                    total_cache_read_tokens: r.total_cache_read_tokens,
+                    total_cache_write_tokens: r.total_cache_write_tokens,
+                    request_count: r.request_count,
+                    estimated_cost_usd: r.estimated_cost_usd,
+                })
+                .collect()
+        };
+
+        let by_story = {
+            #[derive(sqlx::FromRow)]
+            struct StoryCostRow {
+                story_id: String,
+                model: String,
+                total_input_tokens: i64,
+                total_output_tokens: i64,
+                total_cache_read_tokens: i64,
+                total_cache_write_tokens: i64,
+                request_count: i64,
+                estimated_cost_usd: f64,
+            }
+
+            let rows = sqlx::query_as::<_, StoryCostRow>(
+                r#"
+                SELECT
+                    story_id,
+                    model,
+                    SUM(total_input_tokens) as total_input_tokens,
+                    SUM(total_output_tokens) as total_output_tokens,
+                    SUM(total_cache_read_tokens) as total_cache_read_tokens,
+                    SUM(total_cache_write_tokens) as total_cache_write_tokens,
+                    SUM(request_count) as request_count,
+                    SUM(estimated_cost_usd) as estimated_cost_usd
+                FROM cost_by_story
+                WHERE date >= date('now', '-' || ? || ' days')
+                GROUP BY story_id, model
+                ORDER BY estimated_cost_usd DESC
+                "#,
+            )
+            .bind(days)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|r| crate::cost_analytics::CostRecord {
+                    date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                    entity_id: r.story_id,
+                    model: r.model,
+                    total_input_tokens: r.total_input_tokens,
+                    total_output_tokens: r.total_output_tokens,
+                    total_cache_read_tokens: r.total_cache_read_tokens,
+                    total_cache_write_tokens: r.total_cache_write_tokens,
+                    request_count: r.request_count,
+                    estimated_cost_usd: r.estimated_cost_usd,
+                })
+                .collect()
+        };
+
+        // Calculate trend
+        let trend = crate::cost_analytics::CostAnalytics::calculate_trend(&daily_costs);
+
+        // Get budget status
+        let budget_status = {
+            let period_type = if days <= 1 {
+                crate::cost_analytics::BudgetPeriod::Daily
+            } else if days <= 7 {
+                crate::cost_analytics::BudgetPeriod::Weekly
+            } else {
+                crate::cost_analytics::BudgetPeriod::Monthly
+            };
+
+            if let Some(budget) = self.get_active_budget(period_type).await? {
+                let percentage_used = budget.percentage_used(total_cost_usd);
+                let remaining = budget.amount_usd - total_cost_usd;
+                let is_exceeded = budget.is_exceeded(total_cost_usd);
+                let is_alert_triggered = budget.is_alert_threshold_reached(total_cost_usd);
+
+                Some(crate::cost_analytics::BudgetStatus {
+                    budget,
+                    current_cost: total_cost_usd,
+                    percentage_used,
+                    remaining,
+                    is_exceeded,
+                    is_alert_triggered,
+                })
+            } else {
+                None
+            }
+        };
+
+        let period_end = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let period_start = (chrono::Utc::now() - chrono::Duration::days(days as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        Ok(crate::cost_analytics::CostReport {
+            period_start,
+            period_end,
+            total_cost_usd,
+            daily_costs,
+            by_agent,
+            by_epic,
+            by_story,
+            trend,
+            budget_status,
         })
     }
 }

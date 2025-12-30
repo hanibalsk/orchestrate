@@ -12,6 +12,7 @@ pub mod alerting;
 pub mod approval;
 pub mod approval_service;
 pub mod condition_evaluator;
+pub mod cost_analytics;
 pub mod cron;
 pub mod database;
 #[cfg(test)]
@@ -24,6 +25,8 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 #[cfg(test)]
 mod database_notifications_tests;
+#[cfg(test)]
+mod database_cost_tests;
 #[cfg(test)]
 mod tracing_integration_tests;
 pub mod documentation;
@@ -214,4 +217,11 @@ pub use notifications::{
 // Re-export tracing types
 pub use tracing::{
     Span, SpanAttributes, TraceContext, TracingConfig, TracingExporter, TracingProvider,
+};
+
+// Re-export cost analytics types
+pub use cost_analytics::{
+    BudgetPeriod, BudgetStatus, CostAnalytics, CostBudget, CostRecord, CostRecommendation,
+    CostReport, CostTrend, DailyCost, EntityType, ModelCostBreakdown, ModelPricing,
+    RecommendationType, TrendDirection,
 };
