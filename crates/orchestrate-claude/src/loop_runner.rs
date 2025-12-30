@@ -748,9 +748,13 @@ If you encounter an error you cannot resolve, respond with "STATUS: BLOCKED: <re
             AgentType::BackgroundController => "background-controller.md",
             AgentType::Scheduler => "scheduler.md",
             AgentType::RegressionTester => "regression-tester.md",
-            AgentType::TestGenerator => "test-generator.md",
             AgentType::IssueTriager => "issue-triager.md",
-            AgentType::Deployer => "deployer.md",
+            AgentType::DocGenerator => "doc-generator.md",
+            AgentType::RequirementsAnalyzer => "requirements-analyzer.md",
+            AgentType::MultiRepoCoordinator => "multi-repo-coordinator.md",
+            AgentType::CiIntegrator => "ci-integrator.md",
+            AgentType::IncidentResponder => "incident-responder.md",
+            AgentType::SecurityScanner => "security-scanner.md",
         };
 
         // Look for agent file in common locations

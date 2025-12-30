@@ -8,16 +8,11 @@
 //! - Agent network with state/skill dependencies
 
 pub mod agent;
-pub mod alerting;
 pub mod approval;
 pub mod approval_service;
-pub mod audit;
 pub mod condition_evaluator;
-pub mod cost_analytics;
 pub mod cron;
 pub mod database;
-#[cfg(test)]
-mod database_alerting_tests;
 #[cfg(test)]
 mod database_approval_tests;
 #[cfg(test)]
@@ -25,19 +20,25 @@ mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
 #[cfg(test)]
-mod database_notifications_tests;
-#[cfg(test)]
-mod database_cost_tests;
-#[cfg(test)]
-mod database_performance_tests;
-#[cfg(test)]
-mod tracing_integration_tests;
+mod database_slack_tests;
 pub mod documentation;
+pub mod doc_generator;
 pub mod epic;
 pub mod requirements;
 pub mod multi_repo;
 pub mod ci_integration;
 pub mod incident;
+pub mod test_generation;
+pub mod deployment;
+pub mod monitoring;
+pub mod slack;
+pub mod slack_interactions;
+pub mod slack_service;
+pub mod slack_user_service;
+pub mod security;
+pub mod security_fix_agent;
+pub mod security_report;
+pub mod security_gate;
 pub mod error;
 pub mod experiment;
 pub mod feedback;
@@ -46,11 +47,8 @@ pub mod learning;
 pub mod learning_automation;
 pub mod message;
 pub mod model_selection;
-pub mod monitoring;
 pub mod network;
-pub mod notifications;
 pub mod pattern_export;
-pub mod performance_analytics;
 pub mod prompt_optimization;
 pub mod pipeline;
 pub mod pipeline_executor;
@@ -64,12 +62,11 @@ pub mod shell_state;
 pub mod webhook;
 pub mod webhook_config;
 pub mod worktree;
-pub mod tracing;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
     AgentStats, DailyTokenUsage, Database, EffectivenessAnalysisRow, EffectivenessSummary,
-    NotificationLog, TokenStats,
+    SlackCommandAudit, TokenStats,
 };
 pub use epic::{BmadPhase, Epic, EpicStatus, Story, StoryStatus};
 pub use error::{Error, Result};
@@ -134,12 +131,6 @@ pub use pipeline_parser::{
 // Re-export condition evaluator types
 pub use condition_evaluator::{ConditionContext, ConditionEvaluator, EvaluationResult, SkipReason};
 
-// Re-export alerting types
-pub use alerting::{
-    Alert, AlertEvaluator, AlertRule, AlertSeverity, AlertStatus, ConditionParser, ConditionType,
-    ThresholdOperator, generate_fingerprint,
-};
-
 // Re-export approval types
 pub use approval::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
 pub use approval_service::ApprovalService;
@@ -183,6 +174,12 @@ pub use documentation::{
     ReadmeContent, ReadmeSection, ReadmeSectionContent, SchemaInfo,
 };
 
+// Re-export doc_generator functions
+pub use doc_generator::{
+    generate_readme_content, parse_api_endpoints_from_rust, parse_git_commits,
+    validate_rust_doc_coverage,
+};
+
 // Re-export requirements types
 pub use requirements::{
     ArtifactType, ClarifyingQuestion, EffortEstimate, GeneratedStory, ImpactAnalysis, LinkType,
@@ -212,40 +209,69 @@ pub use incident::{
     RootCauseAnalysis, TimelineEvent, TimelineEventType,
 };
 
-// Re-export notification types
-pub use notifications::{
-    ChannelConfig, ChannelType, EmailConfig, MessageTemplate, NotificationError,
-    NotificationWebhookConfig, PagerDutyConfig, RateLimiter, SlackConfig, SLACK_CRITICAL_TEMPLATE,
-    SLACK_INFO_TEMPLATE, SLACK_WARNING_TEMPLATE,
+// Re-export test generation types
+pub use test_generation::{
+    CoverageReport, CoverageTrend, FileCoverage, GeneratedTest, IssueSeverity, ModuleCoverage,
+    TestableUnit, TestableUnitType, TestFramework, TestGenerationRequest, TestQualityIssue,
+    TestQualityIssueType, TestQualityReport, TestResult, TestResultStatus, TestRun, TestRunStatus,
+    TestSuggestion, TestType,
 };
 
-// Re-export tracing types
-pub use tracing::{
-    Span, SpanAttributes, TraceContext, TracingConfig, TracingExporter, TracingProvider,
+// Re-export deployment types
+pub use deployment::{
+    CanaryMetrics, CanaryStage, CanaryStageStatus, ChangeItem, Deployment, DeploymentChangeType,
+    DeploymentDiff, DeploymentLogEntry, DeploymentLogLevel, DeploymentMetrics, DeploymentProvider,
+    DeploymentStatus, DeploymentStrategy, Environment, EnvironmentType, FeatureFlag,
+    PostDeploymentVerification, PreDeploymentValidation, Release, ReleaseAsset,
+    ReleaseType, ValidationCheck, ValidationCheckType, VerificationCheck, VerificationCheckType,
 };
 
-// Re-export cost analytics types
-pub use cost_analytics::{
-    BudgetPeriod, BudgetStatus, CostAnalytics, CostBudget, CostRecord, CostRecommendation,
-    CostReport, CostTrend, DailyCost, EntityType, ModelCostBreakdown, ModelPricing,
-    RecommendationType, TrendDirection,
-};
-
-// Re-export audit types
-pub use audit::{AuditQuery, AuditStats, ExportFormat, RetentionPolicy};
-
-// Re-export monitoring types (non-overlapping with alerting module)
+// Re-export monitoring types
 pub use monitoring::{
-    ActorType, AgentPerformance, AuditAction, AuditEntry, ComponentHealth,
-    CostRecord as MonitoringCostRecord, CostReport as MonitoringCostReport,
-    DailyCost as MonitoringDailyCost, HealthStatus, HistogramBucket, HistogramValue,
-    MetricDefinition, MetricType, MetricValue, MetricsSummary, NotificationChannel,
-    NotificationChannelType, SystemHealth,
+    ActorType, AgentPerformance, Alert, AlertRule, AlertSeverity, AlertStatus, AuditAction,
+    AuditEntry, ComponentHealth, ConditionType, CostRecord, CostReport, DailyCost, HealthStatus,
+    HistogramBucket, HistogramValue, MetricDefinition, MetricType, MetricValue, MetricsSummary,
+    NotificationChannel, NotificationChannelType, SystemHealth,
 };
 
-// Re-export performance analytics types
-pub use performance_analytics::{
-    AgentComparison, AgentExecution, DurationStats, ErrorAnalysis, ErrorPattern,
-    PerformanceAnalytics, PerformanceTrend, TokenEfficiency, TrendDataPoint,
-    TrendDirection as PerformanceTrendDirection,
+// Re-export Slack types
+pub use slack::{
+    ButtonStyle, ChannelConfig, DigestMode, InteractionAction, InteractionChannel,
+    InteractionMessage, InteractionPayload, InteractionType, InteractionUser, NotificationSettings,
+    NotificationType, NotificationTemplate, PrThread, ResponseType, SentMessage, SlackApprovalRequest,
+    SlackBlock, SlackConnection, SlackContextElement, SlackElement, SlackMessage, SlackOption,
+    SlackText, SlashCommand, SlashCommandResponse, TextType, UserMapping,
+    ApprovalDecision as SlackApprovalDecision,
 };
+
+// Re-export Slack interaction types
+pub use slack_interactions::{
+    ApprovalButtonHandler, ApprovalResponse, PrThreadManager, SlashCommandHandler,
+};
+
+// Re-export Slack service types
+pub use slack_service::{
+    AgentLifecycleEvent, PrNotificationEvent, RateLimitConfig, SlackService,
+};
+
+// Re-export Slack user service types
+pub use slack_user_service::{CodeOwner, SlackUserService};
+
+// Re-export security types
+pub use security::{
+    ContainerScanner, DependencyScanner, DetectedSecret, FixChange, FixStatus, FixType,
+    LicenseCheckResult, LicenseIssue, LicenseIssueType, LicenseScanner, PackageManager,
+    SarifArtifactLocation, SarifDriver, SarifLocation, SarifMessage, SarifPhysicalLocation,
+    SarifRegion, SarifReport, SarifResult, SarifRun, SarifTool, SastScanner, ScanStatus,
+    ScanSummary, ScanType, SecretDetector, SecretType, SecurityException, SecurityFix,
+    SecurityPolicy, SecurityScan, Severity, Vulnerability, VulnerabilityType,
+};
+
+// Re-export security fix agent types
+pub use security_fix_agent::{FixCategory, SecurityFixAgent};
+
+// Re-export security report types
+pub use security_report::{HtmlReportGenerator, JsonReportGenerator, ReportFormat, SecurityReportGenerator};
+
+// Re-export security gate types
+pub use security_gate::{GateDecision, GateDetails, GateResult, SecurityGate};
