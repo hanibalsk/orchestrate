@@ -8,6 +8,9 @@ import { PipelineDetail } from './pages/PipelineDetail';
 import { PipelineRunDetail } from './pages/PipelineRunDetail';
 import { PipelineNew } from './pages/PipelineNew';
 import { ScheduleList } from './pages/ScheduleList';
+import { DocsList } from './pages/DocsList';
+import { ApiDocsViewer } from './pages/ApiDocsViewer';
+import { AdrBrowser } from './pages/AdrBrowser';
 
 function App() {
   return (
@@ -24,6 +27,10 @@ function App() {
             <Route path="/pipelines/:name" element={<PipelineDetail />} />
             <Route path="/pipelines/:name/runs/:runId" element={<PipelineRunDetail />} />
             <Route path="/schedules" element={<ScheduleList />} />
+            <Route path="/docs" element={<DocsList />} />
+            <Route path="/docs/api" element={<ApiDocsViewer />} />
+            <Route path="/docs/adr" element={<AdrBrowser />} />
+            <Route path="/docs/adr/:number" element={<AdrBrowser />} />
           </Routes>
         </main>
       </div>
