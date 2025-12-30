@@ -10,6 +10,7 @@
 pub mod agent;
 pub mod agent_continuation;
 pub mod autonomous_session;
+pub mod context_summary;
 pub mod decision_engine;
 pub mod approval;
 pub mod approval_service;
@@ -288,4 +289,11 @@ pub use decision_engine::{
 pub use agent_continuation::{
     AgentContinuation, ContinuationBuilder, ContinuationReason, ContinuationResult,
     ContinuationStatus,
+};
+
+// Re-export context summary types (Epic 016)
+pub use context_summary::{
+    Blocker, BlockerSeverity, BlockerType, ContextSummary, DecisionCategory, FileChange,
+    FileChangeType, KeyDecision, OutputSummarizer, TestAdded, TestType as SummaryTestType,
+    WorkStatus,
 };
