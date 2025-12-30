@@ -211,6 +211,11 @@ enum Commands {
         #[command(subcommand)]
         action: AlertCommand,
     },
+    /// Distributed tracing management
+    Trace {
+        #[command(subcommand)]
+        action: TraceCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1391,6 +1396,32 @@ enum AlertCommand {
         /// Rule name
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    /// Enable distributed tracing
+    Enable {
+        /// Exporter type (jaeger, otlp)
+        #[arg(short, long)]
+        exporter: String,
+        /// Jaeger endpoint (for jaeger exporter)
+        #[arg(long)]
+        jaeger_endpoint: Option<String>,
+        /// OTLP endpoint (for otlp exporter)
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
+        /// Service name
+        #[arg(long, default_value = "orchestrate")]
+        service_name: String,
+        /// Sample rate (0.0 to 1.0)
+        #[arg(long, default_value = "1.0")]
+        sample_rate: f64,
+    },
+    /// Disable distributed tracing
+    Disable,
+    /// Show tracing status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -5181,6 +5212,104 @@ async fn main() -> Result<()> {
                 println!("Channels:  {}", rule.channels.join(", "));
                 println!();
                 println!("Note: This would send test notifications to configured channels");
+                println!("{}", "=".repeat(60));
+            }
+        },
+        Commands::Trace { action } => match action {
+            TraceCommand::Enable {
+                exporter,
+                jaeger_endpoint,
+                otlp_endpoint,
+                service_name,
+                sample_rate,
+            } => {
+                use orchestrate_core::{TracingConfig, TracingExporter, TracingProvider};
+
+                // Parse exporter type
+                let exporter_type = TracingExporter::from_str(&exporter)?;
+
+                // Build configuration
+                let mut config = TracingConfig::new(exporter_type)
+                    .with_service_name(service_name.clone())
+                    .with_sample_rate(sample_rate);
+
+                if let Some(ref endpoint) = jaeger_endpoint {
+                    config = config.with_jaeger_endpoint(endpoint.clone());
+                }
+
+                if let Some(ref endpoint) = otlp_endpoint {
+                    config = config.with_otlp_endpoint(endpoint.clone());
+                }
+
+                // Initialize tracing provider
+                let mut provider = TracingProvider::new(config);
+                provider.init()?;
+
+                println!("\n{}", "=".repeat(60));
+                println!("Distributed Tracing Enabled");
+                println!("{}", "=".repeat(60));
+                println!("Exporter:     {}", exporter);
+                println!("Service Name: {}", service_name);
+                println!("Sample Rate:  {:.0}%", sample_rate * 100.0);
+
+                match exporter_type {
+                    TracingExporter::Jaeger => {
+                        if let Some(ref endpoint) = jaeger_endpoint {
+                            println!("Jaeger:       {}", endpoint);
+                        } else {
+                            println!("Jaeger:       http://localhost:14268/api/traces (default)");
+                        }
+                    }
+                    TracingExporter::Otlp => {
+                        if let Some(ref endpoint) = otlp_endpoint {
+                            println!("OTLP:         {}", endpoint);
+                        } else {
+                            println!("OTLP:         http://localhost:4317 (default)");
+                        }
+                    }
+                    TracingExporter::None => {}
+                }
+
+                println!("{}", "=".repeat(60));
+                println!();
+                println!("Tracing is now active. Spans will be exported to the configured endpoint.");
+                println!("Use 'orchestrate trace status' to check current configuration.");
+            }
+            TraceCommand::Disable => {
+                use orchestrate_core::{TracingConfig, TracingExporter, TracingProvider};
+
+                let config = TracingConfig::new(TracingExporter::None);
+                let mut provider = TracingProvider::new(config);
+                provider.init()?;
+
+                println!("\n{}", "=".repeat(60));
+                println!("Distributed Tracing Disabled");
+                println!("{}", "=".repeat(60));
+                println!();
+                println!("Tracing has been disabled. No spans will be exported.");
+            }
+            TraceCommand::Status => {
+                use orchestrate_core::{TracingConfig, TracingExporter};
+
+                // For now, show default configuration
+                // In production, this would read from a config file or database
+                let config = TracingConfig::default();
+
+                println!("\n{}", "=".repeat(60));
+                println!("Distributed Tracing Status");
+                println!("{}", "=".repeat(60));
+                println!("Status:       {}", if config.exporter == TracingExporter::None { "Disabled" } else { "Enabled" });
+                println!("Exporter:     {}", config.exporter.as_str());
+                println!("Service Name: {}", config.service_name);
+                println!("Sample Rate:  {:.0}%", config.sample_rate * 100.0);
+
+                if let Some(endpoint) = &config.jaeger_endpoint {
+                    println!("Jaeger:       {}", endpoint);
+                }
+                if let Some(endpoint) = &config.otlp_endpoint {
+                    println!("OTLP:         {}", endpoint);
+                }
+
                 println!("{}", "=".repeat(60));
             }
         },

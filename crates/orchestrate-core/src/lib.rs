@@ -24,6 +24,8 @@ mod database_webhook_tests;
 mod database_pipeline_tests;
 #[cfg(test)]
 mod database_notifications_tests;
+#[cfg(test)]
+mod tracing_integration_tests;
 pub mod documentation;
 pub mod epic;
 pub mod requirements;
@@ -54,6 +56,7 @@ pub mod shell_state;
 pub mod webhook;
 pub mod webhook_config;
 pub mod worktree;
+pub mod tracing;
 
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
@@ -206,4 +209,9 @@ pub use notifications::{
     ChannelConfig, ChannelType, EmailConfig, MessageTemplate, NotificationError,
     NotificationWebhookConfig, PagerDutyConfig, RateLimiter, SlackConfig, SLACK_CRITICAL_TEMPLATE,
     SLACK_INFO_TEMPLATE, SLACK_WARNING_TEMPLATE,
+};
+
+// Re-export tracing types
+pub use tracing::{
+    Span, SpanAttributes, TraceContext, TracingConfig, TracingExporter, TracingProvider,
 };
