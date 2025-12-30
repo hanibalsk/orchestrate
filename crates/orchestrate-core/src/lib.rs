@@ -19,6 +19,8 @@ mod database_approval_tests;
 mod database_webhook_tests;
 #[cfg(test)]
 mod database_pipeline_tests;
+#[cfg(test)]
+mod database_slack_tests;
 pub mod documentation;
 pub mod epic;
 pub mod requirements;
@@ -29,6 +31,8 @@ pub mod test_generation;
 pub mod deployment;
 pub mod monitoring;
 pub mod slack;
+pub mod slack_interactions;
+pub mod slack_service;
 pub mod security;
 pub mod error;
 pub mod experiment;
@@ -57,7 +61,7 @@ pub mod worktree;
 pub use agent::{Agent, AgentContext, AgentState, AgentType};
 pub use database::{
     AgentStats, DailyTokenUsage, Database, EffectivenessAnalysisRow, EffectivenessSummary,
-    TokenStats,
+    SlackCommandAudit, TokenStats,
 };
 pub use epic::{BmadPhase, Epic, EpicStatus, Story, StoryStatus};
 pub use error::{Error, Result};
@@ -227,6 +231,16 @@ pub use slack::{
     SlackBlock, SlackConnection, SlackContextElement, SlackElement, SlackMessage, SlackOption,
     SlackText, SlashCommand, SlashCommandResponse, TextType, UserMapping,
     ApprovalDecision as SlackApprovalDecision,
+};
+
+// Re-export Slack interaction types
+pub use slack_interactions::{
+    ApprovalButtonHandler, ApprovalResponse, PrThreadManager, SlashCommandHandler,
+};
+
+// Re-export Slack service types
+pub use slack_service::{
+    AgentLifecycleEvent, PrNotificationEvent, RateLimitConfig, SlackService,
 };
 
 // Re-export security types
